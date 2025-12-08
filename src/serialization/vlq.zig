@@ -229,6 +229,28 @@ pub const Reader = struct {
         return self.data[self.pos];
     }
 
+    /// Read N raw bytes
+    pub fn readBytes(self: *Reader, n: usize) DecodeError![]const u8 {
+        if (self.pos + n > self.data.len) return error.UnexpectedEndOfInput;
+        const result = self.data[self.pos .. self.pos + n];
+        self.pos += n;
+        return result;
+    }
+
+    /// Read VLQ-encoded i16 (ZigZag)
+    pub fn readI16(self: *Reader) DecodeError!i16 {
+        const v = try self.readI64();
+        if (v > std.math.maxInt(i16) or v < std.math.minInt(i16)) return error.Overflow;
+        return @truncate(v);
+    }
+
+    /// Read VLQ-encoded u16
+    pub fn readU16(self: *Reader) DecodeError!u16 {
+        const v = try self.readU64();
+        if (v > std.math.maxInt(u16)) return error.Overflow;
+        return @truncate(v);
+    }
+
     pub fn remaining(self: Reader) []const u8 {
         return self.data[self.pos..];
     }

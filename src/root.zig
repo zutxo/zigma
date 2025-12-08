@@ -21,6 +21,9 @@ pub const vlq = @import("serialization/vlq.zig");
 /// Type serialization (type codes to TypePool indices)
 pub const type_serializer = @import("serialization/type_serializer.zig");
 
+/// Data serialization (values to/from bytes)
+pub const data_serializer = @import("serialization/data_serializer.zig");
+
 /// Core type system (SType, TypePool)
 pub const types = @import("core/types.zig");
 
@@ -40,6 +43,7 @@ pub const EvalPools = memory.EvalPools;
 comptime {
     _ = vlq;
     _ = type_serializer;
+    _ = data_serializer;
     _ = types;
     _ = opcodes;
     _ = memory;
