@@ -1,0 +1,11 @@
+.{
+    .fingerprint = 0x94102e7b041ddbfd,
+    .name = .zigma,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.14.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

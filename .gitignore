@@ -1,0 +1,19 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Zig binary (use download.sh to get it)
+zig/zig
+zig/lib/
+zig/doc/
+zig/LICENSE
+zig/README.md
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# Session files
+init
