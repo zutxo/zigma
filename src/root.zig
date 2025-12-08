@@ -39,6 +39,9 @@ pub const opcodes = @import("core/opcodes.zig");
 /// Memory management pools
 pub const memory = @import("interpreter/memory.zig");
 
+/// Execution context (boxes, headers, height)
+pub const context = @import("interpreter/context.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -55,6 +58,7 @@ comptime {
     _ = types;
     _ = opcodes;
     _ = memory;
+    _ = context;
 }
 
 /// Protocol version constants
