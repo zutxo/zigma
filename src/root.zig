@@ -45,6 +45,9 @@ pub const context = @import("interpreter/context.zig");
 /// Expression evaluator
 pub const evaluator = @import("interpreter/evaluator.zig");
 
+/// Modular operations (arithmetic, comparison, logical)
+pub const ops = @import("interpreter/ops.zig");
+
 /// Cryptographic hash functions (Blake2b256, SHA256)
 pub const hash = @import("crypto/hash.zig");
 
@@ -66,6 +69,7 @@ comptime {
     _ = memory;
     _ = context;
     _ = evaluator;
+    _ = ops;
     _ = hash;
 }
 
