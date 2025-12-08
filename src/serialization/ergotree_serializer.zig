@@ -401,3 +401,138 @@ test "ergotree: error on reserved bits" {
     const data = [_]u8{ 0x20, 0x7F }; // Bit 5 set (reserved)
     try std.testing.expectError(error.InvalidHeader, deserialize(&tree, &data, &arena));
 }
+
+// ============================================================================
+// Conformance Tests (end-to-end)
+// ============================================================================
+
+const evaluator = @import("../interpreter/evaluator.zig");
+const context = @import("../interpreter/context.zig");
+
+test "conformance: HEIGHT > 100 evaluates true at height 500" {
+    // This is the first end-to-end conformance test!
+    // ErgoTree bytes for: HEIGHT > 100
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header: v0, no size, no segregation
+        0x91, // GT opcode (0x90 + 0x01 for SInt type info)
+        0xA3, // HEIGHT opcode
+        0x04, // Type: SInt
+        0xC8, 0x01, // VLQ-encoded 100 (zigzag: 200)
+    };
+
+    // Step 1: Deserialize the ErgoTree
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    // Verify deserialization
+    try std.testing.expectEqual(ErgoTreeVersion.v0, tree.header.version);
+    try std.testing.expect(!tree.header.constant_segregation);
+    try std.testing.expectEqual(@as(u16, 3), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.bin_op, tree.expr_tree.nodes[0].tag);
+
+    // Step 2: Set up evaluation context
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = context.Context.forHeight(500, &inputs);
+    try ctx.validate();
+
+    // Step 3: Evaluate the expression
+    var eval = evaluator.Evaluator.init(&tree.expr_tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Step 4: Verify result
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == true); // 500 > 100 = true
+}
+
+test "conformance: HEIGHT > 100 evaluates false at height 50" {
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header: v0, no size, no segregation
+        0x91, // GT opcode
+        0xA3, // HEIGHT opcode
+        0x04, // Type: SInt
+        0xC8, 0x01, // VLQ-encoded 100
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = context.Context.forHeight(50, &inputs);
+
+    var eval = evaluator.Evaluator.init(&tree.expr_tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == false); // 50 > 100 = false
+}
+
+test "conformance: HEIGHT > 100 boundary at height 100" {
+    const ergo_tree_bytes = [_]u8{
+        0x00, 0x91, 0xA3, 0x04, 0xC8, 0x01,
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = context.Context.forHeight(100, &inputs);
+
+    var eval = evaluator.Evaluator.init(&tree.expr_tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == false); // 100 > 100 = false (GT, not GE)
+}
+
+test "conformance: TrueLeaf always passes" {
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0x7F, // TrueLeaf (SigmaPropConstant true)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = context.Context.forHeight(1, &inputs);
+
+    var eval = evaluator.Evaluator.init(&tree.expr_tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == true);
+}
+
+test "conformance: FalseLeaf always fails" {
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0x80, // FalseLeaf (SigmaPropConstant false)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = context.Context.forHeight(1, &inputs);
+
+    var eval = evaluator.Evaluator.init(&tree.expr_tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == false);
+}
