@@ -11,6 +11,36 @@
 
 const std = @import("std");
 
+// ============================================================================
+// Public API Modules
+// ============================================================================
+
+/// Serialization primitives (VLQ, ZigZag encoding)
+pub const vlq = @import("serialization/vlq.zig");
+
+/// Core type system (SType, TypePool)
+pub const types = @import("core/types.zig");
+
+/// Opcode catalog with metadata
+pub const opcodes = @import("core/opcodes.zig");
+
+/// Memory management pools
+pub const memory = @import("interpreter/memory.zig");
+
+// Re-export commonly used types
+pub const SType = types.SType;
+pub const TypePool = types.TypePool;
+pub const OpCode = opcodes.OpCode;
+pub const EvalPools = memory.EvalPools;
+
+// Pull in tests from all modules
+comptime {
+    _ = vlq;
+    _ = types;
+    _ = opcodes;
+    _ = memory;
+}
+
 /// Protocol version constants
 pub const ProtocolVersion = enum(u8) {
     v0 = 0, // Pre-4.0 (legacy)
