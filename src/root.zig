@@ -27,6 +27,9 @@ pub const data_serializer = @import("serialization/data_serializer.zig");
 /// Expression serialization (expression trees to/from bytes)
 pub const expr_serializer = @import("serialization/expr_serializer.zig");
 
+/// ErgoTree envelope serialization (header, constants, root expression)
+pub const ergotree_serializer = @import("serialization/ergotree_serializer.zig");
+
 /// Core type system (SType, TypePool)
 pub const types = @import("core/types.zig");
 
@@ -48,6 +51,7 @@ comptime {
     _ = type_serializer;
     _ = data_serializer;
     _ = expr_serializer;
+    _ = ergotree_serializer;
     _ = types;
     _ = opcodes;
     _ = memory;
