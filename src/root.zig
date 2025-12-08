@@ -45,6 +45,9 @@ pub const context = @import("interpreter/context.zig");
 /// Expression evaluator
 pub const evaluator = @import("interpreter/evaluator.zig");
 
+/// Cryptographic hash functions (Blake2b256, SHA256)
+pub const hash = @import("crypto/hash.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -63,6 +66,7 @@ comptime {
     _ = memory;
     _ = context;
     _ = evaluator;
+    _ = hash;
 }
 
 /// Protocol version constants
