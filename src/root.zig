@@ -42,6 +42,9 @@ pub const memory = @import("interpreter/memory.zig");
 /// Execution context (boxes, headers, height)
 pub const context = @import("interpreter/context.zig");
 
+/// Expression evaluator
+pub const evaluator = @import("interpreter/evaluator.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -59,6 +62,7 @@ comptime {
     _ = opcodes;
     _ = memory;
     _ = context;
+    _ = evaluator;
 }
 
 /// Protocol version constants
