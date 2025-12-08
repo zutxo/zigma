@@ -32,6 +32,21 @@ pub const max_expressions: usize = 4096;
 /// Maximum cost budget per evaluation (in cost units)
 pub const default_cost_limit: u64 = 1_000_000;
 
+// Compile-time sanity checks for pool configuration
+comptime {
+    // All limits must be reasonable for stack allocation
+    assert(max_eval_depth <= 1024);
+    assert(max_value_stack <= 8192);
+    assert(max_bindings <= 1024);
+    assert(max_expressions <= 16384);
+
+    // Cost limit must be positive
+    assert(default_cost_limit > 0);
+
+    // ValueIndex must fit max_value_stack
+    assert(max_value_stack <= std.math.maxInt(ValueIndex));
+}
+
 // ============================================================================
 // Value Index
 // ============================================================================

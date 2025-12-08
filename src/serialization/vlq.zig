@@ -11,6 +11,15 @@ const assert = std.debug.assert;
 /// Maximum bytes needed for VLQ-encoded u64 (ceil(64/7) = 10)
 pub const max_vlq_bytes: usize = 10;
 
+// Compile-time sanity checks
+comptime {
+    // VLQ for u64 needs at most ceil(64/7) = 10 bytes
+    assert(max_vlq_bytes == 10);
+    // 9 bytes can encode 63 bits, 10 bytes needed for full u64
+    assert((max_vlq_bytes - 1) * 7 < 64);
+    assert(max_vlq_bytes * 7 >= 64);
+}
+
 /// Errors that can occur during VLQ decoding
 pub const DecodeError = error{
     /// Input buffer is empty or truncated (missing continuation bytes)
@@ -29,7 +38,17 @@ pub fn zigzagEncode(n: i64) u64 {
     // Arithmetic right shift preserves sign, giving all 1s for negative
     const shifted: u64 = @bitCast(n << 1);
     const sign_mask: u64 = @bitCast(n >> 63);
-    return shifted ^ sign_mask;
+    const result = shifted ^ sign_mask;
+
+    // POSTCONDITIONS:
+    // 1. Non-negative inputs produce even outputs
+    assert((n >= 0) == (result & 1 == 0));
+    // 2. Zero maps to zero
+    assert(n != 0 or result == 0);
+    // 3. Result encodes magnitude in upper bits
+    assert(if (n >= 0) result >> 1 == @as(u64, @intCast(n)) else result >> 1 == @as(u64, @intCast(-(n + 1))));
+
+    return result;
 }
 
 /// Decode unsigned u64 to signed i64 using ZigZag decoding.
@@ -39,7 +58,17 @@ pub fn zigzagDecode(n: u64) i64 {
     const sign_bit: u64 = n & 1;
     // If sign_bit is 1, negate by XOR with all 1s and subtract (two's complement)
     const mask: u64 = 0 -% sign_bit; // 0 or 0xFFFFFFFFFFFFFFFF
-    return @bitCast(half ^ mask);
+    const result: i64 = @bitCast(half ^ mask);
+
+    // POSTCONDITIONS:
+    // 1. Even inputs produce non-negative outputs
+    assert((n & 1 == 0) == (result >= 0));
+    // 2. Zero maps to zero
+    assert(n != 0 or result == 0);
+    // 3. Magnitude relationship holds
+    assert(if (result >= 0) n >> 1 == @as(u64, @intCast(result)) else n >> 1 == @as(u64, @intCast(-(result + 1))));
+
+    return result;
 }
 
 // ============================================================================
@@ -50,6 +79,7 @@ pub fn zigzagDecode(n: u64) i64 {
 /// Returns number of bytes written.
 /// Buffer must be at least max_vlq_bytes (10) long.
 pub fn encodeU64(value: u64, buf: []u8) usize {
+    // PRECONDITION: Buffer large enough for worst case
     assert(buf.len >= max_vlq_bytes);
 
     var v = value;
@@ -61,10 +91,23 @@ pub fn encodeU64(value: u64, buf: []u8) usize {
 
         if (v == 0) {
             buf[i] = byte; // No continuation bit
-            return i + 1;
+
+            // POSTCONDITIONS:
+            const bytes_written = i + 1;
+            // 1. At least one byte written
+            assert(bytes_written >= 1);
+            // 2. At most max_vlq_bytes written
+            assert(bytes_written <= max_vlq_bytes);
+            // 3. Last byte has no continuation bit
+            assert(buf[i] & 0x80 == 0);
+
+            return bytes_written;
         } else {
             buf[i] = byte | 0x80; // Set continuation bit
             i += 1;
+
+            // INVARIANT: Haven't exceeded max bytes
+            assert(i < max_vlq_bytes);
         }
     }
 }
@@ -72,6 +115,7 @@ pub fn encodeU64(value: u64, buf: []u8) usize {
 /// Decode VLQ-encoded unsigned u64 from buffer.
 /// Returns decoded value and number of bytes consumed.
 pub fn decodeU64(buf: []const u8) DecodeError!struct { value: u64, bytes_read: usize } {
+    // PRECONDITION: Non-empty buffer (checked via error return)
     if (buf.len == 0) return error.UnexpectedEndOfInput;
 
     var result: u64 = 0;
@@ -94,13 +138,22 @@ pub fn decodeU64(buf: []const u8) DecodeError!struct { value: u64, bytes_read: u
 
         if (byte & 0x80 == 0) {
             // No continuation bit - done
+
+            // POSTCONDITIONS:
+            // 1. At least one byte consumed
+            assert(i >= 1);
+            // 2. At most max_vlq_bytes consumed
+            assert(i <= max_vlq_bytes);
+            // 3. Last byte had no continuation bit
+            assert(buf[i - 1] & 0x80 == 0);
+
             return .{ .value = result, .bytes_read = i };
         }
 
         shift += 7;
 
-        // Max 10 bytes for u64
-        if (i >= max_vlq_bytes and (buf.len <= i or buf[i - 1] & 0x80 != 0)) {
+        // INVARIANT: Haven't exceeded max bytes
+        if (i >= max_vlq_bytes) {
             return error.Overflow;
         }
     }

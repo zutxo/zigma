@@ -19,6 +19,17 @@ pub const embeddable_count: u8 = 9;
 /// Type constructor multiplier for embeddable optimization
 pub const type_constr_base: u8 = 12;
 
+// Compile-time sanity checks for type code layout
+comptime {
+    // Embeddable types must fit in type code ranges
+    assert(embeddable_count <= type_constr_base);
+    // Type constructor highest code (symmetric pair + max embeddable) must be < tuple5plus
+    // symmetric_pair_base (84) + embeddable_count (9) = 93 < 96
+    assert(84 + embeddable_count < 96);
+    // Tuple5plus (96) must be below object range (97+)
+    assert(96 < 97);
+}
+
 // ============================================================================
 // Type Code Constants
 // ============================================================================
@@ -94,6 +105,16 @@ pub const TypeIndex = u16;
 
 /// Maximum types in a TypePool
 pub const max_pool_types: usize = 256;
+
+// Compile-time sanity checks for TypePool
+comptime {
+    // TypeIndex must be able to address all pool slots
+    assert(max_pool_types <= std.math.maxInt(TypeIndex));
+    // Pool size is reasonable for stack allocation
+    assert(max_pool_types <= 4096);
+    // Pool can hold at least primitives + common composites
+    assert(max_pool_types >= 32);
+}
 
 /// Runtime type representation using tagged union.
 /// Composite types store indices into TypePool to avoid recursion.
@@ -289,6 +310,9 @@ pub const TypePool = struct {
 
     /// Get or create Coll[T] type
     pub fn getColl(self: *TypePool, elem_idx: TypeIndex) error{PoolFull}!TypeIndex {
+        // PRECONDITION: Element type must exist in pool
+        assert(elem_idx < self.count);
+
         // Check for pre-allocated common types
         if (elem_idx == BYTE) return COLL_BYTE;
         if (elem_idx == INT) return COLL_INT;
@@ -303,11 +327,20 @@ pub const TypePool = struct {
         }
 
         // Create new
-        return self.add(.{ .coll = elem_idx });
+        const result = try self.add(.{ .coll = elem_idx });
+
+        // POSTCONDITION: Result is valid index with correct type
+        assert(result < self.count);
+        assert(self.types[result] == .coll);
+
+        return result;
     }
 
     /// Get or create Option[T] type
     pub fn getOption(self: *TypePool, elem_idx: TypeIndex) error{PoolFull}!TypeIndex {
+        // PRECONDITION: Element type must exist in pool
+        assert(elem_idx < self.count);
+
         // Check for pre-allocated common types
         if (elem_idx == INT) return OPTION_INT;
         if (elem_idx == LONG) return OPTION_LONG;
@@ -321,11 +354,21 @@ pub const TypePool = struct {
         }
 
         // Create new
-        return self.add(.{ .option = elem_idx });
+        const result = try self.add(.{ .option = elem_idx });
+
+        // POSTCONDITION: Result is valid index with correct type
+        assert(result < self.count);
+        assert(self.types[result] == .option);
+
+        return result;
     }
 
     /// Get or create (T1, T2) pair type
     pub fn getPair(self: *TypePool, first: TypeIndex, second: TypeIndex) error{PoolFull}!TypeIndex {
+        // PRECONDITIONS: Both element types must exist in pool
+        assert(first < self.count);
+        assert(second < self.count);
+
         // Search existing
         for (self.types[first_dynamic..self.count], first_dynamic..) |t, i| {
             if (t == .pair and t.pair.first == first and t.pair.second == second) {
@@ -334,7 +377,13 @@ pub const TypePool = struct {
         }
 
         // Create new
-        return self.add(.{ .pair = .{ .first = first, .second = second } });
+        const result = try self.add(.{ .pair = .{ .first = first, .second = second } });
+
+        // POSTCONDITION: Result is valid index with correct type
+        assert(result < self.count);
+        assert(self.types[result] == .pair);
+
+        return result;
     }
 
     /// Calculate serialization type code for a type at given index
