@@ -215,6 +215,20 @@ pub const Reader = struct {
         return @truncate(v);
     }
 
+    /// Read a single byte (for type codes, opcodes, etc.)
+    pub fn readByte(self: *Reader) DecodeError!u8 {
+        if (self.pos >= self.data.len) return error.UnexpectedEndOfInput;
+        const byte = self.data[self.pos];
+        self.pos += 1;
+        return byte;
+    }
+
+    /// Peek at next byte without consuming it
+    pub fn peekByte(self: Reader) ?u8 {
+        if (self.pos >= self.data.len) return null;
+        return self.data[self.pos];
+    }
+
     pub fn remaining(self: Reader) []const u8 {
         return self.data[self.pos..];
     }

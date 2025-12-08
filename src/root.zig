@@ -18,6 +18,9 @@ const std = @import("std");
 /// Serialization primitives (VLQ, ZigZag encoding)
 pub const vlq = @import("serialization/vlq.zig");
 
+/// Type serialization (type codes to TypePool indices)
+pub const type_serializer = @import("serialization/type_serializer.zig");
+
 /// Core type system (SType, TypePool)
 pub const types = @import("core/types.zig");
 
@@ -36,6 +39,7 @@ pub const EvalPools = memory.EvalPools;
 // Pull in tests from all modules
 comptime {
     _ = vlq;
+    _ = type_serializer;
     _ = types;
     _ = opcodes;
     _ = memory;
