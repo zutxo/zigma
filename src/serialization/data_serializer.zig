@@ -81,6 +81,12 @@ pub const Value = union(enum) {
     /// Header value (reference to block header)
     header: HeaderRef,
 
+    /// Single box reference (index into context array)
+    box: BoxRef,
+
+    /// Collection of boxes (reference to context array)
+    box_coll: BoxCollRef,
+
     /// 256-bit signed integer stored as big-endian bytes
     pub const BigInt = struct {
         bytes: [max_bigint_bytes]u8,
@@ -163,6 +169,42 @@ pub const Value = union(enum) {
             assert(@sizeOf([44]u8) == 44); // AVL+ digest
             assert(@sizeOf([3]u8) == 3); // Votes
             assert(@sizeOf([8]u8) == 8); // PoW nonce
+        }
+    };
+
+    /// Reference to a single box in the execution context.
+    /// Boxes are referenced by source (inputs/outputs/data_inputs) and index.
+    pub const BoxRef = struct {
+        /// Which collection the box is from
+        source: BoxSource,
+        /// Index within the source collection
+        index: u16,
+
+        pub const BoxSource = enum(u2) {
+            inputs = 0,
+            outputs = 1,
+            data_inputs = 2,
+        };
+
+        // Compile-time assertions (ZIGMA_STYLE requirement)
+        comptime {
+            // BoxRef must be compact for stack efficiency
+            assert(@sizeOf(BoxRef) <= 8);
+            // Source enum fits in 2 bits
+            assert(@sizeOf(BoxSource) == 1);
+        }
+    };
+
+    /// Reference to a collection of boxes in the execution context.
+    /// Used for INPUTS, OUTPUTS, DATA_INPUTS accessors.
+    pub const BoxCollRef = struct {
+        /// Which collection to reference
+        source: BoxRef.BoxSource,
+
+        // Compile-time assertions (ZIGMA_STYLE requirement)
+        comptime {
+            // BoxCollRef must be minimal
+            assert(@sizeOf(BoxCollRef) <= 4);
         }
     };
 };

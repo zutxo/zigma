@@ -299,10 +299,27 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
-            .inputs, .outputs, .self_box => {
-                // Context accessors - minimal support for now
+            .inputs => {
+                // INPUTS accessor: returns collection of input boxes
                 try self.addCost(FixedCost.inputs);
-                return error.UnsupportedExpression; // TODO: implement collections
+                try self.pushValue(.{ .box_coll = .{ .source = .inputs } });
+            },
+
+            .outputs => {
+                // OUTPUTS accessor: returns collection of output boxes
+                try self.addCost(FixedCost.inputs); // Same cost as inputs
+                try self.pushValue(.{ .box_coll = .{ .source = .outputs } });
+            },
+
+            .self_box => {
+                // SELF accessor: returns the box being validated
+                // PRECONDITION: Context has valid self_index
+                assert(self.ctx.self_index < self.ctx.inputs.len);
+                try self.addCost(FixedCost.inputs);
+                try self.pushValue(.{ .box = .{
+                    .source = .inputs,
+                    .index = self.ctx.self_index,
+                } });
             },
 
             .calc_blake2b256, .calc_sha256 => {
@@ -2347,4 +2364,109 @@ test "evaluator: byte_array_to_bigint negative" {
 
     try std.testing.expect(result == .big_int);
     try std.testing.expect(result.big_int.isNegative()); // Should be negative
+}
+
+// ============================================================================
+// Context Accessor Tests
+// ============================================================================
+
+test "evaluator: inputs returns box collection" {
+    // INPUTS accessor returns collection of input boxes
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .inputs };
+    tree.node_count = 1;
+
+    var box1 = context.testBox();
+    box1.value = 1000;
+    var box2 = context.testBox();
+    box2.value = 2000;
+    const test_inputs = [_]context.BoxView{ box1, box2 };
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is a box collection referencing inputs
+    try std.testing.expect(result == .box_coll);
+    try std.testing.expectEqual(Value.BoxCollRef{ .source = .inputs }, result.box_coll);
+}
+
+test "evaluator: outputs returns box collection" {
+    // OUTPUTS accessor returns collection of output boxes
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .outputs };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    var out_box = context.testBox();
+    out_box.value = 5000;
+    const test_outputs = [_]context.BoxView{out_box};
+    ctx.outputs = &test_outputs;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is a box collection referencing outputs
+    try std.testing.expect(result == .box_coll);
+    try std.testing.expectEqual(Value.BoxCollRef{ .source = .outputs }, result.box_coll);
+}
+
+test "evaluator: self_box returns current box" {
+    // SELF accessor returns the box being validated
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .self_box };
+    tree.node_count = 1;
+
+    var box1 = context.testBox();
+    box1.value = 111;
+    var box2 = context.testBox();
+    box2.value = 222;
+    const test_inputs = [_]context.BoxView{ box1, box2 };
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.self_index = 1; // SELF is the second box
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is a box reference to inputs[self_index]
+    try std.testing.expect(result == .box);
+    try std.testing.expectEqual(Value.BoxRef.BoxSource.inputs, result.box.source);
+    try std.testing.expectEqual(@as(u16, 1), result.box.index);
+}
+
+test "evaluator: self_box at index 0" {
+    // Edge case: SELF is the first input
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .self_box };
+    tree.node_count = 1;
+
+    var box = context.testBox();
+    box.value = 12345;
+    const test_inputs = [_]context.BoxView{box};
+    const ctx = Context.forHeight(100, &test_inputs); // self_index defaults to 0
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Box reference at index 0
+    try std.testing.expect(result == .box);
+    try std.testing.expectEqual(@as(u16, 0), result.box.index);
+}
+
+test "evaluator: inputs with empty context still valid" {
+    // INPUTS on context with 1 input (minimum)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .inputs };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(1, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Even with single input, returns valid box_coll
+    try std.testing.expect(result == .box_coll);
+    try std.testing.expectEqual(Value.BoxCollRef{ .source = .inputs }, result.box_coll);
 }
