@@ -1043,11 +1043,15 @@ pub const Evaluator = struct {
         }
         self.values_sp = start + elem_count;
 
-        // Create tuple reference
-        try self.pushValue(.{ .tuple = .{
-            .start = @truncate(start),
-            .len = @truncate(elem_count),
-        } });
+        // Create tuple reference (using external storage via values array)
+        try self.pushValue(.{
+            .tuple = .{
+                .start = @truncate(start),
+                .len = @truncate(elem_count),
+                .types = .{ 0, 0, 0, 0 }, // External storage, types not inline
+                .values = .{ 0, 0, 0, 0 }, // External storage, values not inline
+            },
+        });
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);

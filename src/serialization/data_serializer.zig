@@ -138,8 +138,14 @@ pub const Value = union(enum) {
 
     /// Reference to tuple
     pub const TupleRef = struct {
+        /// For simple tuples (primitives only): start=0 indicates inline storage
+        /// Otherwise, start/len index into external values array
         start: u16,
         len: u8,
+        /// Element type indices (up to 4)
+        types: [4]TypeIndex,
+        /// Inline storage for simple types (up to 4 i64 values)
+        values: [4]i64,
     };
 
     /// Reference to header (inline copy of HeaderView fields for evaluation)
@@ -477,15 +483,22 @@ fn deserializeTuple2(
     reader: *vlq.Reader,
     arena: anytype,
 ) DeserializeError!Value {
-    _ = t1;
-    _ = t2;
-    _ = pool;
-    _ = arena;
-    _ = reader;
+    // Deserialize both elements
+    const v1 = try deserialize(t1, pool, reader, arena);
+    const v2 = try deserialize(t2, pool, reader, arena);
 
-    // Tuples are serialized as sequential elements
-    // Would need values array to store results
-    return error.NotSupported;
+    // For simple types, store inline
+    const val1 = try valueToI64(v1) orelse return error.NotSupported;
+    const val2 = try valueToI64(v2) orelse return error.NotSupported;
+
+    return .{
+        .tuple = .{
+            .start = 0, // 0 indicates inline storage
+            .len = 2,
+            .types = .{ t1, t2, 0, 0 },
+            .values = .{ val1, val2, 0, 0 },
+        },
+    };
 }
 
 fn deserializeTuple3(
@@ -496,13 +509,20 @@ fn deserializeTuple3(
     reader: *vlq.Reader,
     arena: anytype,
 ) DeserializeError!Value {
-    _ = t1;
-    _ = t2;
-    _ = t3;
-    _ = pool;
-    _ = arena;
-    _ = reader;
-    return error.NotSupported;
+    const v1 = try deserialize(t1, pool, reader, arena);
+    const v2 = try deserialize(t2, pool, reader, arena);
+    const v3 = try deserialize(t3, pool, reader, arena);
+
+    const val1 = try valueToI64(v1) orelse return error.NotSupported;
+    const val2 = try valueToI64(v2) orelse return error.NotSupported;
+    const val3 = try valueToI64(v3) orelse return error.NotSupported;
+
+    return .{ .tuple = .{
+        .start = 0,
+        .len = 3,
+        .types = .{ t1, t2, t3, 0 },
+        .values = .{ val1, val2, val3, 0 },
+    } };
 }
 
 fn deserializeTuple4(
@@ -514,14 +534,22 @@ fn deserializeTuple4(
     reader: *vlq.Reader,
     arena: anytype,
 ) DeserializeError!Value {
-    _ = t1;
-    _ = t2;
-    _ = t3;
-    _ = t4;
-    _ = pool;
-    _ = arena;
-    _ = reader;
-    return error.NotSupported;
+    const v1 = try deserialize(t1, pool, reader, arena);
+    const v2 = try deserialize(t2, pool, reader, arena);
+    const v3 = try deserialize(t3, pool, reader, arena);
+    const v4 = try deserialize(t4, pool, reader, arena);
+
+    const val1 = try valueToI64(v1) orelse return error.NotSupported;
+    const val2 = try valueToI64(v2) orelse return error.NotSupported;
+    const val3 = try valueToI64(v3) orelse return error.NotSupported;
+    const val4 = try valueToI64(v4) orelse return error.NotSupported;
+
+    return .{ .tuple = .{
+        .start = 0,
+        .len = 4,
+        .types = .{ t1, t2, t3, t4 },
+        .values = .{ val1, val2, val3, val4 },
+    } };
 }
 
 fn deserializeTupleN(
@@ -530,11 +558,38 @@ fn deserializeTupleN(
     reader: *vlq.Reader,
     arena: anytype,
 ) DeserializeError!Value {
-    _ = indices;
-    _ = pool;
-    _ = arena;
-    _ = reader;
-    return error.NotSupported;
+    // Only support up to 4 elements for now
+    if (indices.len > 4) return error.NotSupported;
+
+    var elem_types: [4]TypeIndex = .{ 0, 0, 0, 0 };
+    var elem_values: [4]i64 = .{ 0, 0, 0, 0 };
+
+    for (indices, 0..) |t, i| {
+        const v = try deserialize(t, pool, reader, arena);
+        const val = try valueToI64(v) orelse return error.NotSupported;
+        elem_types[i] = t;
+        elem_values[i] = val;
+    }
+
+    return .{ .tuple = .{
+        .start = 0,
+        .len = @intCast(indices.len),
+        .types = elem_types,
+        .values = elem_values,
+    } };
+}
+
+/// Convert simple Value to i64 for inline tuple storage
+/// Returns null for complex types that can't be stored inline
+fn valueToI64(v: Value) DeserializeError!?i64 {
+    return switch (v) {
+        .boolean => |b| if (b) 1 else 0,
+        .byte => |b| @as(i64, b),
+        .short => |s| @as(i64, s),
+        .int => |i| @as(i64, i),
+        .long => |l| l,
+        else => null,
+    };
 }
 
 fn mapVlqError(err: vlq.DecodeError) DeserializeError {
@@ -969,4 +1024,60 @@ test "data_serializer: group_element rejects x >= field prime" {
 
     var reader = vlq.Reader.init(&x_equals_p);
     try std.testing.expectError(error.InvalidGroupElement, deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena));
+}
+
+test "data_serializer: deserialize tuple2 of longs" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    // Register (Long, Long) tuple type
+    const tuple_type = pool.add(.{ .pair = .{ .first = TypePool.LONG, .second = TypePool.LONG } }) catch unreachable;
+
+    // Two VLQ-encoded longs: 10 and 20
+    var data: [32]u8 = undefined;
+    const len1 = vlq.encodeI64(10, &data);
+    const len2 = vlq.encodeI64(20, data[len1..]);
+
+    var reader = vlq.Reader.init(data[0 .. len1 + len2]);
+    const result = try deserialize(tuple_type, &pool, &reader, &arena);
+
+    try std.testing.expect(result == .tuple);
+    try std.testing.expectEqual(@as(u8, 2), result.tuple.len);
+    try std.testing.expectEqual(@as(i64, 10), result.tuple.values[0]);
+    try std.testing.expectEqual(@as(i64, 20), result.tuple.values[1]);
+}
+
+test "data_serializer: deserialize option Some(long)" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    // Register Option[Long] type
+    const option_type = pool.add(.{ .option = TypePool.LONG }) catch unreachable;
+
+    // Some(42): 0x01 (flag) + VLQ(42)
+    var data: [32]u8 = undefined;
+    data[0] = 0x01; // Some flag
+    const val_len = vlq.encodeI64(42, data[1..]);
+
+    var reader = vlq.Reader.init(data[0 .. 1 + val_len]);
+    const result = try deserialize(option_type, &pool, &reader, &arena);
+
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(@as(?u16, 0), result.option.value_idx);
+    try std.testing.expectEqual(@as(i64, 42), result.option.simple_value);
+}
+
+test "data_serializer: deserialize option None" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    const option_type = pool.add(.{ .option = TypePool.LONG }) catch unreachable;
+
+    // None: 0x00
+    var data = [_]u8{0x00};
+    var reader = vlq.Reader.init(&data);
+    const result = try deserialize(option_type, &pool, &reader, &arena);
+
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(@as(?u16, null), result.option.value_idx);
 }
