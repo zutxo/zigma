@@ -1,0 +1,52 @@
+{
+  "category": "conversion",
+  "description": "Type conversion operations",
+  "upcast": {
+    "byte_to_short": [
+      {
+        "input": 0,
+        "expected": 0
+      },
+      {
+        "input": 127,
+        "expected": 127
+      },
+      {
+        "input": -128,
+        "expected": -128
+      },
+      {
+        "input": -1,
+        "expected": -1
+      }
+    ],
+    "byte_to_int": [
+      {
+        "input": 0,
+        "expected": 0
+      },
+      {
+        "input": 127,
+        "expected": 127
+      },
+      {
+        "input": -128,
+        "expected": -128
+      }
+    ],
+    "byte_to_long": [
+      {
+        "input": 0,
+        "expected": 0
+      },
+      {
+        "input": 127,
+        "expected": 127
+      },
+      {
+        "input": -128,
+        "expected": -128
+      }
+    ]
+  }
+}

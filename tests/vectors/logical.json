@@ -1,0 +1,106 @@
+{
+  "category": "logical",
+  "description": "Boolean logical operations",
+  "operations": {
+    "xor": [
+      {
+        "input": [
+          true,
+          true
+        ],
+        "expected": false
+      },
+      {
+        "input": [
+          true,
+          false
+        ],
+        "expected": true
+      },
+      {
+        "input": [
+          false,
+          false
+        ],
+        "expected": false
+      },
+      {
+        "input": [
+          false,
+          true
+        ],
+        "expected": true
+      }
+    ],
+    "and": [
+      {
+        "input": [
+          false,
+          true
+        ],
+        "expected": false
+      },
+      {
+        "input": [
+          false,
+          false
+        ],
+        "expected": false
+      },
+      {
+        "input": [
+          true,
+          true
+        ],
+        "expected": true
+      },
+      {
+        "input": [
+          true,
+          false
+        ],
+        "expected": false
+      }
+    ],
+    "or": [
+      {
+        "input": [
+          true,
+          false
+        ],
+        "expected": true
+      },
+      {
+        "input": [
+          true,
+          true
+        ],
+        "expected": true
+      },
+      {
+        "input": [
+          false,
+          false
+        ],
+        "expected": false
+      },
+      {
+        "input": [
+          false,
+          true
+        ],
+        "expected": true
+      }
+    ],
+    "not": [
+      {
+        "input": false,
+        "expected": true
+      },
+      {
+        "input": true,
+        "expected": false
+      }
+    ]
+  }
+}

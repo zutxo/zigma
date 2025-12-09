@@ -1,0 +1,320 @@
+{
+  "category": "arithmetic",
+  "description": "Numeric arithmetic operations with overflow checking",
+  "byte_operations": [
+    {
+      "input": [
+        -128,
+        -128
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -128,
+        0
+      ],
+      "expected": {
+        "error": "/ by zero"
+      }
+    },
+    {
+      "input": [
+        -128,
+        17
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -128,
+        127
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -120,
+        82
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -103,
+        1
+      ],
+      "expected": {
+        "plus": -102,
+        "minus": -104,
+        "multiply": -103,
+        "divide": -103,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        -90,
+        37
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -78,
+        -111
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -71,
+        -44
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -53,
+        0
+      ],
+      "expected": {
+        "error": "/ by zero"
+      }
+    },
+    {
+      "input": [
+        -34,
+        8
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -24,
+        127
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        -1,
+        -1
+      ],
+      "expected": {
+        "plus": -2,
+        "minus": 0,
+        "multiply": 1,
+        "divide": 1,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        -1,
+        23
+      ],
+      "expected": {
+        "plus": 22,
+        "minus": -24,
+        "multiply": -23,
+        "divide": 0,
+        "modulo": -1
+      }
+    },
+    {
+      "input": [
+        0,
+        -128
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        0,
+        -23
+      ],
+      "expected": {
+        "plus": -23,
+        "minus": 23,
+        "multiply": 0,
+        "divide": 0,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        0,
+        -1
+      ],
+      "expected": {
+        "plus": -1,
+        "minus": 1,
+        "multiply": 0,
+        "divide": 0,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        0,
+        0
+      ],
+      "expected": {
+        "error": "/ by zero"
+      }
+    },
+    {
+      "input": [
+        0,
+        1
+      ],
+      "expected": {
+        "plus": 1,
+        "minus": -1,
+        "multiply": 0,
+        "divide": 0,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        0,
+        60
+      ],
+      "expected": {
+        "plus": 60,
+        "minus": -60,
+        "multiply": 0,
+        "divide": 0,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        0,
+        127
+      ],
+      "expected": {
+        "plus": 127,
+        "minus": -127,
+        "multiply": 0,
+        "divide": 0,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        1,
+        -1
+      ],
+      "expected": {
+        "plus": 0,
+        "minus": 2,
+        "multiply": -1,
+        "divide": -1,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        1,
+        0
+      ],
+      "expected": {
+        "error": "/ by zero"
+      }
+    },
+    {
+      "input": [
+        1,
+        26
+      ],
+      "expected": {
+        "plus": 27,
+        "minus": -25,
+        "multiply": 26,
+        "divide": 0,
+        "modulo": 1
+      }
+    },
+    {
+      "input": [
+        7,
+        -32
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        33,
+        1
+      ],
+      "expected": {
+        "plus": 34,
+        "minus": 32,
+        "multiply": 33,
+        "divide": 33,
+        "modulo": 0
+      }
+    },
+    {
+      "input": [
+        90,
+        0
+      ],
+      "expected": {
+        "error": "/ by zero"
+      }
+    },
+    {
+      "input": [
+        127,
+        -128
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        127,
+        -47
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    },
+    {
+      "input": [
+        127,
+        127
+      ],
+      "expected": {
+        "error": "Byte overflow"
+      }
+    }
+  ]
+}
