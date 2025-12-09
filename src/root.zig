@@ -54,6 +54,9 @@ pub const hash = @import("crypto/hash.zig");
 /// 256-bit signed integer arithmetic
 pub const bigint = @import("crypto/bigint.zig");
 
+/// secp256k1 elliptic curve operations
+pub const secp256k1 = @import("crypto/secp256k1.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -75,6 +78,7 @@ comptime {
     _ = ops;
     _ = hash;
     _ = bigint;
+    _ = secp256k1;
 }
 
 /// Protocol version constants
