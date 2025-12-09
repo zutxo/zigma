@@ -57,6 +57,9 @@ pub const bigint = @import("crypto/bigint.zig");
 /// secp256k1 elliptic curve operations
 pub const secp256k1 = @import("crypto/secp256k1.zig");
 
+/// SigmaBoolean tree representation
+pub const sigma_tree = @import("sigma/sigma_tree.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -79,6 +82,7 @@ comptime {
     _ = hash;
     _ = bigint;
     _ = secp256k1;
+    _ = sigma_tree;
 }
 
 /// Protocol version constants
