@@ -87,6 +87,14 @@ pub const ExprTag = enum(u8) {
     byte_array_to_bigint,
     /// Convert Coll[Byte] to Long (opcode 0x7A)
     byte_array_to_long,
+    /// Decode point from bytes (opcode 0xD0) - Coll[Byte] → GroupElement
+    decode_point,
+    /// Get group generator G (opcode 0xD2) - → GroupElement
+    group_generator,
+    /// Scalar multiplication (opcode 0xD3) - GroupElement, BigInt → GroupElement
+    exponentiate,
+    /// Point multiplication/addition (opcode 0xD4) - GroupElement, GroupElement → GroupElement
+    multiply_group,
     /// Unsupported opcode
     unsupported,
 };
@@ -367,6 +375,17 @@ fn deserializeWithDepth(
             opcodes.LongToByteArray => try deserializeUnaryOp(tree, reader, arena, .long_to_byte_array, depth),
             opcodes.ByteArrayToBigInt => try deserializeUnaryOp(tree, reader, arena, .byte_array_to_bigint, depth),
             opcodes.ByteArrayToLong => try deserializeUnaryOp(tree, reader, arena, .byte_array_to_long, depth),
+            // Group element crypto operations
+            opcodes.DecodePoint => try deserializeUnaryOp(tree, reader, arena, .decode_point, depth),
+            opcodes.GroupGenerator => {
+                // Nullary operation - just add the node
+                _ = try tree.addNode(.{
+                    .tag = .group_generator,
+                    .result_type = TypePool.GROUP_ELEMENT,
+                });
+            },
+            opcodes.Exponentiate => try deserializeBinaryGroupOp(tree, reader, arena, .exponentiate, depth),
+            opcodes.MultiplyGroup => try deserializeBinaryGroupOp(tree, reader, arena, .multiply_group, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -489,7 +508,7 @@ fn deserializeUnaryOp(
     assert(tag == .calc_blake2b256 or tag == .calc_sha256 or
         tag == .option_get or tag == .option_is_defined or
         tag == .long_to_byte_array or tag == .byte_array_to_bigint or
-        tag == .byte_array_to_long);
+        tag == .byte_array_to_long or tag == .decode_point);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {
@@ -498,6 +517,7 @@ fn deserializeUnaryOp(
         .option_get => TypePool.ANY, // Will be inner type of option at runtime
         .byte_array_to_long => TypePool.LONG,
         .byte_array_to_bigint => TypePool.BIG_INT,
+        .decode_point => TypePool.GROUP_ELEMENT,
         else => TypePool.ANY,
     };
 
@@ -508,6 +528,29 @@ fn deserializeUnaryOp(
     });
 
     // Parse the single operand
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeBinaryGroupOp(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITION: tag is a valid binary group operation
+    assert(tag == .exponentiate or tag == .multiply_group);
+
+    // Add the binary op node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .result_type = TypePool.GROUP_ELEMENT,
+    });
+
+    // Parse left operand (GroupElement for both ops)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse right operand (BigInt for exponentiate, GroupElement for multiply)
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 

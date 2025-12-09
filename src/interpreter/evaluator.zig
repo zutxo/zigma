@@ -19,6 +19,7 @@ const expr = @import("../serialization/expr_serializer.zig");
 const data = @import("../serialization/data_serializer.zig");
 const types = @import("../core/types.zig");
 const hash = @import("../crypto/hash.zig");
+const crypto_ops = @import("ops/crypto.zig");
 
 const Context = context.Context;
 const ExprTree = expr.ExprTree;
@@ -90,6 +91,8 @@ pub const EvalError = error{
     OptionNone,
     /// Invalid data format (wrong length, etc.)
     InvalidData,
+    /// Invalid group element (not on curve or bad encoding)
+    InvalidGroupElement,
 };
 
 // ============================================================================
@@ -128,6 +131,11 @@ const FixedCost = struct {
     pub const blake2b256_base: u32 = 59; // Base cost for CalcBlake2b256
     pub const sha256_base: u32 = 64; // Base cost for CalcSha256
     pub const hash_per_byte: u32 = 1; // Per-byte cost for hashing
+    // Group element operation costs (from opcodes.zig)
+    pub const decode_point: u32 = 1100;
+    pub const group_generator: u32 = 10;
+    pub const exponentiate: u32 = 5100;
+    pub const multiply_group: u32 = 250;
 };
 
 // ============================================================================
@@ -359,6 +367,39 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            .decode_point => {
+                // Unary: Coll[Byte] → GroupElement
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .group_generator => {
+                // Nullary: → GroupElement (no children to evaluate)
+                try self.addCost(FixedCost.group_generator);
+                const g = crypto_ops.groupGenerator();
+                try self.pushValue(.{ .group_element = g });
+            },
+
+            .exponentiate => {
+                // Binary: GroupElement, BigInt → GroupElement
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Left child (GroupElement) at node_idx+1
+                const left_idx = node_idx + 1;
+                const right_idx = self.findSubtreeEnd(left_idx);
+                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+            },
+
+            .multiply_group => {
+                // Binary: GroupElement, GroupElement → GroupElement
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Left child (GroupElement) at node_idx+1
+                const left_idx = node_idx + 1;
+                const right_idx = self.findSubtreeEnd(left_idx);
+                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -445,6 +486,18 @@ pub const Evaluator = struct {
 
             .byte_array_to_bigint => {
                 try self.computeByteArrayToBigInt();
+            },
+
+            .decode_point => {
+                try self.computeDecodePoint();
+            },
+
+            .exponentiate => {
+                try self.computeExponentiate();
+            },
+
+            .multiply_group => {
+                try self.computeMultiplyGroup();
             },
 
             else => {
@@ -625,6 +678,98 @@ pub const Evaluator = struct {
         assert(self.value_sp > 0);
     }
 
+    /// Compute DecodePoint - decode Coll[Byte] to GroupElement
+    fn computeDecodePoint(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.decode_point);
+
+        const input = try self.popValue();
+        if (input != .coll_byte) return error.TypeMismatch;
+
+        const bytes = input.coll_byte;
+        if (bytes.len != 33) return error.InvalidData;
+
+        // INVARIANT: Input is exactly 33 bytes
+        assert(bytes.len == 33);
+
+        // Decode and validate the point
+        _ = crypto_ops.decodePoint(bytes) catch return error.InvalidGroupElement;
+
+        // Store as raw bytes (already validated)
+        var result: [33]u8 = undefined;
+        @memcpy(&result, bytes);
+        try self.pushValue(.{ .group_element = result });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute Exponentiate - scalar multiplication: GroupElement * BigInt
+    fn computeExponentiate(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(FixedCost.exponentiate);
+
+        // Pop right (scalar) then left (point) - stack order
+        const scalar_val = try self.popValue();
+        const point_val = try self.popValue();
+
+        // Validate types
+        if (point_val != .group_element) return error.TypeMismatch;
+        if (scalar_val != .big_int) return error.TypeMismatch;
+
+        // INVARIANT: Both values have correct types
+        assert(point_val == .group_element);
+        assert(scalar_val == .big_int);
+
+        const point_bytes = point_val.group_element;
+        const scalar = scalar_val.big_int;
+
+        // Perform scalar multiplication
+        const result = crypto_ops.exponentiate(&point_bytes, scalar.bytes[0..scalar.len]) catch
+            return error.InvalidGroupElement;
+
+        try self.pushValue(.{ .group_element = result });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute MultiplyGroup - point addition: GroupElement + GroupElement
+    fn computeMultiplyGroup(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(FixedCost.multiply_group);
+
+        // Pop right then left - stack order
+        const right_val = try self.popValue();
+        const left_val = try self.popValue();
+
+        // Validate types
+        if (left_val != .group_element) return error.TypeMismatch;
+        if (right_val != .group_element) return error.TypeMismatch;
+
+        // INVARIANT: Both values are group elements
+        assert(left_val == .group_element);
+        assert(right_val == .group_element);
+
+        const left_bytes = left_val.group_element;
+        const right_bytes = right_val.group_element;
+
+        // Perform point addition
+        const result = crypto_ops.multiplyGroup(&left_bytes, &right_bytes) catch
+            return error.InvalidGroupElement;
+
+        try self.pushValue(.{ .group_element = result });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
     /// Compute binary operation
     fn computeBinOp(self: *Evaluator, kind: BinOpKind) EvalError!void {
         try self.addCost(FixedCost.comparison);
@@ -743,10 +888,10 @@ pub const Evaluator = struct {
 
         switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box => {},
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .group_generator => {},
 
             // One child
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long => {
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point => {
                 next = self.findSubtreeEnd(next);
             },
 
@@ -756,9 +901,9 @@ pub const Evaluator = struct {
             },
 
             // Two children
-            .bin_op, .option_get_or_else => {
-                next = self.findSubtreeEnd(next); // Left / Option
-                next = self.findSubtreeEnd(next); // Right / Default
+            .bin_op, .option_get_or_else, .exponentiate, .multiply_group => {
+                next = self.findSubtreeEnd(next); // Left / Option / Point
+                next = self.findSubtreeEnd(next); // Right / Default / Scalar/Point
             },
 
             // Three children
