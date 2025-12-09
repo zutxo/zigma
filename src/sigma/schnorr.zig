@@ -203,8 +203,12 @@ pub fn verifyAndGetCommitment(
     challenge: Challenge,
     response: SecondMessage,
 ) SchnorrError!Point {
-    // Precondition: inputs are valid
+    // PRECONDITION 1: response has valid size
     assert(response.z.len == SCALAR_SIZE);
+    // PRECONDITION 2: challenge has valid size
+    assert(challenge.bytes.len == SOUNDNESS_BYTES);
+    // PRECONDITION 3: public key has valid prefix (compressed point)
+    assert(proposition.public_key[0] == 0x02 or proposition.public_key[0] == 0x03);
 
     const z = response.toScalar();
 
@@ -213,7 +217,11 @@ pub fn verifyAndGetCommitment(
         return error.InvalidResponse;
     }
 
-    return computeCommitment(proposition, challenge, response);
+    const result = try computeCommitment(proposition, challenge, response);
+
+    // POSTCONDITION: result is valid point
+    assert(result.is_infinity or result.isValid());
+    return result;
 }
 
 // ============================================================================
@@ -222,13 +230,18 @@ pub fn verifyAndGetCommitment(
 
 /// Convert 24-byte challenge to 32-byte scalar (zero-padded, big-endian)
 fn challengeToScalar(challenge: Challenge) [4]u64 {
-    // Precondition: challenge is 24 bytes
+    // PRECONDITION 1: challenge is 24 bytes
     assert(challenge.bytes.len == SOUNDNESS_BYTES);
+    // PRECONDITION 2: 192-bit challenge fits in 256-bit scalar with room to spare
+    assert(SOUNDNESS_BYTES < 32);
 
     // Create 32-byte array, zero-padded at the start (big-endian)
     var scalar_bytes: [32]u8 = [_]u8{0} ** 32;
     // Copy 24 bytes to the end (bytes 8-31)
     @memcpy(scalar_bytes[8..32], &challenge.bytes);
+
+    // INVARIANT: first 8 bytes are zero (padding)
+    assert(std.mem.eql(u8, scalar_bytes[0..8], &[_]u8{0} ** 8));
 
     // Convert to limbs (little-endian)
     var limbs: [4]u64 = undefined;
@@ -237,8 +250,11 @@ fn challengeToScalar(challenge: Challenge) [4]u64 {
         limbs[i] = std.mem.readInt(u64, scalar_bytes[offset..][0..8], .big);
     }
 
-    // Postcondition: high limb has only 56 bits (since challenge is 192 bits)
+    // POSTCONDITION 1: high limb has only 56 bits (since challenge is 192 bits)
     assert(limbs[3] >> 56 == 0);
+    // POSTCONDITION 2: result is less than curve order (192 bits < 256 bits)
+    assert(cmpLimbs(limbs, CURVE_ORDER) == .lt);
+
     return limbs;
 }
 

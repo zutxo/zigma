@@ -66,14 +66,19 @@ pub const Challenge = struct {
 
     /// Create from slice (must be exactly SOUNDNESS_BYTES)
     pub fn fromSlice(slice: []const u8) error{InvalidLength}!Challenge {
-        // Precondition: slice length must be exact
+        // PRECONDITION 1: slice length must be exact
         if (slice.len != SOUNDNESS_BYTES) return error.InvalidLength;
+        // PRECONDITION 2: slice pointer is valid (redundant but defensive)
+        assert(slice.len > 0);
 
         var result: Challenge = undefined;
         @memcpy(&result.bytes, slice);
 
-        // Postcondition: result has correct length
+        // POSTCONDITION 1: result has correct length
         assert(result.bytes.len == SOUNDNESS_BYTES);
+        // POSTCONDITION 2: bytes were copied correctly
+        assert(std.mem.eql(u8, &result.bytes, slice));
+
         return result;
     }
 
@@ -121,15 +126,24 @@ pub const Challenge = struct {
 /// Compute Fiat-Shamir challenge from arbitrary input
 /// Returns first 24 bytes of Blake2b256 hash
 pub fn fiatShamirHash(input: []const u8) Challenge {
-    // Precondition: input length is bounded
+    // PRECONDITION 1: input length is bounded
     assert(input.len <= std.math.maxInt(usize));
+    // PRECONDITION 2: blake2b256 produces 32 bytes (enough for 24)
+    assert(32 >= SOUNDNESS_BYTES);
 
     const full_hash = hash.blake2b256(input);
+
+    // INVARIANT: hash output has expected length
+    assert(full_hash.len == 32);
+
     var result: [SOUNDNESS_BYTES]u8 = undefined;
     @memcpy(&result, full_hash[0..SOUNDNESS_BYTES]);
 
-    // Postcondition: result is correct length
+    // POSTCONDITION 1: result is correct length
     assert(result.len == SOUNDNESS_BYTES);
+    // POSTCONDITION 2: result matches hash prefix
+    assert(std.mem.eql(u8, &result, full_hash[0..SOUNDNESS_BYTES]));
+
     return Challenge{ .bytes = result };
 }
 
@@ -137,19 +151,28 @@ pub fn fiatShamirHash(input: []const u8) Challenge {
 /// This is the main entry point for verification:
 ///   challenge = Blake2b256(tree_bytes || message).take(24)
 pub fn computeChallenge(tree_bytes: []const u8, message: []const u8) Challenge {
-    // Precondition: combined length is bounded
+    // PRECONDITION 1: combined length is bounded (no overflow)
     assert(tree_bytes.len <= std.math.maxInt(usize) - message.len);
+    // PRECONDITION 2: tree_bytes is not unreasonably large
+    assert(tree_bytes.len <= MAX_FS_TREE_BYTES);
 
     var hasher = hash.Blake2b256Hasher.init();
     hasher.update(tree_bytes);
     hasher.update(message);
 
     const full_hash = hasher.finalize();
+
+    // INVARIANT: hash output has expected length
+    assert(full_hash.len == 32);
+
     var result: [SOUNDNESS_BYTES]u8 = undefined;
     @memcpy(&result, full_hash[0..SOUNDNESS_BYTES]);
 
-    // Postcondition: result is valid challenge
+    // POSTCONDITION 1: result is valid challenge length
     assert(result.len == SOUNDNESS_BYTES);
+    // POSTCONDITION 2: result matches hash prefix
+    assert(std.mem.eql(u8, &result, full_hash[0..SOUNDNESS_BYTES]));
+
     return Challenge{ .bytes = result };
 }
 
@@ -225,9 +248,12 @@ pub fn serializeLeaf(
     commitment: ?FirstMessage,
     buffer: []u8,
 ) SerializeError![]u8 {
+    // PRECONDITION 1: buffer has minimum size for header
     assert(buffer.len >= 1);
-
+    // PRECONDITION 2: commitment is provided
     const commit = commitment orelse return error.MissingCommitment;
+    // PRECONDITION 3: proposition is a valid leaf type
+    assert(proposition == .prove_dlog or proposition == .prove_dh_tuple);
 
     // Serialize proposition as minimal ErgoTree
     // For ProveDlog: 0x08cd || public_key (35 bytes total)
@@ -292,6 +318,11 @@ pub fn serializeLeaf(
     // Write commitment bytes
     @memcpy(buffer[pos .. pos + commit_bytes.len], commit_bytes);
     pos += commit_bytes.len;
+
+    // POSTCONDITION 1: wrote expected number of bytes
+    assert(pos == total_size);
+    // POSTCONDITION 2: first byte is leaf prefix
+    assert(buffer[0] == LEAF_PREFIX);
 
     return buffer[0..pos];
 }

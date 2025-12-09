@@ -52,19 +52,72 @@ pub const VerifierError = error{
     UnsupportedProposition,
     /// Buffer too small for tree serialization
     BufferTooSmall,
-    /// Memory allocation failed
-    OutOfMemory,
+    /// Proof tree exceeds maximum allowed size
+    ProofTooLarge,
+    /// Proof tree exceeds maximum depth
+    ProofTooDeep,
+};
+
+// ============================================================================
+// Verifier Context (Pre-Allocated Pools)
+// ============================================================================
+
+/// Maximum proof tree depth (prevents stack overflow)
+pub const MAX_PROOF_DEPTH: u8 = 32;
+
+/// Maximum children in AND/OR/THRESHOLD nodes
+pub const MAX_CHILDREN: u8 = 16;
+
+/// Maximum total nodes in a proof tree
+pub const MAX_TREE_NODES: u16 = @as(u16, MAX_PROOF_DEPTH) * MAX_CHILDREN;
+
+// Compile-time sanity checks
+comptime {
+    assert(MAX_PROOF_DEPTH <= 128);
+    assert(MAX_CHILDREN <= 255);
+    assert(MAX_TREE_NODES <= 4096);
+}
+
+/// Pre-allocated verification context
+/// Replaces dynamic allocation during verification
+pub const VerifierContext = struct {
+    /// Pre-allocated node storage
+    tree_nodes: [MAX_TREE_NODES]UncheckedTree = undefined,
+    /// Number of nodes allocated
+    node_count: u16 = 0,
+
+    /// Fiat-Shamir serialization buffer
+    fs_buffer: [challenge_mod.MAX_FS_TREE_BYTES]u8 = undefined,
+
+    /// Allocate space for tree nodes from pre-allocated pool
+    pub fn allocateNodes(self: *VerifierContext, count: u16) VerifierError![]UncheckedTree {
+        // PRECONDITION: Request is bounded
+        assert(count <= MAX_CHILDREN);
+        // PRECONDITION: Current count is valid
+        assert(self.node_count <= MAX_TREE_NODES);
+
+        if (self.node_count + count > MAX_TREE_NODES) {
+            return error.ProofTooLarge;
+        }
+
+        const start = self.node_count;
+        self.node_count += count;
+
+        // POSTCONDITION: Returned slice has requested size
+        const result = self.tree_nodes[start..self.node_count];
+        assert(result.len == count);
+        return result;
+    }
+
+    /// Reset for reuse (O(1), no memory zeroing)
+    pub fn reset(self: *VerifierContext) void {
+        self.node_count = 0;
+    }
 };
 
 // ============================================================================
 // Unchecked Proof Tree
 // ============================================================================
-
-/// Maximum proof tree depth
-pub const MAX_PROOF_DEPTH: usize = 32;
-
-/// Maximum children in AND/OR/THRESHOLD
-pub const MAX_CHILDREN: usize = 16;
 
 /// Unchecked Schnorr proof leaf
 pub const UncheckedSchnorr = struct {
@@ -195,17 +248,25 @@ pub fn parseAndProof(
     children: []const *const SigmaBoolean,
     reader: *ProofReader,
     challenge_opt: ?Challenge,
-    allocator: std.mem.Allocator,
+    ctx: *VerifierContext,
 ) VerifierError!UncheckedTree {
+    // PRECONDITION: children count is bounded
+    assert(children.len <= MAX_CHILDREN);
+    // PRECONDITION: context has valid state
+    assert(ctx.node_count <= MAX_TREE_NODES);
+
     const challenge = challenge_opt orelse try reader.readChallenge();
 
-    var parsed_children = try allocator.alloc(UncheckedTree, children.len);
-    errdefer allocator.free(parsed_children);
+    // Allocate from pre-allocated pool
+    var parsed_children = try ctx.allocateNodes(@intCast(children.len));
 
     // AND: all children get the same challenge
     for (children, 0..) |child, i| {
-        parsed_children[i] = try parseProofTree(child.*, reader, challenge, allocator);
+        parsed_children[i] = try parseProofTree(child.*, reader, challenge, ctx);
     }
+
+    // POSTCONDITION: all children parsed
+    assert(parsed_children.len == children.len);
 
     return UncheckedTree{
         .cand = .{
@@ -222,27 +283,34 @@ pub fn parseOrProof(
     children: []const *const SigmaBoolean,
     reader: *ProofReader,
     challenge_opt: ?Challenge,
-    allocator: std.mem.Allocator,
+    ctx: *VerifierContext,
 ) VerifierError!UncheckedTree {
+    // PRECONDITION: children count is bounded and non-empty
+    assert(children.len > 0);
+    assert(children.len <= MAX_CHILDREN);
+    // PRECONDITION: context has valid state
+    assert(ctx.node_count <= MAX_TREE_NODES);
+
     const challenge = challenge_opt orelse try reader.readChallenge();
 
-    if (children.len == 0) return error.UnsupportedProposition;
-
-    var parsed_children = try allocator.alloc(UncheckedTree, children.len);
-    errdefer allocator.free(parsed_children);
+    // Allocate from pre-allocated pool
+    var parsed_children = try ctx.allocateNodes(@intCast(children.len));
 
     // OR: read challenges for all but last, compute last via XOR
     var xored = challenge;
 
     for (0..children.len - 1) |i| {
         // Each child except last reads its own challenge
-        parsed_children[i] = try parseProofTree(children[i].*, reader, null, allocator);
+        parsed_children[i] = try parseProofTree(children[i].*, reader, null, ctx);
         xored = xored.xor(parsed_children[i].getChallenge());
     }
 
     // Last child's challenge is XOR of all others with parent
     const last_idx = children.len - 1;
-    parsed_children[last_idx] = try parseProofTree(children[last_idx].*, reader, xored, allocator);
+    parsed_children[last_idx] = try parseProofTree(children[last_idx].*, reader, xored, ctx);
+
+    // POSTCONDITION: all children parsed and XOR property holds
+    assert(parsed_children.len == children.len);
 
     return UncheckedTree{
         .cor = .{
@@ -252,20 +320,23 @@ pub fn parseOrProof(
     };
 }
 
-/// Parse proof tree recursively
+/// Parse proof tree (uses context for pre-allocated storage)
 pub fn parseProofTree(
     prop: SigmaBoolean,
     reader: *ProofReader,
     challenge_opt: ?Challenge,
-    allocator: std.mem.Allocator,
+    ctx: *VerifierContext,
 ) VerifierError!UncheckedTree {
+    // PRECONDITION: context has valid state
+    assert(ctx.node_count <= MAX_TREE_NODES);
+
     return switch (prop) {
         .trivial_true => .trivial_true,
         .trivial_false => .trivial_false,
         .prove_dlog => |dlog| .{ .schnorr = try parseSchnorrProof(dlog, reader, challenge_opt) },
         .prove_dh_tuple => error.UnsupportedProposition, // TODO: Phase 6.5
-        .cand => |and_node| try parseAndProof(and_node.children, reader, challenge_opt, allocator),
-        .cor => |or_node| try parseOrProof(or_node.children, reader, challenge_opt, allocator),
+        .cand => |and_node| try parseAndProof(and_node.children, reader, challenge_opt, ctx),
+        .cor => |or_node| try parseOrProof(or_node.children, reader, challenge_opt, ctx),
         .cthreshold => error.UnsupportedProposition, // TODO: Phase 6.5
     };
 }
@@ -274,9 +345,17 @@ pub fn parseProofTree(
 // Commitment Computation (Verifier Step 4)
 // ============================================================================
 
+/// Maximum work stack depth for tree traversal
+const MAX_WORK_STACK: u16 = MAX_TREE_NODES;
+
 /// Compute commitment for a Schnorr proof leaf
 /// a = g^z * h^(-e)
 fn computeSchnorrCommitment(unchecked: *UncheckedSchnorr) VerifierError!void {
+    // PRECONDITION: response has valid size
+    assert(unchecked.response.len == SCALAR_SIZE);
+    // PRECONDITION: commitment not already computed
+    assert(unchecked.commitment == null);
+
     const commitment = schnorr.computeCommitment(
         unchecked.proposition,
         unchecked.challenge,
@@ -284,25 +363,71 @@ fn computeSchnorrCommitment(unchecked: *UncheckedSchnorr) VerifierError!void {
     ) catch return error.CommitmentMismatch;
 
     unchecked.commitment = commitment;
+
+    // POSTCONDITION: commitment is now set
+    assert(unchecked.commitment != null);
 }
 
-/// Compute commitments for all leaves in the tree
+/// Compute commitments for all leaves in the tree (non-recursive)
+/// Uses explicit work stack following TigerBeetle pattern
 pub fn computeCommitments(tree: *UncheckedTree) VerifierError!void {
-    switch (tree.*) {
-        .trivial_true, .trivial_false => {},
-        .schnorr => |*s| try computeSchnorrCommitment(s),
-        .dh_tuple => return error.UnsupportedProposition,
-        .cand => |*and_node| {
-            for (and_node.children) |*child| {
-                try computeCommitments(child);
-            }
-        },
-        .cor => |*or_node| {
-            for (or_node.children) |*child| {
-                try computeCommitments(child);
-            }
-        },
-        .cthreshold => return error.UnsupportedProposition,
+    // PRECONDITION: tree is not null
+    assert(@intFromPtr(tree) != 0);
+
+    // Stack of tree nodes to process
+    var work_stack: [MAX_WORK_STACK]*UncheckedTree = undefined;
+    var work_sp: u16 = 0;
+
+    // Push root
+    work_stack[0] = tree;
+    work_sp = 1;
+
+    // Process nodes iteratively
+    var iterations: u32 = 0;
+    while (work_sp > 0) : (iterations += 1) {
+        // INVARIANT: bounded iteration prevents infinite loops
+        if (iterations >= MAX_TREE_NODES * 2) {
+            return error.ProofTooLarge;
+        }
+
+        work_sp -= 1;
+        const node = work_stack[work_sp];
+
+        switch (node.*) {
+            .trivial_true, .trivial_false => {},
+            .schnorr => |*s| try computeSchnorrCommitment(s),
+            .dh_tuple => return error.UnsupportedProposition,
+            .cand => |*and_node| {
+                // Push children (reverse order for correct processing)
+                try pushChildren(and_node.children, &work_stack, &work_sp);
+            },
+            .cor => |*or_node| {
+                try pushChildren(or_node.children, &work_stack, &work_sp);
+            },
+            .cthreshold => return error.UnsupportedProposition,
+        }
+    }
+
+    // POSTCONDITION: all nodes processed
+    assert(work_sp == 0);
+}
+
+/// Push children onto work stack in reverse order
+fn pushChildren(
+    children: []UncheckedTree,
+    stack: *[MAX_WORK_STACK]*UncheckedTree,
+    sp: *u16,
+) VerifierError!void {
+    // PRECONDITION: children count bounded
+    assert(children.len <= MAX_CHILDREN);
+
+    // Push in reverse for correct processing order
+    var i: usize = children.len;
+    while (i > 0) {
+        i -= 1;
+        if (sp.* >= MAX_WORK_STACK) return error.ProofTooDeep;
+        stack[sp.*] = &children[i];
+        sp.* += 1;
     }
 }
 
@@ -312,12 +437,16 @@ pub fn computeCommitments(tree: *UncheckedTree) VerifierError!void {
 
 /// Verify a signature against a SigmaBoolean proposition
 /// Returns true if the signature is valid
+/// Uses stack-local pre-allocated context (no allocator needed)
 pub fn verifySignature(
     proposition: SigmaBoolean,
     signature: []const u8,
     message: []const u8,
-    allocator: std.mem.Allocator,
 ) VerifierError!bool {
+    // PRECONDITION: inputs have reasonable bounds
+    assert(signature.len <= 65536); // 64KB max signature
+    assert(message.len <= 65536); // 64KB max message
+
     // Handle trivial propositions
     switch (proposition) {
         .trivial_true => return true,
@@ -328,20 +457,26 @@ pub fn verifySignature(
     // Non-trivial proposition requires a signature
     if (signature.len == 0) return error.EmptyProof;
 
+    // Stack-local pre-allocated context (zero allocation during verification)
+    var ctx = VerifierContext{};
+
     // Step 1-3: Parse proof and compute challenges
     var reader = ProofReader.init(signature);
-    var tree = try parseProofTree(proposition, &reader, null, allocator);
+    var tree = try parseProofTree(proposition, &reader, null, &ctx);
 
     // Step 4: Compute commitments for all leaves
     try computeCommitments(&tree);
 
-    // Step 5: Serialize tree for Fiat-Shamir
-    var fs_buffer: [challenge_mod.MAX_FS_TREE_BYTES]u8 = undefined;
-    const tree_bytes = try serializeForFiatShamir(&tree, &fs_buffer);
+    // Step 5: Serialize tree for Fiat-Shamir (use context buffer)
+    const tree_bytes = try serializeForFiatShamir(&tree, &ctx.fs_buffer);
 
     // Step 6: Verify root challenge
     const expected_challenge = challenge_mod.computeChallenge(tree_bytes, message);
     const actual_challenge = tree.getChallenge();
+
+    // POSTCONDITION: challenges have correct size
+    assert(expected_challenge.bytes.len == SOUNDNESS_BYTES);
+    assert(actual_challenge.bytes.len == SOUNDNESS_BYTES);
 
     return expected_challenge.eql(actual_challenge);
 }
@@ -350,88 +485,129 @@ pub fn verifySignature(
 // Fiat-Shamir Tree Serialization (for verification)
 // ============================================================================
 
-/// Serialize unchecked tree for Fiat-Shamir hash
+/// Serialize unchecked tree for Fiat-Shamir hash (non-recursive)
 /// Format matches FiatShamirTree.toBytes in Scala
+/// Uses explicit work stack following TigerBeetle pattern
 fn serializeForFiatShamir(tree: *const UncheckedTree, buffer: []u8) VerifierError![]u8 {
+    // PRECONDITION: buffer has sufficient size
+    assert(buffer.len >= challenge_mod.MAX_FS_TREE_BYTES);
+
+    // Work stack for pre-order traversal
+    var work_stack: [MAX_WORK_STACK]*const UncheckedTree = undefined;
+    var work_sp: u16 = 0;
     var pos: usize = 0;
-    try serializeNodeForFiatShamir(tree, buffer, &pos);
+
+    // Push root
+    work_stack[0] = tree;
+    work_sp = 1;
+
+    // Process nodes iteratively (pre-order: serialize header, then children)
+    var iterations: u32 = 0;
+    while (work_sp > 0) : (iterations += 1) {
+        // INVARIANT: bounded iteration prevents infinite loops
+        if (iterations >= MAX_TREE_NODES * 2) {
+            return error.ProofTooLarge;
+        }
+
+        work_sp -= 1;
+        const node = work_stack[work_sp];
+
+        switch (node.*) {
+            .trivial_true, .trivial_false => return error.UnsupportedProposition,
+            .schnorr => |s| try serializeSchnorrLeaf(&s, buffer, &pos),
+            .dh_tuple => return error.UnsupportedProposition,
+            .cand => |and_node| {
+                try serializeConnectiveHeader(.and_connective, and_node.children.len, buffer, &pos);
+                try pushChildrenConst(and_node.children, &work_stack, &work_sp);
+            },
+            .cor => |or_node| {
+                try serializeConnectiveHeader(.or_connective, or_node.children.len, buffer, &pos);
+                try pushChildrenConst(or_node.children, &work_stack, &work_sp);
+            },
+            .cthreshold => return error.UnsupportedProposition,
+        }
+    }
+
+    // POSTCONDITION: position within buffer
+    assert(pos <= buffer.len);
     return buffer[0..pos];
 }
 
-fn serializeNodeForFiatShamir(tree: *const UncheckedTree, buffer: []u8, pos: *usize) VerifierError!void {
-    switch (tree.*) {
-        .trivial_true, .trivial_false => {
-            // Trivial propositions shouldn't appear in proofs
-            return error.UnsupportedProposition;
-        },
-        .schnorr => |s| {
-            // Leaf: prefix + prop_len + prop_bytes + commit_len + commit_bytes
-            if (pos.* + 100 > buffer.len) return error.BufferTooSmall;
+/// Serialize a Schnorr leaf node for Fiat-Shamir
+fn serializeSchnorrLeaf(s: *const UncheckedSchnorr, buffer: []u8, pos: *usize) VerifierError!void {
+    // PRECONDITION: sufficient buffer space (1 + 2 + 35 + 2 + 33 = 73 bytes)
+    if (pos.* + 73 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: commitment computed
+    const commitment = s.commitment orelse return error.CommitmentMismatch;
 
-            const commitment = s.commitment orelse return error.CommitmentMismatch;
+    // Leaf prefix
+    buffer[pos.*] = challenge_mod.LEAF_PREFIX;
+    pos.* += 1;
 
-            // Leaf prefix
-            buffer[pos.*] = challenge_mod.LEAF_PREFIX;
-            pos.* += 1;
+    // Proposition bytes (ErgoTree format: 0x08cd || pk, 35 bytes)
+    const prop_len: i16 = 35;
+    buffer[pos.*] = @intCast((prop_len >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(prop_len & 0xFF);
+    pos.* += 2;
+    buffer[pos.*] = 0x08; // ErgoTree header v0
+    buffer[pos.* + 1] = 0xcd; // SigmaProp constant opcode
+    pos.* += 2;
+    @memcpy(buffer[pos.* .. pos.* + 33], &s.proposition.public_key);
+    pos.* += 33;
 
-            // Proposition bytes (ErgoTree format: 0x08cd || pk)
-            const prop_len: i16 = 35;
-            buffer[pos.*] = @intCast((prop_len >> 8) & 0xFF);
-            buffer[pos.* + 1] = @intCast(prop_len & 0xFF);
-            pos.* += 2;
+    // Commitment bytes (compressed point, 33 bytes)
+    const commit_bytes = commitment.encode();
+    const commit_len: i16 = 33;
+    buffer[pos.*] = @intCast((commit_len >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(commit_len & 0xFF);
+    pos.* += 2;
+    @memcpy(buffer[pos.* .. pos.* + 33], &commit_bytes);
+    pos.* += 33;
 
-            buffer[pos.*] = 0x08; // ErgoTree header v0
-            buffer[pos.* + 1] = 0xcd; // SigmaProp constant opcode
-            pos.* += 2;
-            @memcpy(buffer[pos.* .. pos.* + 33], &s.proposition.public_key);
-            pos.* += 33;
+    // POSTCONDITION: wrote exactly 73 bytes
+}
 
-            // Commitment bytes (compressed point, 33 bytes)
-            const commit_bytes = commitment.encode();
-            const commit_len: i16 = 33;
-            buffer[pos.*] = @intCast((commit_len >> 8) & 0xFF);
-            buffer[pos.* + 1] = @intCast(commit_len & 0xFF);
-            pos.* += 2;
-            @memcpy(buffer[pos.* .. pos.* + 33], &commit_bytes);
-            pos.* += 33;
-        },
-        .dh_tuple => return error.UnsupportedProposition,
-        .cand => |and_node| {
-            // Internal node: prefix + type + children_count + children
-            if (pos.* + 10 > buffer.len) return error.BufferTooSmall;
+/// Serialize AND/OR/THRESHOLD header for Fiat-Shamir
+fn serializeConnectiveHeader(
+    connective: challenge_mod.ConjectureType,
+    children_count: usize,
+    buffer: []u8,
+    pos: *usize,
+) VerifierError!void {
+    // PRECONDITION: sufficient buffer space (1 + 1 + 2 = 4 bytes)
+    if (pos.* + 4 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: children count bounded
+    assert(children_count <= MAX_CHILDREN);
 
-            buffer[pos.*] = challenge_mod.INTERNAL_NODE_PREFIX;
-            pos.* += 1;
-            buffer[pos.*] = @intFromEnum(challenge_mod.ConjectureType.and_connective);
-            pos.* += 1;
+    buffer[pos.*] = challenge_mod.INTERNAL_NODE_PREFIX;
+    pos.* += 1;
+    buffer[pos.*] = @intFromEnum(connective);
+    pos.* += 1;
 
-            const children_count: i16 = @intCast(and_node.children.len);
-            buffer[pos.*] = @intCast((children_count >> 8) & 0xFF);
-            buffer[pos.* + 1] = @intCast(children_count & 0xFF);
-            pos.* += 2;
+    const count_i16: i16 = @intCast(children_count);
+    buffer[pos.*] = @intCast((count_i16 >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(count_i16 & 0xFF);
+    pos.* += 2;
 
-            for (and_node.children) |*child| {
-                try serializeNodeForFiatShamir(child, buffer, pos);
-            }
-        },
-        .cor => |or_node| {
-            if (pos.* + 10 > buffer.len) return error.BufferTooSmall;
+    // POSTCONDITION: wrote exactly 4 bytes
+}
 
-            buffer[pos.*] = challenge_mod.INTERNAL_NODE_PREFIX;
-            pos.* += 1;
-            buffer[pos.*] = @intFromEnum(challenge_mod.ConjectureType.or_connective);
-            pos.* += 1;
+/// Push const children onto work stack in reverse order
+fn pushChildrenConst(
+    children: []UncheckedTree,
+    stack: *[MAX_WORK_STACK]*const UncheckedTree,
+    sp: *u16,
+) VerifierError!void {
+    // PRECONDITION: children count bounded
+    assert(children.len <= MAX_CHILDREN);
 
-            const children_count: i16 = @intCast(or_node.children.len);
-            buffer[pos.*] = @intCast((children_count >> 8) & 0xFF);
-            buffer[pos.* + 1] = @intCast(children_count & 0xFF);
-            pos.* += 2;
-
-            for (or_node.children) |*child| {
-                try serializeNodeForFiatShamir(child, buffer, pos);
-            }
-        },
-        .cthreshold => return error.UnsupportedProposition,
+    // Push in reverse for correct pre-order traversal
+    var i: usize = children.len;
+    while (i > 0) {
+        i -= 1;
+        if (sp.* >= MAX_WORK_STACK) return error.ProofTooDeep;
+        stack[sp.*] = &children[i];
+        sp.* += 1;
     }
 }
 
@@ -454,12 +630,12 @@ test "verifier: ProofReader reads correctly" {
 }
 
 test "verifier: trivial true returns true" {
-    const result = try verifySignature(.trivial_true, &[_]u8{}, &[_]u8{}, std.testing.allocator);
+    const result = try verifySignature(.trivial_true, &[_]u8{}, &[_]u8{});
     try std.testing.expect(result);
 }
 
 test "verifier: trivial false returns false" {
-    const result = try verifySignature(.trivial_false, &[_]u8{}, &[_]u8{}, std.testing.allocator);
+    const result = try verifySignature(.trivial_false, &[_]u8{}, &[_]u8{});
     try std.testing.expect(!result);
 }
 
@@ -467,7 +643,7 @@ test "verifier: empty proof for non-trivial rejects" {
     const pk = [_]u8{0x02} ++ [_]u8{0xAA} ** 32;
     const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk) };
 
-    const result = verifySignature(prop, &[_]u8{}, &[_]u8{}, std.testing.allocator);
+    const result = verifySignature(prop, &[_]u8{}, &[_]u8{});
     try std.testing.expectError(error.EmptyProof, result);
 }
 
@@ -517,9 +693,10 @@ test "verifier: AND node distributes same challenge to all children" {
     const child2 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk2) };
     const children = [_]*const SigmaBoolean{ &child1, &child2 };
 
+    var ctx = VerifierContext{};
     var reader = ProofReader.init(&proof_bytes);
-    const result = try parseAndProof(&children, &reader, null, std.testing.allocator);
-    defer std.testing.allocator.free(result.cand.children);
+    const result = try parseAndProof(&children, &reader, null, &ctx);
+    // No defer needed - context is stack-local
 
     // Both children should have the same challenge (parent's)
     const parent_challenge = result.getChallenge();
@@ -542,9 +719,10 @@ test "verifier: OR node XORs challenges correctly" {
     const child2 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk2) };
     const children = [_]*const SigmaBoolean{ &child1, &child2 };
 
+    var ctx = VerifierContext{};
     var reader = ProofReader.init(&proof_bytes);
-    const result = try parseOrProof(&children, &reader, null, std.testing.allocator);
-    defer std.testing.allocator.free(result.cor.children);
+    const result = try parseOrProof(&children, &reader, null, &ctx);
+    // No defer needed - context is stack-local
 
     const parent = result.getChallenge();
     const c1 = result.cor.children[0].getChallenge();
