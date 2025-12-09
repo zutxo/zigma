@@ -93,6 +93,8 @@ pub const EvalError = error{
     InvalidData,
     /// Invalid group element (not on curve or bad encoding)
     InvalidGroupElement,
+    /// Tuple field index out of bounds
+    IndexOutOfBounds,
 };
 
 // ============================================================================
@@ -136,6 +138,9 @@ const FixedCost = struct {
     pub const group_generator: u32 = 10;
     pub const exponentiate: u32 = 5100;
     pub const multiply_group: u32 = 250;
+    // Tuple operation costs (from opcodes.zig)
+    pub const select_field: u32 = 10;
+    pub const tuple_construct: u32 = 10;
 };
 
 // ============================================================================
@@ -168,6 +173,11 @@ pub const Evaluator = struct {
     /// Variable bindings (varId -> Value)
     /// null = unbound, non-null = bound value
     var_bindings: [max_var_bindings]?Value = [_]?Value{null} ** max_var_bindings,
+
+    /// Values array for tuple storage
+    /// Tuples reference ranges in this array
+    values: [max_value_stack]Value = undefined,
+    values_sp: u16 = 0,
 
     pub fn init(tree: *const ExprTree, ctx: *const Context) Evaluator {
         return .{
@@ -400,6 +410,51 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
             },
 
+            .select_field => {
+                // Unary: Tuple → element value
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .tuple_construct => {
+                // N-ary: n elements → Tuple
+                const elem_count = node.data;
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Push elements in reverse order so first element evaluates first
+                var idx = node_idx + 1;
+                var indices: [256]u16 = undefined;
+                var i: u16 = 0;
+                while (i < elem_count) : (i += 1) {
+                    indices[i] = idx;
+                    idx = self.findSubtreeEnd(idx);
+                }
+                // Push in reverse order
+                while (i > 0) {
+                    i -= 1;
+                    try self.pushWork(.{ .node_idx = indices[i], .phase = .evaluate });
+                }
+            },
+
+            .pair_construct => {
+                // Binary: 2 elements → Pair
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const first_idx = node_idx + 1;
+                const second_idx = self.findSubtreeEnd(first_idx);
+                try self.pushWork(.{ .node_idx = second_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = first_idx, .phase = .evaluate });
+            },
+
+            .triple_construct => {
+                // Ternary: 3 elements → Triple
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const first_idx = node_idx + 1;
+                const second_idx = self.findSubtreeEnd(first_idx);
+                const third_idx = self.findSubtreeEnd(second_idx);
+                try self.pushWork(.{ .node_idx = third_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = second_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = first_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -498,6 +553,14 @@ pub const Evaluator = struct {
 
             .multiply_group => {
                 try self.computeMultiplyGroup();
+            },
+
+            .select_field => {
+                try self.computeSelectField(node.data);
+            },
+
+            .tuple_construct, .pair_construct, .triple_construct => {
+                try self.computeTupleConstruct(node.data);
             },
 
             else => {
@@ -770,6 +833,69 @@ pub const Evaluator = struct {
         assert(self.value_sp > 0);
     }
 
+    /// Compute SelectField - extract element from tuple by index
+    fn computeSelectField(self: *Evaluator, field_idx: u16) EvalError!void {
+        // PRECONDITION: Value stack has at least one value (the tuple)
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.select_field);
+
+        const tuple_val = try self.popValue();
+        if (tuple_val != .tuple) return error.TypeMismatch;
+
+        // INVARIANT: Value is a tuple
+        assert(tuple_val == .tuple);
+
+        const tuple = tuple_val.tuple;
+        if (field_idx >= tuple.len) return error.IndexOutOfBounds;
+
+        // INVARIANT: Index is within bounds
+        assert(field_idx < tuple.len);
+
+        // Get the element from the values array
+        const elem_idx = tuple.start + field_idx;
+        if (elem_idx >= self.values_sp) return error.InvalidData;
+
+        const elem = self.values[elem_idx];
+        try self.pushValue(elem);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute tuple construction - create tuple from n values on stack
+    fn computeTupleConstruct(self: *Evaluator, elem_count: u16) EvalError!void {
+        // PRECONDITION: Value stack has at least elem_count values
+        assert(self.value_sp >= elem_count);
+
+        try self.addCost(FixedCost.tuple_construct);
+
+        // INVARIANT: Element count is valid
+        assert(elem_count <= 255);
+
+        // Store tuple elements in the values array
+        const start = self.values_sp;
+        if (start + elem_count > self.values.len) return error.OutOfMemory;
+
+        // Pop elements in reverse order (last on stack = first in tuple)
+        var i: u16 = elem_count;
+        while (i > 0) {
+            i -= 1;
+            const val = try self.popValue();
+            self.values[start + i] = val;
+        }
+        self.values_sp = start + elem_count;
+
+        // Create tuple reference
+        try self.pushValue(.{ .tuple = .{
+            .start = @truncate(start),
+            .len = @truncate(elem_count),
+        } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
     /// Compute binary operation
     fn computeBinOp(self: *Evaluator, kind: BinOpKind) EvalError!void {
         try self.addCost(FixedCost.comparison);
@@ -891,7 +1017,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .group_generator => {},
 
             // One child
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point => {
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field => {
                 next = self.findSubtreeEnd(next);
             },
 
@@ -901,13 +1027,13 @@ pub const Evaluator = struct {
             },
 
             // Two children
-            .bin_op, .option_get_or_else, .exponentiate, .multiply_group => {
-                next = self.findSubtreeEnd(next); // Left / Option / Point
-                next = self.findSubtreeEnd(next); // Right / Default / Scalar/Point
+            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct => {
+                next = self.findSubtreeEnd(next); // Left / Option / Point / First
+                next = self.findSubtreeEnd(next); // Right / Default / Scalar/Point / Second
             },
 
             // Three children
-            .if_then_else => {
+            .if_then_else, .triple_construct => {
                 next = self.findSubtreeEnd(next); // Condition
                 next = self.findSubtreeEnd(next); // Then
                 next = self.findSubtreeEnd(next); // Else
@@ -921,6 +1047,15 @@ pub const Evaluator = struct {
                     next = self.findSubtreeEnd(next);
                 }
                 next = self.findSubtreeEnd(next); // Result
+            },
+
+            // tuple_construct: elem_count children
+            .tuple_construct => {
+                const elem_count = node.data;
+                var i: u16 = 0;
+                while (i < elem_count) : (i += 1) {
+                    next = self.findSubtreeEnd(next);
+                }
             },
 
             // func_value: body expression

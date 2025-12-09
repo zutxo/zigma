@@ -95,6 +95,14 @@ pub const ExprTag = enum(u8) {
     exponentiate,
     /// Point multiplication/addition (opcode 0xD4) - GroupElement, GroupElement → GroupElement
     multiply_group,
+    /// Select field from tuple (opcode 0xBD) - Tuple → element type
+    select_field,
+    /// Generic tuple constructor (opcode 0xBE) - n elements → Tuple
+    tuple_construct,
+    /// Pair constructor (opcode 0xDD) - 2 elements → Pair
+    pair_construct,
+    /// Triple constructor (opcode 0xDE) - 3 elements → Triple
+    triple_construct,
     /// Unsupported opcode
     unsupported,
 };
@@ -386,6 +394,11 @@ fn deserializeWithDepth(
             },
             opcodes.Exponentiate => try deserializeBinaryGroupOp(tree, reader, arena, .exponentiate, depth),
             opcodes.MultiplyGroup => try deserializeBinaryGroupOp(tree, reader, arena, .multiply_group, depth),
+            // Tuple operations
+            opcodes.SelectField => try deserializeSelectField(tree, reader, arena, depth),
+            opcodes.Tuple => try deserializeTuple(tree, reader, arena, depth),
+            opcodes.PairConstructor => try deserializePairConstructor(tree, reader, arena, depth),
+            opcodes.TripleConstructor => try deserializeTripleConstructor(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -679,6 +692,106 @@ fn deserializeOptionGetOrElse(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 
     // Parse the default expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeSelectField(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // SelectField format: tuple expression + field index (VLQ)
+    // Note: some serializations have field index before the expression
+
+    // For now, assume format: SelectField(fieldIdx, tupleExpr)
+    // Field index is 1-based in ErgoTree
+    const field_idx = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Add the select_field node first (pre-order)
+    // Store field index in data (convert to 0-based)
+    _ = try tree.addNode(.{
+        .tag = .select_field,
+        .data = @truncate(field_idx -| 1), // Convert 1-based to 0-based, saturating
+        .result_type = TypePool.ANY, // Determined at runtime from tuple type
+    });
+
+    // Parse the tuple expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeTuple(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Tuple format: element count (VLQ) + n element expressions
+
+    const elem_count = reader.readU32() catch |e| return mapVlqError(e);
+    if (elem_count > 255) return error.InvalidData;
+
+    // Add the tuple_construct node first (pre-order)
+    // Store element count in data
+    _ = try tree.addNode(.{
+        .tag = .tuple_construct,
+        .data = @truncate(elem_count),
+        .result_type = TypePool.ANY, // Determined at runtime
+    });
+
+    // Parse each element expression
+    var i: u32 = 0;
+    while (i < elem_count) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+}
+
+fn deserializePairConstructor(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PairConstructor format: first expression + second expression
+
+    // Add the pair_construct node first (pre-order)
+    // Store element count (2) in data
+    _ = try tree.addNode(.{
+        .tag = .pair_construct,
+        .data = 2, // Fixed: 2 elements
+        .result_type = TypePool.ANY, // Determined at runtime
+    });
+
+    // Parse first element
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse second element
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeTripleConstructor(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // TripleConstructor format: three expressions
+
+    // Add the triple_construct node first (pre-order)
+    // Store element count (3) in data
+    _ = try tree.addNode(.{
+        .tag = .triple_construct,
+        .data = 3, // Fixed: 3 elements
+        .result_type = TypePool.ANY, // Determined at runtime
+    });
+
+    // Parse first element
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse second element
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse third element
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
