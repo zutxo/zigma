@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const vlq = @import("vlq.zig");
 const types = @import("../core/types.zig");
 const memory = @import("../interpreter/memory.zig");
+const secp256k1 = @import("../crypto/secp256k1.zig");
 
 const TypePool = types.TypePool;
 const TypeIndex = types.TypeIndex;
@@ -140,6 +141,8 @@ pub const DeserializeError = error{
     OutOfMemory,
     TypeMismatch,
     NotSupported,
+    /// GroupElement is not a valid curve point (invalid encoding, not on curve, or invalid x)
+    InvalidGroupElement,
 };
 
 // ============================================================================
@@ -249,14 +252,26 @@ fn deserializeUnsignedBigInt(reader: *vlq.Reader) DeserializeError!Value {
 }
 
 fn deserializeGroupElement(reader: *vlq.Reader) DeserializeError!Value {
-    // 33 bytes compressed SEC1 point
+    // PRECONDITION: reader has at least 33 bytes available
     const bytes = reader.readBytes(group_element_size) catch |e| return mapVlqError(e);
 
     var result: [group_element_size]u8 = undefined;
     @memcpy(&result, bytes);
 
-    // TODO: Validate point is on curve and in subgroup
-    // For now, just store the raw bytes
+    // SECURITY: Validate point is on curve
+    // Point.decode() validates:
+    // 1. Valid prefix (0x02, 0x03, or all zeros for infinity)
+    // 2. x coordinate < field prime p
+    // 3. Point satisfies curve equation: y² = x³ + 7 (mod p)
+    //
+    // Note: secp256k1 has cofactor 1, so all curve points are in the main subgroup.
+    // No separate subgroup check is needed.
+    const point = secp256k1.Point.decode(&result) catch {
+        return error.InvalidGroupElement;
+    };
+
+    // POSTCONDITION: Point is valid (on curve or infinity)
+    assert(point.is_infinity or point.isValid());
 
     return .{ .group_element = result };
 }
@@ -749,4 +764,107 @@ test "data_serializer: error on invalid bigint length" {
     // BigInt with length > 32
     var r2 = vlq.Reader.init(&[_]u8{0x21}); // 33
     try std.testing.expectError(error.InvalidData, deserialize(TypePool.BIG_INT, &pool, &r2, &arena));
+}
+
+// ============================================================================
+// GroupElement Security Tests
+// ============================================================================
+
+test "data_serializer: group_element rejects invalid prefix" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(64).init();
+
+    // Invalid prefix 0x04 (uncompressed format not supported)
+    var bad_prefix: [33]u8 = undefined;
+    bad_prefix[0] = 0x04;
+    @memset(bad_prefix[1..], 0x42);
+
+    var reader = vlq.Reader.init(&bad_prefix);
+    try std.testing.expectError(error.InvalidGroupElement, deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena));
+}
+
+test "data_serializer: group_element rejects point not on curve" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(64).init();
+
+    // Valid prefix but x coordinate that doesn't produce a valid y
+    // For x = 5: y² = 5³ + 7 = 132, which has no square root mod p
+    // The array is big-endian: 31 zero bytes followed by 0x05
+    var not_on_curve: [33]u8 = [_]u8{0x02} ++ [_]u8{0} ** 31 ++ [_]u8{0x05};
+
+    var reader = vlq.Reader.init(&not_on_curve);
+    try std.testing.expectError(error.InvalidGroupElement, deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena));
+}
+
+test "data_serializer: group_element accepts infinity" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(64).init();
+
+    // All zeros = point at infinity (valid identity element)
+    const infinity: [33]u8 = [_]u8{0} ** 33;
+
+    var reader = vlq.Reader.init(&infinity);
+    const v = try deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena);
+    try std.testing.expectEqual(@as(u8, 0), v.group_element[0]);
+}
+
+test "data_serializer: group_element accepts valid point" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(64).init();
+
+    // Generator point G (known to be on curve)
+    const gen_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    var gen_bytes: [33]u8 = undefined;
+    _ = std.fmt.hexToBytes(&gen_bytes, gen_hex) catch unreachable;
+
+    var reader = vlq.Reader.init(&gen_bytes);
+    const v = try deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena);
+    try std.testing.expectEqual(@as(u8, 0x02), v.group_element[0]);
+    try std.testing.expectEqual(@as(u8, 0x79), v.group_element[1]);
+}
+
+test "data_serializer: group_element rejects x >= field prime" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(64).init();
+
+    // x = p (field prime) - should be rejected as x must be < p
+    // p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    var x_equals_p: [33]u8 = undefined;
+    x_equals_p[0] = 0x02;
+    // Set x = p (big-endian)
+    x_equals_p[1] = 0xFF;
+    x_equals_p[2] = 0xFF;
+    x_equals_p[3] = 0xFF;
+    x_equals_p[4] = 0xFF;
+    x_equals_p[5] = 0xFF;
+    x_equals_p[6] = 0xFF;
+    x_equals_p[7] = 0xFF;
+    x_equals_p[8] = 0xFF;
+    x_equals_p[9] = 0xFF;
+    x_equals_p[10] = 0xFF;
+    x_equals_p[11] = 0xFF;
+    x_equals_p[12] = 0xFF;
+    x_equals_p[13] = 0xFF;
+    x_equals_p[14] = 0xFF;
+    x_equals_p[15] = 0xFF;
+    x_equals_p[16] = 0xFF;
+    x_equals_p[17] = 0xFF;
+    x_equals_p[18] = 0xFF;
+    x_equals_p[19] = 0xFF;
+    x_equals_p[20] = 0xFF;
+    x_equals_p[21] = 0xFF;
+    x_equals_p[22] = 0xFF;
+    x_equals_p[23] = 0xFF;
+    x_equals_p[24] = 0xFF;
+    x_equals_p[25] = 0xFF;
+    x_equals_p[26] = 0xFF;
+    x_equals_p[27] = 0xFF;
+    x_equals_p[28] = 0xFF;
+    x_equals_p[29] = 0xFE; // Note: p has 0xFE here
+    x_equals_p[30] = 0xFF;
+    x_equals_p[31] = 0xFC;
+    x_equals_p[32] = 0x2F;
+
+    var reader = vlq.Reader.init(&x_equals_p);
+    try std.testing.expectError(error.InvalidGroupElement, deserialize(TypePool.GROUP_ELEMENT, &pool, &reader, &arena));
 }

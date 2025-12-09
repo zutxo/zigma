@@ -252,7 +252,7 @@ fn parseConstants(
             return switch (e) {
                 error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
                 error.Overflow => error.Overflow,
-                error.InvalidData => error.InvalidData,
+                error.InvalidData, error.InvalidGroupElement => error.InvalidData,
                 error.OutOfMemory => error.OutOfMemory,
                 error.TypeMismatch => error.TypeMismatch,
                 error.NotSupported => error.NotSupported,
