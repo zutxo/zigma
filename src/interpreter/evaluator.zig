@@ -148,6 +148,9 @@ const FixedCost = struct {
     pub const downcast: u32 = 10;
     // Header extraction costs (all low-cost field access)
     pub const extract_header_field: u32 = 10;
+    // Collection HOF costs
+    pub const collection_base: u32 = 20; // Base cost for collection operation
+    pub const collection_per_item: u32 = 5; // Per-element cost
 };
 
 // ============================================================================
@@ -544,6 +547,26 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            // Collection higher-order functions
+            .map_collection, .exists, .for_all, .filter => {
+                // Binary: collection + lambda → result
+                // We evaluate the collection first, then handle lambda in compute phase
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Collection is at node_idx+1
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+                // Lambda body will be evaluated during compute phase for each element
+            },
+
+            .fold => {
+                // Ternary: collection + zero + lambda → result
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const coll_idx = node_idx + 1;
+                const zero_idx = self.findSubtreeEnd(coll_idx);
+                // Evaluate collection and zero, lambda handled in compute phase
+                try self.pushWork(.{ .node_idx = zero_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = coll_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -675,6 +698,13 @@ pub const Evaluator = struct {
             .extract_difficulty => try self.computeExtractDifficulty(),
             .extract_votes => try self.computeExtractVotes(),
             .extract_miner_rewards => try self.computeExtractMinerRewards(),
+
+            // Collection HOF operations
+            .exists => try self.computeExists(node_idx),
+            .for_all => try self.computeForAll(node_idx),
+            .map_collection => try self.computeMap(node_idx),
+            .filter => try self.computeFilter(node_idx),
+            .fold => try self.computeFold(node_idx),
 
             else => {
                 // Other node types don't need compute phase
@@ -1538,6 +1568,332 @@ pub const Evaluator = struct {
     }
 
     // ========================================================================
+    // Collection HOF operations
+    // ========================================================================
+
+    /// Compute exists: returns true if predicate holds for any element
+    fn computeExists(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITION: Collection value is on stack
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.collection_base);
+
+        const coll = try self.popValue();
+
+        // Get collection length - only coll_byte supported currently
+        const len: usize = switch (coll) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // Empty collection: exists returns false
+        if (len == 0) {
+            try self.pushValue(.{ .boolean = false });
+            return;
+        }
+
+        // Find the lambda (func_value node after collection subtree)
+        const coll_idx = node_idx + 1;
+        const lambda_idx = self.findSubtreeEnd(coll_idx);
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+
+        // Get lambda argument var_id by scanning for val_use in body
+        const body_idx = lambda_idx + 1;
+        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1; // Default to 1
+
+        // Evaluate predicate for each element
+        for (0..len) |i| {
+            // Bind element to lambda argument
+            const elem = try self.getCollectionElement(coll, i);
+            self.var_bindings[arg_var_id] = elem;
+
+            // Evaluate lambda body
+            const body_result = try self.evaluateSubtree(body_idx);
+            if (body_result != .boolean) return error.TypeMismatch;
+
+            if (body_result.boolean) {
+                // Found true: exists succeeds
+                try self.pushValue(.{ .boolean = true });
+                return;
+            }
+
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        // No element satisfied predicate
+        try self.pushValue(.{ .boolean = false });
+    }
+
+    /// Compute forall: returns true if predicate holds for all elements
+    fn computeForAll(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITION: Collection value is on stack
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.collection_base);
+
+        const coll = try self.popValue();
+
+        // Get collection length - only coll_byte supported currently
+        const len: usize = switch (coll) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // Empty collection: forall returns true
+        if (len == 0) {
+            try self.pushValue(.{ .boolean = true });
+            return;
+        }
+
+        // Find the lambda (func_value node after collection subtree)
+        const coll_idx = node_idx + 1;
+        const lambda_idx = self.findSubtreeEnd(coll_idx);
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+
+        // Get lambda argument var_id by scanning for val_use in body
+        const body_idx = lambda_idx + 1;
+        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+
+        // Evaluate predicate for each element
+        for (0..len) |i| {
+            // Bind element to lambda argument
+            const elem = try self.getCollectionElement(coll, i);
+            self.var_bindings[arg_var_id] = elem;
+
+            // Evaluate lambda body
+            const body_result = try self.evaluateSubtree(body_idx);
+            if (body_result != .boolean) return error.TypeMismatch;
+
+            if (!body_result.boolean) {
+                // Found false: forall fails
+                try self.pushValue(.{ .boolean = false });
+                return;
+            }
+
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        // All elements satisfied predicate
+        try self.pushValue(.{ .boolean = true });
+    }
+
+    /// Compute map: apply function to each element
+    /// Currently only supports Coll[Byte] → Coll[Byte]
+    fn computeMap(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITION: Collection value is on stack
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.collection_base);
+
+        const coll = try self.popValue();
+
+        // Currently only support coll_byte
+        if (coll != .coll_byte) return error.UnsupportedExpression;
+
+        const input = coll.coll_byte;
+
+        // Empty collection: return empty
+        if (input.len == 0) {
+            const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
+            try self.pushValue(.{ .coll_byte = empty });
+            return;
+        }
+
+        // Find the lambda
+        const coll_idx = node_idx + 1;
+        const lambda_idx = self.findSubtreeEnd(coll_idx);
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+
+        const body_idx = lambda_idx + 1;
+        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+
+        // Allocate result array
+        const result = self.arena.allocSlice(u8, input.len) catch return error.OutOfMemory;
+
+        // Apply function to each element
+        for (input, 0..) |elem, i| {
+            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+
+            const mapped = try self.evaluateSubtree(body_idx);
+            result[i] = switch (mapped) {
+                .byte => |v| @bitCast(v),
+                .int => |v| @truncate(@as(u32, @bitCast(v))),
+                .long => |v| @truncate(@as(u64, @bitCast(v))),
+                else => return error.TypeMismatch,
+            };
+
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
+    /// Compute filter: keep elements that satisfy predicate
+    /// Currently only supports Coll[Byte]
+    fn computeFilter(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITION: Collection value is on stack
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.collection_base);
+
+        const coll = try self.popValue();
+
+        // Currently only support coll_byte
+        if (coll != .coll_byte) return error.UnsupportedExpression;
+
+        const input = coll.coll_byte;
+
+        if (input.len == 0) {
+            const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
+            try self.pushValue(.{ .coll_byte = empty });
+            return;
+        }
+
+        // Find the lambda
+        const coll_idx = node_idx + 1;
+        const lambda_idx = self.findSubtreeEnd(coll_idx);
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+
+        const body_idx = lambda_idx + 1;
+        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+
+        // First pass: count matching elements
+        var count: usize = 0;
+        for (input) |elem| {
+            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+            const predicate_result = try self.evaluateSubtree(body_idx);
+            if (predicate_result != .boolean) return error.TypeMismatch;
+            if (predicate_result.boolean) count += 1;
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        // Allocate result and fill
+        const result = self.arena.allocSlice(u8, count) catch return error.OutOfMemory;
+        var j: usize = 0;
+        for (input) |elem| {
+            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+            const pred = try self.evaluateSubtree(body_idx);
+            if (pred.boolean) {
+                result[j] = elem;
+                j += 1;
+            }
+        }
+
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
+    /// Compute fold: reduce collection with binary function
+    fn computeFold(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITION: Collection and zero values are on stack
+        assert(self.value_sp >= 2);
+
+        try self.addCost(FixedCost.collection_base);
+
+        // Pop in reverse order: zero was pushed last
+        const zero = try self.popValue();
+        const coll = try self.popValue();
+
+        // Get collection length - only coll_byte supported currently
+        const len: usize = switch (coll) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // Empty collection: return zero
+        if (len == 0) {
+            try self.pushValue(zero);
+            return;
+        }
+
+        // Find the lambda (after collection subtree and zero subtree)
+        const coll_idx = node_idx + 1;
+        const zero_idx = self.findSubtreeEnd(coll_idx);
+        const lambda_idx = self.findSubtreeEnd(zero_idx);
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+        if (lambda_node.data != 2) return error.InvalidData; // Fold lambda takes 2 args
+
+        // For fold, we need two var_ids: accumulator and element
+        // Convention: acc_id = 1, elem_id = 2 (or scan body to find them)
+        const body_idx = lambda_idx + 1;
+        const acc_var_id: u16 = 1;
+        const elem_var_id: u16 = 2;
+
+        // Accumulate
+        var acc = zero;
+        for (0..len) |i| {
+            const elem = try self.getCollectionElement(coll, i);
+            self.var_bindings[acc_var_id] = acc;
+            self.var_bindings[elem_var_id] = elem;
+
+            acc = try self.evaluateSubtree(body_idx);
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        try self.pushValue(acc);
+    }
+
+    /// Helper: get element from collection at index
+    fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
+        _ = self;
+        return switch (coll) {
+            .coll_byte => |c| if (idx < c.len) .{ .byte = @bitCast(c[idx]) } else error.IndexOutOfBounds,
+            // Generic collections need value array access (not yet implemented)
+            .coll => return error.UnsupportedExpression,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper: find lambda argument var_id by scanning body for val_use
+    fn findLambdaArgId(self: *const Evaluator, body_idx: u16) ?u16 {
+        const end_idx = self.findSubtreeEnd(body_idx);
+        var i = body_idx;
+        while (i < end_idx) : (i += 1) {
+            const node = self.tree.nodes[i];
+            if (node.tag == .val_use) {
+                return node.data;
+            }
+        }
+        return null;
+    }
+
+    /// Helper: evaluate a subtree and return result
+    fn evaluateSubtree(self: *Evaluator, root_idx: u16) EvalError!Value {
+        // Save current stack state
+        const saved_work_sp = self.work_sp;
+        const saved_value_sp = self.value_sp;
+
+        // Push work for subtree
+        try self.pushWork(.{ .node_idx = root_idx, .phase = .evaluate });
+
+        // Process until we return to saved state
+        while (self.work_sp > saved_work_sp) {
+            const work = self.popWork();
+            switch (work.phase) {
+                .evaluate => try self.evaluateNode(work.node_idx),
+                .compute => try self.computeNode(work.node_idx),
+            }
+        }
+
+        // Result should be on stack
+        if (self.value_sp <= saved_value_sp) return error.ValueStackUnderflow;
+
+        return self.popValue();
+    }
+
+    // ========================================================================
     // Stack operations
     // ========================================================================
 
@@ -1666,6 +2022,19 @@ pub const Evaluator = struct {
             .apply => {
                 next = self.findSubtreeEnd(next); // Function
                 next = self.findSubtreeEnd(next); // Arg
+            },
+
+            // Collection HOF: map_collection, exists, for_all, filter - 2 children (collection + lambda)
+            .map_collection, .exists, .for_all, .filter => {
+                next = self.findSubtreeEnd(next); // Collection
+                next = self.findSubtreeEnd(next); // Lambda (func_value)
+            },
+
+            // fold: 3 children (collection + zero + lambda)
+            .fold => {
+                next = self.findSubtreeEnd(next); // Collection
+                next = self.findSubtreeEnd(next); // Zero value
+                next = self.findSubtreeEnd(next); // Lambda (func_value)
             },
         }
 
@@ -2652,4 +3021,75 @@ test "evaluator: last_block_utxo_root no headers errors" {
 
     var eval = Evaluator.init(&tree, &ctx);
     try std.testing.expectError(error.InvalidContext, eval.evaluate());
+}
+
+test "evaluator: exists on empty collection returns false" {
+    // exists({ }, { x => x > 0 }) => false
+    // Tree structure: [exists] [constant(empty coll)] [func_value] [true_leaf]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .exists, .result_type = TypePool.BOOLEAN };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // Empty collection
+    tree.nodes[2] = .{ .tag = .func_value, .data = 1 }; // 1 arg lambda
+    tree.nodes[3] = .{ .tag = .true_leaf }; // Lambda body (always true)
+    tree.node_count = 4;
+    tree.values[0] = .{ .coll_byte = "" }; // Empty collection
+    tree.value_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Empty collection: exists returns false regardless of predicate
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == false);
+}
+
+test "evaluator: forall on empty collection returns true" {
+    // forall({ }, { x => x > 0 }) => true
+    // Tree structure: [for_all] [constant(empty coll)] [func_value] [false_leaf]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .for_all, .result_type = TypePool.BOOLEAN };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // Empty collection
+    tree.nodes[2] = .{ .tag = .func_value, .data = 1 }; // 1 arg lambda
+    tree.nodes[3] = .{ .tag = .false_leaf }; // Lambda body (always false)
+    tree.node_count = 4;
+    tree.values[0] = .{ .coll_byte = "" }; // Empty collection
+    tree.value_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Empty collection: forall returns true regardless of predicate
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == true);
+}
+
+test "evaluator: fold on empty collection returns zero" {
+    // fold({ }, 42, { (acc, x) => acc + x }) => 42
+    // Tree structure: [fold] [constant(empty coll)] [constant(42)] [func_value] [body]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .fold };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // Empty collection
+    tree.nodes[2] = .{ .tag = .constant, .data = 1 }; // Zero value = 42
+    tree.nodes[3] = .{ .tag = .func_value, .data = 2 }; // 2 arg lambda
+    tree.nodes[4] = .{ .tag = .val_use, .data = 1 }; // Return accumulator
+    tree.node_count = 5;
+    tree.values[0] = .{ .coll_byte = "" }; // Empty collection
+    tree.values[1] = .{ .long = 42 }; // Zero value
+    tree.value_count = 2;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Empty collection: fold returns zero value
+    try std.testing.expect(result == .long);
+    try std.testing.expectEqual(@as(i64, 42), result.long);
 }

@@ -58,9 +58,10 @@ pub const constant_last: OpCode = 111;
 /// Variable operations
 pub const TaggedVariable: OpCode = 113; // 0x71
 pub const ValUse: OpCode = 114; // 0x72
-pub const ValDef: OpCode = 115; // 0x73
-pub const FunDef: OpCode = 117; // 0x75
-pub const BlockValue: OpCode = 116; // 0x74
+pub const ValDef: OpCode = 115; // 0x73 (NOTE: Wrong! Should be 214 per Scala - see zigma-a5q)
+pub const FunDef: OpCode = 117; // 0x75 (NOTE: Wrong! Should be 215 per Scala - see zigma-a5q)
+pub const BlockValue: OpCode = 116; // 0x74 (NOTE: Wrong! Should be 216 per Scala - see zigma-a5q)
+pub const FuncValue: OpCode = 131; // 0x83 (NOTE: Wrong! Should be 217 per Scala - see zigma-a5q) - using 131 to avoid conflict
 
 /// Boolean literals
 pub const TrueLeaf: OpCode = 127; // 0x7F
@@ -229,6 +230,7 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         ValDef => .{ .name = "ValDef", .code = ValDef, .category = .control, .cost = 10 },
         FunDef => .{ .name = "FunDef", .code = FunDef, .category = .control, .cost = 10 },
         BlockValue => .{ .name = "BlockValue", .code = BlockValue, .category = .control, .cost = 10 },
+        FuncValue => .{ .name = "FuncValue", .code = FuncValue, .category = .control, .cost = 20 },
 
         // Literals
         TrueLeaf => .{ .name = "TrueLeaf", .code = TrueLeaf, .category = .literal, .cost = 10 },

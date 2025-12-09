@@ -114,6 +114,18 @@ pub const ExprTag = enum(u8) {
     /// Concrete collection literal (opcode 0xDC) - Coll[T](item_0, item_1, ...)
     concrete_collection,
 
+    // Collection higher-order functions (opcodes 0xAD-0xB5)
+    /// Map: Coll[A] × (A → B) → Coll[B] (opcode 0xAD)
+    map_collection,
+    /// Exists: Coll[A] × (A → Boolean) → Boolean (opcode 0xAE)
+    exists,
+    /// ForAll: Coll[A] × (A → Boolean) → Boolean (opcode 0xAF)
+    for_all,
+    /// Fold: Coll[A] × B × ((B,A) → B) → B (opcode 0xB0)
+    fold,
+    /// Filter: Coll[A] × (A → Boolean) → Coll[A] (opcode 0xB5)
+    filter,
+
     // Header field extraction opcodes (0xE9-0xF2)
     /// Extract version byte from Header (opcode 0xE9)
     extract_version,
@@ -449,6 +461,14 @@ fn deserializeWithDepth(
             opcodes.Downcast => try deserializeDowncast(tree, reader, arena, depth),
             // Collection constructors
             opcodes.ConcreteCollection => try deserializeConcreteCollection(tree, reader, arena, depth),
+            // Collection higher-order functions
+            opcodes.MapCollection => try deserializeCollectionHOF(tree, reader, arena, .map_collection, depth),
+            opcodes.Exists => try deserializeCollectionHOF(tree, reader, arena, .exists, depth),
+            opcodes.ForAll => try deserializeCollectionHOF(tree, reader, arena, .for_all, depth),
+            opcodes.Fold => try deserializeFold(tree, reader, arena, depth),
+            opcodes.Filter => try deserializeCollectionHOF(tree, reader, arena, .filter, depth),
+            // FuncValue
+            opcodes.FuncValue => try deserializeFuncValue(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -953,6 +973,103 @@ fn deserializeConcreteCollection(
 
     // POSTCONDITION: all items parsed
     // (node count increased by 1 + sum of all child nodes)
+}
+
+fn deserializeCollectionHOF(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // Collection HOF format: [collection_expr] [lambda_func]
+    // For Map, Exists, ForAll, Filter
+    // PRECONDITION: tag is a valid collection HOF
+    assert(tag == .map_collection or tag == .exists or tag == .for_all or tag == .filter);
+
+    // Determine result type
+    const result_type: TypeIndex = switch (tag) {
+        .exists, .for_all => TypePool.BOOLEAN,
+        .map_collection, .filter => TypePool.ANY, // Determined at runtime
+        else => TypePool.ANY,
+    };
+
+    // Add the HOF node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .result_type = result_type,
+    });
+
+    // Parse collection expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse lambda function expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeFold(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Fold format: [collection_expr] [zero_expr] [fold_op_func]
+    // Fold: Coll[A] × B × ((B,A) → B) → B
+
+    // Add the fold node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = .fold,
+        .result_type = TypePool.ANY, // Type of zero/result
+    });
+
+    // Parse collection expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse zero (initial accumulator) expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse fold operation (lambda: (acc, elem) -> acc)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeFuncValue(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // FuncValue format: numArgs (VLQ) + args [(id, type)...] + body expr
+    // Reference: Scala FuncValueSerializer.scala
+
+    const num_args = reader.readU32() catch |e| return mapVlqError(e);
+    if (num_args > 32) return error.InvalidData; // Reasonable limit
+
+    // Read argument definitions and register types
+    var i: u32 = 0;
+    while (i < num_args) : (i += 1) {
+        const var_id = reader.readU32() catch |e| return mapVlqError(e);
+        const arg_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+            return switch (e) {
+                error.InvalidTypeCode => error.InvalidTypeCode,
+                error.PoolFull => error.PoolFull,
+                error.NestingTooDeep => error.NestingTooDeep,
+                error.InvalidTupleLength => error.InvalidTupleLength,
+                else => error.InvalidData,
+            };
+        };
+        // Register the argument type for ValUse lookups
+        tree.setValDefType(@truncate(var_id), arg_type);
+    }
+
+    // Add the func_value node (stores num_args in data)
+    _ = try tree.addNode(.{
+        .tag = .func_value,
+        .data = @truncate(num_args),
+        .result_type = TypePool.ANY, // Function type determined by body
+    });
+
+    // Parse function body
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
 fn mapVlqError(err: vlq.DecodeError) DeserializeError {
