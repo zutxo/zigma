@@ -60,6 +60,15 @@ pub const secp256k1 = @import("crypto/secp256k1.zig");
 /// SigmaBoolean tree representation
 pub const sigma_tree = @import("sigma/sigma_tree.zig");
 
+/// Fiat-Shamir challenge computation
+pub const challenge = @import("sigma/challenge.zig");
+
+/// Schnorr signature verification (ProveDlog)
+pub const schnorr = @import("sigma/schnorr.zig");
+
+/// Sigma protocol verifier (AND/OR/THRESHOLD)
+pub const verifier = @import("sigma/verifier.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -83,6 +92,9 @@ comptime {
     _ = bigint;
     _ = secp256k1;
     _ = sigma_tree;
+    _ = challenge;
+    _ = schnorr;
+    _ = verifier;
 }
 
 /// Protocol version constants
