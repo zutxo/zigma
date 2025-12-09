@@ -51,6 +51,9 @@ pub const ops = @import("interpreter/ops.zig");
 /// Cryptographic hash functions (Blake2b256, SHA256)
 pub const hash = @import("crypto/hash.zig");
 
+/// 256-bit signed integer arithmetic
+pub const bigint = @import("crypto/bigint.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -71,6 +74,7 @@ comptime {
     _ = evaluator;
     _ = ops;
     _ = hash;
+    _ = bigint;
 }
 
 /// Protocol version constants
