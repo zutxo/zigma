@@ -107,6 +107,29 @@ pub const ExprTag = enum(u8) {
     upcast,
     /// Downcast to smaller type (opcode 0xE5) - e.g., Long → Int, may overflow
     downcast,
+
+    // Header field extraction opcodes (0xE9-0xF2)
+    /// Extract version byte from Header (opcode 0xE9)
+    extract_version,
+    /// Extract parent block ID from Header (opcode 0xEA)
+    extract_parent_id,
+    /// Extract AD proofs root from Header (opcode 0xEB)
+    extract_ad_proofs_root,
+    /// Extract state root (AVL+ digest) from Header (opcode 0xEC)
+    extract_state_root,
+    /// Extract transactions root from Header (opcode 0xED)
+    extract_txs_root,
+    /// Extract timestamp from Header (opcode 0xEE)
+    extract_timestamp,
+    /// Extract nBits (difficulty target) from Header (opcode 0xEF)
+    extract_n_bits,
+    /// Extract difficulty as BigInt from Header (opcode 0xF0)
+    extract_difficulty,
+    /// Extract votes from Header (opcode 0xF1)
+    extract_votes,
+    /// Extract miner rewards pubkey from Header (opcode 0xF2)
+    extract_miner_rewards,
+
     /// Unsupported opcode
     unsupported,
 };

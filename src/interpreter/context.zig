@@ -343,6 +343,27 @@ pub fn testBox() BoxView {
     };
 }
 
+/// Create a minimal header for testing
+pub fn testHeader() HeaderView {
+    return .{
+        .id = [_]u8{0} ** 32,
+        .version = 2,
+        .parent_id = [_]u8{0} ** 32,
+        .ad_proofs_root = [_]u8{0} ** 32,
+        .state_root = [_]u8{0} ** 44,
+        .transactions_root = [_]u8{0} ** 32,
+        .timestamp = 1700000000000, // Nov 2023
+        .n_bits = 0x01000000,
+        .height = 1000000,
+        .extension_root = [_]u8{0} ** 32,
+        .miner_pk = [_]u8{0x02} ++ [_]u8{0} ** 32,
+        .pow_onetime_pk = [_]u8{0x02} ++ [_]u8{0} ** 32,
+        .pow_nonce = [_]u8{0} ** 8,
+        .pow_distance = [_]u8{0} ** 32,
+        .votes = [_]u8{0} ** 3,
+    };
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

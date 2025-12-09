@@ -78,6 +78,9 @@ pub const Value = union(enum) {
     /// Tuple value (indices into value array)
     tuple: TupleRef,
 
+    /// Header value (reference to block header)
+    header: HeaderRef,
+
     /// 256-bit signed integer stored as big-endian bytes
     pub const BigInt = struct {
         bytes: [max_bigint_bytes]u8,
@@ -127,6 +130,26 @@ pub const Value = union(enum) {
     pub const TupleRef = struct {
         start: u16,
         len: u8,
+    };
+
+    /// Reference to header (inline copy of HeaderView fields for evaluation)
+    /// This mirrors context.HeaderView but is stored inline in Value
+    pub const HeaderRef = struct {
+        id: [32]u8,
+        version: u8,
+        parent_id: [32]u8,
+        ad_proofs_root: [32]u8,
+        state_root: [44]u8,
+        transactions_root: [32]u8,
+        timestamp: u64,
+        n_bits: u64,
+        height: u32,
+        extension_root: [32]u8,
+        miner_pk: [33]u8,
+        pow_onetime_pk: [33]u8,
+        pow_nonce: [8]u8,
+        pow_distance: [32]u8,
+        votes: [3]u8,
     };
 };
 

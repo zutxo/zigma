@@ -18,6 +18,7 @@ pub const box = @import("ops/box.zig");
 pub const context_ops = @import("ops/context_ops.zig");
 pub const collection = @import("ops/collection.zig");
 pub const crypto = @import("ops/crypto.zig");
+pub const header_ops = @import("ops/header_ops.zig");
 
 // Re-export common error types
 pub const ArithmeticError = arithmetic.ArithmeticError;
@@ -26,6 +27,7 @@ pub const Order = comparison.Order;
 // Re-export context error type
 pub const ContextError = context_ops.ContextError;
 pub const CollectionError = collection.CollectionError;
+pub const HeaderError = header_ops.HeaderError;
 
 // Pull in tests from all submodules
 comptime {
@@ -36,6 +38,7 @@ comptime {
     _ = context_ops;
     _ = collection;
     _ = crypto;
+    _ = header_ops;
 }
 
 test "ops: module imports work" {

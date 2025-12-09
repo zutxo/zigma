@@ -144,6 +144,8 @@ const FixedCost = struct {
     // Type cast costs
     pub const upcast: u32 = 10;
     pub const downcast: u32 = 10;
+    // Header extraction costs (all low-cost field access)
+    pub const extract_header_field: u32 = 10;
 };
 
 // ============================================================================
@@ -464,6 +466,23 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            // Header field extraction opcodes (0xE9-0xF2)
+            .extract_version,
+            .extract_parent_id,
+            .extract_ad_proofs_root,
+            .extract_state_root,
+            .extract_txs_root,
+            .extract_timestamp,
+            .extract_n_bits,
+            .extract_difficulty,
+            .extract_votes,
+            .extract_miner_rewards,
+            => {
+                // Unary: Header → field value
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -579,6 +598,18 @@ pub const Evaluator = struct {
             .downcast => {
                 try self.computeDowncast(node.data);
             },
+
+            // Header field extraction
+            .extract_version => try self.computeExtractVersion(),
+            .extract_parent_id => try self.computeExtractParentId(),
+            .extract_ad_proofs_root => try self.computeExtractAdProofsRoot(),
+            .extract_state_root => try self.computeExtractStateRoot(),
+            .extract_txs_root => try self.computeExtractTxsRoot(),
+            .extract_timestamp => try self.computeExtractTimestamp(),
+            .extract_n_bits => try self.computeExtractNBits(),
+            .extract_difficulty => try self.computeExtractDifficulty(),
+            .extract_votes => try self.computeExtractVotes(),
+            .extract_miner_rewards => try self.computeExtractMinerRewards(),
 
             else => {
                 // Other node types don't need compute phase
@@ -1150,6 +1181,145 @@ pub const Evaluator = struct {
     }
 
     // ========================================================================
+    // Header Field Extraction Operations
+    // ========================================================================
+
+    /// Compute ExtractVersion (0xE9): Header → Byte
+    fn computeExtractVersion(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        try self.pushValue(.{ .byte = @intCast(header.version) });
+    }
+
+    /// Compute ExtractParentId (0xEA): Header → Coll[Byte] 32b
+    fn computeExtractParentId(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.parent_id);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute ExtractAdProofsRoot (0xEB): Header → Coll[Byte] 32b
+    fn computeExtractAdProofsRoot(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.ad_proofs_root);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute ExtractStateRoot (0xEC): Header → AvlTree digest 44b
+    fn computeExtractStateRoot(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 44) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.state_root);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute ExtractTransactionsRoot (0xED): Header → Coll[Byte] 32b
+    fn computeExtractTxsRoot(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.transactions_root);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute ExtractTimestamp (0xEE): Header → Long
+    fn computeExtractTimestamp(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        try self.pushValue(.{ .long = @intCast(header.timestamp) });
+    }
+
+    /// Compute ExtractNBits (0xEF): Header → Long
+    fn computeExtractNBits(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        try self.pushValue(.{ .long = @intCast(header.n_bits) });
+    }
+
+    /// Compute ExtractDifficulty (0xF0): Header → BigInt 32b
+    fn computeExtractDifficulty(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        // Return pow_distance as BigInt (32 bytes)
+        var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 32 };
+        @memcpy(bigint.bytes[0..32], &header.pow_distance);
+        try self.pushValue(.{ .big_int = bigint });
+    }
+
+    /// Compute ExtractVotes (0xF1): Header → Coll[Byte] 3b
+    fn computeExtractVotes(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 3) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.votes);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute ExtractMinerRewards (0xF2): Header → Coll[Byte] 33b (miner pubkey)
+    fn computeExtractMinerRewards(self: *Evaluator) EvalError!void {
+        assert(self.value_sp > 0);
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+        const result_slice = self.arena.allocSlice(u8, 33) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.miner_pk);
+        try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    // ========================================================================
     // Stack operations
     // ========================================================================
 
@@ -1197,7 +1367,29 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .group_generator => {},
 
             // One child
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast => {
+            .calc_blake2b256,
+            .calc_sha256,
+            .option_get,
+            .option_is_defined,
+            .long_to_byte_array,
+            .byte_array_to_bigint,
+            .byte_array_to_long,
+            .decode_point,
+            .select_field,
+            .upcast,
+            .downcast,
+            // Header extraction (all take one Header child)
+            .extract_version,
+            .extract_parent_id,
+            .extract_ad_proofs_root,
+            .extract_state_root,
+            .extract_txs_root,
+            .extract_timestamp,
+            .extract_n_bits,
+            .extract_difficulty,
+            .extract_votes,
+            .extract_miner_rewards,
+            => {
                 next = self.findSubtreeEnd(next);
             },
 
