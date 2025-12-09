@@ -52,6 +52,20 @@ pub const FieldElement = struct {
     pub const zero = FieldElement{ .limbs = .{ 0, 0, 0, 0 } };
     pub const one = FieldElement{ .limbs = .{ 1, 0, 0, 0 } };
 
+    // Compile-time assertions for constant correctness
+    comptime {
+        // P must have top limbs all 1s (2^256 - small number)
+        assert(P[3] == 0xFFFFFFFFFFFFFFFF);
+        assert(P[2] == 0xFFFFFFFFFFFFFFFF);
+        assert(P[1] == 0xFFFFFFFFFFFFFFFF);
+        // P's low limb encodes -2^32 - 977 in two's complement
+        assert(P[0] == 0xFFFFFFFEFFFFFC2F);
+        // Zero is all zeros
+        assert(zero.limbs[0] == 0 and zero.limbs[3] == 0);
+        // One has value 1 in lowest limb
+        assert(one.limbs[0] == 1 and one.limbs[1] == 0);
+    }
+
     /// Create from u64
     pub fn fromInt(n: u64) FieldElement {
         return .{ .limbs = .{ n, 0, 0, 0 } };
@@ -59,6 +73,9 @@ pub const FieldElement = struct {
 
     /// Create from big-endian bytes (32 bytes)
     pub fn fromBytes(bytes: *const [32]u8) Secp256k1Error!FieldElement {
+        // Precondition: input is exactly 32 bytes (ensured by type)
+        assert(bytes.len == 32);
+
         var limbs: [4]u64 = undefined;
         for (0..4) |i| {
             const offset = 32 - (i + 1) * 8;
@@ -70,6 +87,9 @@ pub const FieldElement = struct {
         if (cmpLimbs(limbs, P) != .lt) {
             return error.InvalidFieldElement;
         }
+
+        // Postcondition: result is a valid field element (< p)
+        assert(cmpLimbs(fe.limbs, P) == .lt);
         return fe;
     }
 
@@ -97,6 +117,10 @@ pub const FieldElement = struct {
 
     /// Addition mod p
     pub fn add(a: FieldElement, b: FieldElement) FieldElement {
+        // Precondition: inputs are valid field elements (< p)
+        assert(cmpLimbs(a.limbs, P) == .lt);
+        assert(cmpLimbs(b.limbs, P) == .lt);
+
         var result: [4]u64 = undefined;
         var carry: u64 = 0;
 
@@ -112,24 +136,38 @@ pub const FieldElement = struct {
             result = subLimbs(result, P);
         }
 
+        // Postcondition: result is a valid field element (< p)
+        assert(cmpLimbs(result, P) == .lt);
         return .{ .limbs = result };
     }
 
     /// Subtraction mod p
     pub fn sub(a: FieldElement, b: FieldElement) FieldElement {
+        // Precondition: inputs are valid field elements (< p)
+        assert(cmpLimbs(a.limbs, P) == .lt);
+        assert(cmpLimbs(b.limbs, P) == .lt);
+
+        var result: [4]u64 = undefined;
         if (cmpLimbs(a.limbs, b.limbs) != .lt) {
             // a >= b: simple subtraction
-            return .{ .limbs = subLimbs(a.limbs, b.limbs) };
+            result = subLimbs(a.limbs, b.limbs);
         } else {
             // a < b: compute a - b + p = (a + p) - b
-            var result = addLimbsNoReduce(a.limbs, P);
+            result = addLimbsNoReduce(a.limbs, P);
             result = subLimbs(result, b.limbs);
-            return .{ .limbs = result };
         }
+
+        // Postcondition: result is a valid field element (< p)
+        assert(cmpLimbs(result, P) == .lt);
+        return .{ .limbs = result };
     }
 
     /// Multiplication mod p
     pub fn mul(a: FieldElement, b: FieldElement) FieldElement {
+        // Precondition: inputs are valid field elements (< p)
+        assert(cmpLimbs(a.limbs, P) == .lt);
+        assert(cmpLimbs(b.limbs, P) == .lt);
+
         // Schoolbook multiplication with Barrett reduction
         var result: [8]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
 
@@ -145,7 +183,10 @@ pub const FieldElement = struct {
         }
 
         // Reduce mod p
-        return reduce512(result);
+        const reduced = reduce512(result);
+        // Postcondition: result is a valid field element (< p)
+        assert(cmpLimbs(reduced.limbs, P) == .lt);
+        return reduced;
     }
 
     /// Squaring mod p (slightly more efficient than mul)
@@ -161,15 +202,25 @@ pub const FieldElement = struct {
 
     /// Modular inverse using Fermat's little theorem: a^(-1) = a^(p-2) mod p
     pub fn inv(self: FieldElement) FieldElement {
-        assert(!self.isZero()); // Cannot invert zero
+        // Precondition: cannot invert zero
+        assert(!self.isZero());
+        // Precondition: input is a valid field element (< p)
+        assert(cmpLimbs(self.limbs, P) == .lt);
 
         // p - 2 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2D
         // Use square-and-multiply
-        return self.pow(P_MINUS_2);
+        const result = self.pow(P_MINUS_2);
+
+        // Postcondition: self * result = 1 (mod p)
+        assert(self.mul(result).eql(one));
+        return result;
     }
 
     /// Exponentiation: self^exp mod p
     pub fn pow(self: FieldElement, exp: [4]u64) FieldElement {
+        // Precondition: base is a valid field element (< p)
+        assert(cmpLimbs(self.limbs, P) == .lt);
+
         var result = one;
         var base = self;
 
@@ -184,12 +235,17 @@ pub const FieldElement = struct {
             }
         }
 
+        // Postcondition: result is a valid field element (< p)
+        assert(cmpLimbs(result.limbs, P) == .lt);
         return result;
     }
 
     /// Square root mod p using Tonelli-Shanks
     /// For p ≡ 3 (mod 4), sqrt(a) = a^((p+1)/4) mod p
     pub fn sqrt(self: FieldElement) Secp256k1Error!FieldElement {
+        // Precondition: input is a valid field element (< p)
+        assert(cmpLimbs(self.limbs, P) == .lt);
+
         if (self.isZero()) return zero;
 
         // Since p ≡ 3 (mod 4), sqrt(a) = a^((p+1)/4)
@@ -200,6 +256,8 @@ pub const FieldElement = struct {
             return error.NoSquareRoot;
         }
 
+        // Postcondition: candidate² == self
+        assert(candidate.square().eql(self));
         return candidate;
     }
 
@@ -221,71 +279,25 @@ pub const FieldElement = struct {
         0x3FFFFFFFFFFFFFFF,
     };
 
+    // secp256k1 reduction constant: 2^256 = c (mod p), where c = 2^32 + 977
+    const SECP256K1_C: u64 = 0x1000003D1;
+
     // Reduce 512-bit number mod p using secp256k1's special form
     // p = 2^256 - 2^32 - 977, so 2^256 = 2^32 + 977 (mod p)
     fn reduce512(x: [8]u64) FieldElement {
-        // For secp256k1: x mod p = x_lo + x_hi * c (mod p)
-        // where c = 2^32 + 977 = 0x1000003D1
-        const c: u64 = 0x1000003D1;
-
-        // Start with the high part of x
         var result: [5]u64 = .{ x[0], x[1], x[2], x[3], 0 };
 
-        // Add x[4] * c, x[5] * c << 64, etc.
+        // Reduce high limbs: x[4..8] * c
         for (4..8) |i| {
             if (x[i] == 0) continue;
-
-            const shift_pos = i - 4;
-            var carry: u64 = 0;
-            const prod_full: u128 = @as(u128, x[i]) * @as(u128, c);
-            const prod_lo: u64 = @truncate(prod_full);
-            const prod_hi: u64 = @truncate(prod_full >> 64);
-
-            // Add prod_lo at position shift_pos
-            var sum: u128 = @as(u128, result[shift_pos]) + @as(u128, prod_lo);
-            result[shift_pos] = @truncate(sum);
-            carry = @truncate(sum >> 64);
-
-            // Add prod_hi at position shift_pos + 1
-            if (shift_pos + 1 < 5) {
-                sum = @as(u128, result[shift_pos + 1]) + @as(u128, prod_hi) + @as(u128, carry);
-                result[shift_pos + 1] = @truncate(sum);
-                carry = @truncate(sum >> 64);
-
-                // Propagate carry
-                var j = shift_pos + 2;
-                while (carry != 0 and j < 5) : (j += 1) {
-                    sum = @as(u128, result[j]) + @as(u128, carry);
-                    result[j] = @truncate(sum);
-                    carry = @truncate(sum >> 64);
-                }
-            }
+            reduceAddMulC(&result, x[i], i - 4);
         }
 
-        // Now result is at most 320 bits (5 limbs)
-        // Reduce the 5th limb
+        // Reduce 5th limb until it's zero
         while (result[4] != 0) {
             const hi = result[4];
             result[4] = 0;
-
-            const prod_full: u128 = @as(u128, hi) * @as(u128, c);
-            const prod_lo: u64 = @truncate(prod_full);
-            const prod_hi: u64 = @truncate(prod_full >> 64);
-
-            var sum: u128 = @as(u128, result[0]) + @as(u128, prod_lo);
-            result[0] = @truncate(sum);
-            var carry: u64 = @truncate(sum >> 64);
-
-            sum = @as(u128, result[1]) + @as(u128, prod_hi) + @as(u128, carry);
-            result[1] = @truncate(sum);
-            carry = @truncate(sum >> 64);
-
-            var j: usize = 2;
-            while (carry != 0 and j < 5) : (j += 1) {
-                sum = @as(u128, result[j]) + @as(u128, carry);
-                result[j] = @truncate(sum);
-                carry = @truncate(sum >> 64);
-            }
+            reduceAddMulC(&result, hi, 0);
         }
 
         var r: [4]u64 = .{ result[0], result[1], result[2], result[3] };
@@ -296,6 +308,30 @@ pub const FieldElement = struct {
         }
 
         return .{ .limbs = r };
+    }
+
+    // Helper: Add value * c at position in 5-limb accumulator
+    fn reduceAddMulC(result: *[5]u64, value: u64, pos: usize) void {
+        const prod_full: u128 = @as(u128, value) * @as(u128, SECP256K1_C);
+        const prod_lo: u64 = @truncate(prod_full);
+        const prod_hi: u64 = @truncate(prod_full >> 64);
+
+        var sum: u128 = @as(u128, result[pos]) + @as(u128, prod_lo);
+        result[pos] = @truncate(sum);
+        var carry: u64 = @truncate(sum >> 64);
+
+        if (pos + 1 < 5) {
+            sum = @as(u128, result[pos + 1]) + @as(u128, prod_hi) + @as(u128, carry);
+            result[pos + 1] = @truncate(sum);
+            carry = @truncate(sum >> 64);
+
+            var j = pos + 2;
+            while (carry != 0 and j < 5) : (j += 1) {
+                sum = @as(u128, result[j]) + @as(u128, carry);
+                result[j] = @truncate(sum);
+                carry = @truncate(sum >> 64);
+            }
+        }
     }
 };
 
@@ -405,7 +441,12 @@ pub const Point = struct {
     }
 
     /// Encode to SEC1 compressed format (33 bytes)
+    /// PAIR ASSERTION: decode() asserts isValid() after deserializing,
+    /// encode() asserts isValid() before serializing
     pub fn encode(self: Point) [33]u8 {
+        // CRITICAL: Never serialize an invalid point
+        assert(self.is_infinity or self.isValid());
+
         if (self.is_infinity) {
             return [_]u8{0} ** 33;
         }
@@ -436,6 +477,10 @@ pub const Point = struct {
 
     /// Point addition
     pub fn add(self: Point, other: Point) Point {
+        // Precondition: both points are valid (on curve or infinity)
+        assert(self.is_infinity or self.isValid());
+        assert(other.is_infinity or other.isValid());
+
         if (self.is_infinity) return other;
         if (other.is_infinity) return self;
 
@@ -462,11 +507,17 @@ pub const Point = struct {
         const x3 = lambda2.sub(self.x).sub(other.x);
         const y3 = lambda.mul(self.x.sub(x3)).sub(self.y);
 
-        return .{ .x = x3, .y = y3, .is_infinity = false };
+        const result = Point{ .x = x3, .y = y3, .is_infinity = false };
+        // Postcondition: result is on curve
+        assert(result.isValid());
+        return result;
     }
 
     /// Point doubling: 2P
     pub fn double(self: Point) Point {
+        // Precondition: point is valid (on curve or infinity)
+        assert(self.is_infinity or self.isValid());
+
         if (self.is_infinity) return self;
         if (self.y.isZero()) return infinity; // Tangent is vertical
 
@@ -484,11 +535,17 @@ pub const Point = struct {
         const x3 = lambda2.sub(self.x).sub(self.x);
         const y3 = lambda.mul(self.x.sub(x3)).sub(self.y);
 
-        return .{ .x = x3, .y = y3, .is_infinity = false };
+        const result = Point{ .x = x3, .y = y3, .is_infinity = false };
+        // Postcondition: result is on curve
+        assert(result.isValid());
+        return result;
     }
 
     /// Scalar multiplication: k * P using double-and-add
     pub fn mul(self: Point, k: [4]u64) Point {
+        // Precondition: point is valid (on curve or infinity)
+        assert(self.is_infinity or self.isValid());
+
         if (self.is_infinity) return infinity;
 
         // Check for zero scalar
@@ -511,6 +568,8 @@ pub const Point = struct {
             }
         }
 
+        // Postcondition: result is valid (on curve or infinity)
+        assert(result.is_infinity or result.isValid());
         return result;
     }
 };

@@ -35,6 +35,14 @@ pub const CollectionError = error{
 /// Maximum collection size (matches Ergo protocol limits)
 pub const max_collection_size: usize = 10000;
 
+// Compile-time assertions for limits
+comptime {
+    // Collection size must fit in i32 for Ergo compatibility
+    assert(max_collection_size <= @as(usize, @intCast(std.math.maxInt(i32))));
+    // Collection size must be reasonable for stack-based interpreter
+    assert(max_collection_size <= 65535);
+}
+
 // ============================================================================
 // Basic Collection Operations
 // ============================================================================
@@ -42,33 +50,57 @@ pub const max_collection_size: usize = 10000;
 /// Get size of collection
 /// OpCode: SizeOf (0x6C)
 pub fn sizeOf(comptime T: type, coll: []const T) i32 {
+    // Precondition: collection doesn't exceed protocol limits
     assert(coll.len <= max_collection_size);
-    return @intCast(coll.len);
+
+    const result: i32 = @intCast(coll.len);
+
+    // Postcondition: result is non-negative
+    assert(result >= 0);
+    // Postcondition: result matches input length
+    assert(result == @as(i32, @intCast(coll.len)));
+    return result;
 }
 
 /// Access element by index
 /// OpCode: ByIndex (0x6A)
 /// Returns error if index out of bounds
 pub fn byIndex(comptime T: type, coll: []const T, index: i32) CollectionError!T {
+    // Precondition: collection is valid
+    assert(coll.len <= max_collection_size);
+
     if (index < 0 or index >= sizeOf(T, coll)) {
         return error.IndexOutOfBounds;
     }
-    return coll[@intCast(index)];
+
+    const uindex: usize = @intCast(index);
+    // Invariant: index is within bounds after check
+    assert(uindex < coll.len);
+    return coll[uindex];
 }
 
 /// Access element by index with default for out-of-bounds
 /// OpCode: ByIndex with default value
 pub fn byIndexOrDefault(comptime T: type, coll: []const T, index: i32, default: T) T {
+    // Precondition: collection is valid
+    assert(coll.len <= max_collection_size);
+
     if (index < 0 or index >= sizeOf(T, coll)) {
         return default;
     }
-    return coll[@intCast(index)];
+    const uindex: usize = @intCast(index);
+    // Invariant: index is within bounds
+    assert(uindex < coll.len);
+    return coll[uindex];
 }
 
 /// Extract slice [start, end)
 /// OpCode: Slice (0x6B)
 /// Returns error if range is invalid
 pub fn slice(comptime T: type, coll: []const T, start: i32, end: i32) CollectionError![]const T {
+    // Precondition: collection is valid
+    assert(coll.len <= max_collection_size);
+
     const len = sizeOf(T, coll);
 
     if (start < 0 or end < 0) {
@@ -80,7 +112,15 @@ pub fn slice(comptime T: type, coll: []const T, start: i32, end: i32) Collection
 
     const start_idx: usize = @intCast(start);
     const end_idx: usize = @intCast(end);
-    return coll[start_idx..end_idx];
+
+    // Invariant: indices are valid after bounds check
+    assert(start_idx <= end_idx);
+    assert(end_idx <= coll.len);
+
+    const result = coll[start_idx..end_idx];
+    // Postcondition: result length equals end - start
+    assert(result.len == end_idx - start_idx);
+    return result;
 }
 
 /// Get first element
@@ -119,27 +159,46 @@ pub fn append(
     b: []const T,
     buffer: []T,
 ) CollectionError![]T {
+    // Precondition: input collections are valid
+    assert(a.len <= max_collection_size);
+    assert(b.len <= max_collection_size);
+
     const total_len = a.len + b.len;
     if (total_len > max_collection_size) return error.SizeLimitExceeded;
     if (buffer.len < total_len) return error.SizeLimitExceeded;
 
+    // Precondition: buffer has sufficient capacity
+    assert(buffer.len >= total_len);
+
     @memcpy(buffer[0..a.len], a);
     @memcpy(buffer[a.len..total_len], b);
 
-    return buffer[0..total_len];
+    const result = buffer[0..total_len];
+    // Postcondition: result length is sum of input lengths
+    assert(result.len == a.len + b.len);
+    return result;
 }
 
 /// Create indices collection [0, 1, ..., len-1]
 /// Caller must provide buffer
 pub fn indices(len: usize, buffer: []i32) CollectionError![]i32 {
+    // Precondition: length is within limits
     if (len > max_collection_size) return error.SizeLimitExceeded;
     if (buffer.len < len) return error.SizeLimitExceeded;
+
+    // Precondition: buffer has sufficient capacity
+    assert(buffer.len >= len);
 
     for (0..len) |i| {
         buffer[i] = @intCast(i);
     }
 
-    return buffer[0..len];
+    const result = buffer[0..len];
+    // Postcondition: result has correct length
+    assert(result.len == len);
+    // Postcondition: if non-empty, first element is 0
+    assert(len == 0 or result[0] == 0);
+    return result;
 }
 
 /// Take first n elements

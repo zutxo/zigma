@@ -28,7 +28,15 @@ pub const ProveDlog = struct {
 
     /// Create from public key bytes
     pub fn init(pk: [33]u8) ProveDlog {
-        return .{ .public_key = pk };
+        // Precondition: public key has valid compressed prefix (0x02 or 0x03)
+        assert(pk[0] == 0x02 or pk[0] == 0x03);
+        // Precondition: public key is 33 bytes (ensured by type)
+        assert(pk.len == 33);
+
+        const result = ProveDlog{ .public_key = pk };
+        // Postcondition: stored key matches input
+        assert(std.mem.eql(u8, &result.public_key, &pk));
+        return result;
     }
 
     /// Check equality
@@ -68,6 +76,16 @@ pub const max_tree_depth: usize = 128;
 
 /// Maximum number of children in AND/OR/THRESHOLD nodes
 pub const max_children: usize = 255;
+
+// Compile-time assertions for tree limits
+comptime {
+    // Depth must be bounded to prevent stack overflow
+    assert(max_tree_depth <= 256);
+    // Children count must fit in u8 for compact representation
+    assert(max_children <= 255);
+    // Tree depth must allow reasonable nesting
+    assert(max_tree_depth >= 8);
+}
 
 /// SigmaBoolean tree node
 /// Tagged union representing all possible proposition types
@@ -141,6 +159,9 @@ pub const SigmaBoolean = union(enum) {
     }
 
     fn reduceWithDepth(self: *const SigmaBoolean, depth: usize) SigmaBoolean {
+        // Precondition: depth is within bounds
+        assert(depth <= max_tree_depth);
+
         // Prevent infinite recursion
         if (depth >= max_tree_depth) {
             return self.*;

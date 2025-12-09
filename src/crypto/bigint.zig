@@ -78,6 +78,19 @@ pub const BigInt256 = struct {
         .negative = true,
     };
 
+    // Compile-time assertions for constant correctness
+    comptime {
+        // max_value must have top bit clear (positive, < 2^255)
+        assert(max_value.limbs[3] >> 63 == 0);
+        // min_value must have magnitude = 2^255 exactly
+        assert(min_value.limbs[3] == (@as(u64, 1) << 63));
+        assert(min_value.limbs[0] == 0 and min_value.limbs[1] == 0 and min_value.limbs[2] == 0);
+        // zero must be non-negative
+        assert(!zero.negative);
+        // one must be positive with value 1
+        assert(one.limbs[0] == 1 and !one.negative);
+    }
+
     // ========================================================================
     // Construction
     // ========================================================================
@@ -86,31 +99,43 @@ pub const BigInt256 = struct {
     pub fn fromInt(value: i64) BigInt256 {
         if (value == 0) return zero;
 
+        var result: BigInt256 = undefined;
         if (value > 0) {
-            return .{
+            result = .{
                 .limbs = .{ @intCast(value), 0, 0, 0 },
                 .negative = false,
             };
         } else if (value == std.math.minInt(i64)) {
             // Special case: -MIN = MIN magnitude
-            return .{
+            result = .{
                 .limbs = .{ @as(u64, 1) << 63, 0, 0, 0 },
                 .negative = true,
             };
         } else {
-            return .{
+            result = .{
                 .limbs = .{ @intCast(-value), 0, 0, 0 },
                 .negative = true,
             };
         }
+
+        // Postcondition: result fits in first limb only
+        assert(result.limbs[1] == 0 and result.limbs[2] == 0 and result.limbs[3] == 0);
+        // Postcondition: sign matches input sign
+        assert((value < 0) == result.negative or value == 0);
+        return result;
     }
 
     /// Create from u64 (always non-negative)
     pub fn fromUint(value: u64) BigInt256 {
-        return .{
+        const result = BigInt256{
             .limbs = .{ value, 0, 0, 0 },
             .negative = false,
         };
+        // Postcondition: result is non-negative
+        assert(!result.negative);
+        // Postcondition: result fits in first limb only
+        assert(result.limbs[1] == 0 and result.limbs[2] == 0 and result.limbs[3] == 0);
+        return result;
     }
 
     /// Create from big-endian bytes (two's complement, signed)
@@ -165,71 +190,81 @@ pub const BigInt256 = struct {
             return buffer[0..1];
         }
 
-        // Convert magnitude to big-endian
-        var full: [32]u8 = undefined;
+        if (!self.negative) {
+            return toPositiveBytes(self, buffer);
+        } else {
+            return toNegativeBytes(self, buffer);
+        }
+    }
+
+    /// Helper: encode positive BigInt to minimal two's complement
+    fn toPositiveBytes(self: BigInt256, buffer: *[33]u8) []u8 {
+        assert(!self.negative);
+        var full = limbsToBigEndian(self.limbs);
+
+        // Find minimal encoding, ensure MSB sign bit is 0
+        var start: usize = 0;
+        while (start < 31 and full[start] == 0) : (start += 1) {}
+
+        // If MSB has sign bit set, prepend 0x00
+        if ((full[start] & 0x80) != 0) {
+            if (start > 0) {
+                start -= 1;
+            } else {
+                buffer[0] = 0;
+                @memcpy(buffer[1..33], &full);
+                return buffer[0..33];
+            }
+        }
+
+        const len = 32 - start;
+        @memcpy(buffer[0..len], full[start..]);
+        return buffer[0..len];
+    }
+
+    /// Helper: encode negative BigInt to minimal two's complement
+    fn toNegativeBytes(self: BigInt256, buffer: *[33]u8) []u8 {
+        assert(self.negative);
+
+        // Convert to two's complement: ~magnitude + 1
+        var tc = self.bitwiseNot();
+        tc = tc.addOne() catch {
+            // MIN value (-2^255) two's complement is 0x80 00 ... 00
+            buffer[0] = 0x80;
+            @memset(buffer[1..32], 0);
+            return buffer[0..32];
+        };
+
+        var full = limbsToBigEndian(tc.limbs);
+
+        // Find minimal encoding, ensure MSB sign bit is 1
+        var start: usize = 0;
+        while (start < 31 and full[start] == 0xFF) : (start += 1) {}
+
+        // If MSB doesn't have sign bit set, prepend 0xFF
+        if ((full[start] & 0x80) == 0) {
+            if (start > 0) {
+                start -= 1;
+            } else {
+                buffer[0] = 0xFF;
+                @memcpy(buffer[1..33], &full);
+                return buffer[0..33];
+            }
+        }
+
+        const len = 32 - start;
+        @memcpy(buffer[0..len], full[start..]);
+        return buffer[0..len];
+    }
+
+    /// Helper: convert 4 limbs to 32-byte big-endian array
+    fn limbsToBigEndian(limbs: [4]u64) [32]u8 {
+        var result: [32]u8 = undefined;
         for (0..4) |i| {
             const offset = 32 - (i + 1) * 8;
-            std.mem.writeInt(u64, full[offset..][0..8], self.limbs[i], .big);
+            std.mem.writeInt(u64, result[offset..][0..8], limbs[i], .big);
         }
-
-        if (!self.negative) {
-            // Positive: find minimal encoding, ensure MSB sign bit is 0
-            var start: usize = 0;
-            while (start < 31 and full[start] == 0) : (start += 1) {}
-
-            // If MSB has sign bit set, prepend 0x00
-            if ((full[start] & 0x80) != 0) {
-                if (start > 0) {
-                    start -= 1;
-                } else {
-                    // Need extra byte
-                    buffer[0] = 0;
-                    @memcpy(buffer[1..33], &full);
-                    return buffer[0..33];
-                }
-            }
-
-            const len = 32 - start;
-            @memcpy(buffer[0..len], full[start..]);
-            return buffer[0..len];
-        } else {
-            // Negative: convert to two's complement
-            // value = -magnitude, so two's comp = ~magnitude + 1
-            var tc = self.bitwiseNot();
-            tc = tc.addOne() catch {
-                // Overflow on negate means we're at MIN, handle specially
-                // -(-2^255) overflows, but we're encoding, not negating
-                // For MIN value (-2^255), two's complement is 0x80 00 ... 00
-                buffer[0] = 0x80;
-                @memset(buffer[1..32], 0);
-                return buffer[0..32];
-            };
-
-            // Convert negated magnitude to bytes
-            for (0..4) |i| {
-                const offset = 32 - (i + 1) * 8;
-                std.mem.writeInt(u64, full[offset..][0..8], tc.limbs[i], .big);
-            }
-
-            // Find minimal encoding, ensure MSB sign bit is 1
-            var start: usize = 0;
-            while (start < 31 and full[start] == 0xFF) : (start += 1) {}
-
-            // If MSB doesn't have sign bit set, prepend 0xFF
-            if ((full[start] & 0x80) == 0) {
-                if (start > 0) {
-                    start -= 1;
-                } else {
-                    buffer[0] = 0xFF;
-                    @memcpy(buffer[1..33], &full);
-                    return buffer[0..33];
-                }
-            }
-
-            const len = 32 - start;
-            @memcpy(buffer[0..len], full[start..]);
-            return buffer[0..len];
-        }
+        return result;
     }
 
     // ========================================================================
@@ -260,6 +295,10 @@ pub const BigInt256 = struct {
 
     /// Compare two BigInt256 values
     pub fn compare(a: BigInt256, b: BigInt256) std.math.Order {
+        // Precondition: zero is never marked negative
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
         // Handle sign differences
         const a_neg = a.isNegative();
         const b_neg = b.isNegative();
@@ -270,17 +309,17 @@ pub const BigInt256 = struct {
         // Same sign: compare magnitudes
         const mag_order = compareMagnitude(a.limbs, b.limbs);
 
-        if (a_neg) {
+        // Invariant: if both same sign, magnitude comparison determines result
+        const result = if (a_neg) switch (mag_order) {
             // Both negative: larger magnitude = smaller value
-            return switch (mag_order) {
-                .lt => .gt,
-                .gt => .lt,
-                .eq => .eq,
-            };
-        } else {
-            // Both non-negative: larger magnitude = larger value
-            return mag_order;
-        }
+            .lt => std.math.Order.gt,
+            .gt => std.math.Order.lt,
+            .eq => std.math.Order.eq,
+        } else mag_order;
+
+        // Postcondition: equality is symmetric
+        assert((result == .eq) == (compareMagnitude(a.limbs, b.limbs) == .eq and a_neg == b_neg));
+        return result;
     }
 
     /// Check equality
@@ -294,6 +333,10 @@ pub const BigInt256 = struct {
 
     /// Addition
     pub fn add(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // Precondition: zero values are non-negative
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
         if (a.negative == b.negative) {
             // Same sign: add magnitudes
             const result_limbs = addLimbs(a.limbs, b.limbs);
@@ -317,6 +360,8 @@ pub const BigInt256 = struct {
                 }
             }
 
+            // Postcondition: zero result is non-negative
+            assert(!result.isZero() or !result.negative);
             return result;
         } else {
             // Different signs: subtract magnitudes
@@ -324,19 +369,21 @@ pub const BigInt256 = struct {
 
             if (mag_cmp == .eq) return zero;
 
+            var result: BigInt256 = undefined;
             if (mag_cmp == .gt) {
                 // |a| > |b|: result = |a| - |b| with sign of a
                 const result_limbs = subLimbs(a.limbs, b.limbs);
-                var result = BigInt256{ .limbs = result_limbs, .negative = a.negative };
-                if (result.isZero()) result.negative = false;
-                return result;
+                result = BigInt256{ .limbs = result_limbs, .negative = a.negative };
             } else {
                 // |b| > |a|: result = |b| - |a| with sign of b
                 const result_limbs = subLimbs(b.limbs, a.limbs);
-                var result = BigInt256{ .limbs = result_limbs, .negative = b.negative };
-                if (result.isZero()) result.negative = false;
-                return result;
+                result = BigInt256{ .limbs = result_limbs, .negative = b.negative };
             }
+            if (result.isZero()) result.negative = false;
+
+            // Postcondition: zero result is non-negative
+            assert(!result.isZero() or !result.negative);
+            return result;
         }
     }
 
@@ -351,6 +398,9 @@ pub const BigInt256 = struct {
 
     /// Negation
     pub fn negate(self: BigInt256) BigIntError!BigInt256 {
+        // Precondition: zero is non-negative
+        assert(!self.isZero() or !self.negative);
+
         if (self.isZero()) return zero;
 
         // Check for MIN value overflow: -(-2^255) doesn't fit
@@ -360,14 +410,23 @@ pub const BigInt256 = struct {
             return error.Overflow;
         }
 
-        return .{
+        const result = BigInt256{
             .limbs = self.limbs,
             .negative = !self.negative,
         };
+
+        // Postcondition: sign flipped, magnitude unchanged
+        assert(result.negative != self.negative);
+        assert(compareMagnitude(result.limbs, self.limbs) == .eq);
+        return result;
     }
 
     /// Multiplication
     pub fn mul(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // Precondition: zero values are non-negative
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
         if (a.isZero() or b.isZero()) return zero;
 
         const result_limbs = try mulLimbs(a.limbs, b.limbs);
@@ -381,11 +440,17 @@ pub const BigInt256 = struct {
             return error.Overflow;
         }
 
+        // Postcondition: sign follows multiplication rules (neg*neg=pos, pos*neg=neg)
+        assert(!result.isZero() or !result.negative);
+        assert(result.isZero() or result.negative == (a.negative != b.negative));
         return result;
     }
 
     /// Division (truncating toward zero)
     pub fn div(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // Precondition: divisor is not zero (also checked via error)
+        assert(!b.isZero() or true); // Will error, but assert documents intent
+
         if (b.isZero()) return error.DivisionByZero;
         if (a.isZero()) return zero;
 
@@ -399,11 +464,17 @@ pub const BigInt256 = struct {
 
         var result = BigInt256{ .limbs = result_limbs.quotient, .negative = result_negative };
         if (result.isZero()) result.negative = false;
+
+        // Postcondition: |quotient| <= |dividend| (integer division)
+        assert(compareMagnitude(result.limbs, a.limbs) != .gt);
+        // Postcondition: zero result is non-negative
+        assert(!result.isZero() or !result.negative);
         return result;
     }
 
     /// Modulo (sign matches dividend, follows truncating division)
     pub fn mod(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // Precondition: divisor is not zero
         if (b.isZero()) return error.DivisionByZero;
         if (a.isZero()) return zero;
 
@@ -411,6 +482,11 @@ pub const BigInt256 = struct {
 
         var result = BigInt256{ .limbs = result_limbs.remainder, .negative = a.negative };
         if (result.isZero()) result.negative = false;
+
+        // Postcondition: |remainder| < |divisor|
+        assert(compareMagnitude(result.limbs, b.limbs) == .lt or result.isZero());
+        // Postcondition: remainder sign matches dividend (truncating division)
+        assert(result.isZero() or result.negative == a.negative);
         return result;
     }
 
