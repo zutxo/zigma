@@ -763,11 +763,25 @@ pub const Evaluator = struct {
         // INVARIANT: Option type is well-formed
         assert(opt_val.option.inner_type != 0); // Has valid inner type
 
-        if (opt_val.option.value_idx) |_| {
-            // Some(x) - need to get the inner value
-            // For now we don't have proper Option value storage
-            // This would require storing values in a separate array
-            return error.UnsupportedExpression;
+        if (opt_val.option.value_idx) |idx| {
+            if (idx == 0) {
+                // Simple value stored inline - extract based on inner_type
+                const inner_type = opt_val.option.inner_type;
+                const simple_val = opt_val.option.simple_value;
+
+                const result: Value = switch (inner_type) {
+                    TypePool.BOOLEAN => .{ .boolean = simple_val != 0 },
+                    TypePool.BYTE => .{ .byte = @intCast(simple_val) },
+                    TypePool.SHORT => .{ .short = @intCast(simple_val) },
+                    TypePool.INT => .{ .int = @intCast(simple_val) },
+                    TypePool.LONG => .{ .long = simple_val },
+                    else => return error.UnsupportedExpression,
+                };
+                try self.pushValue(result);
+            } else {
+                // Complex value in external storage - not yet implemented
+                return error.UnsupportedExpression;
+            }
         } else {
             // None - error per ErgoTree semantics
             return error.OptionNone;
@@ -2582,7 +2596,7 @@ test "evaluator: option_is_defined on None" {
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
     // None value
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
@@ -2601,8 +2615,8 @@ test "evaluator: option_is_defined on Some" {
     tree.nodes[0] = .{ .tag = .option_is_defined };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    // Some value (value_idx is non-null)
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 1 } };
+    // Some value (value_idx=0 means inline, simple_value=99)
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0, .simple_value = 99 } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
@@ -2621,7 +2635,7 @@ test "evaluator: option_get on None errors" {
     tree.nodes[0] = .{ .tag = .option_get };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
@@ -2631,6 +2645,26 @@ test "evaluator: option_get on None errors" {
     try std.testing.expectError(error.OptionNone, eval.evaluate());
 }
 
+test "evaluator: option_get on Some extracts value" {
+    // OptionGet(Some(99)) should return 99
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_get };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    // Some(99) with inline value
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0, .simple_value = 99 } };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .int);
+    try std.testing.expectEqual(@as(i32, 99), result.int);
+}
+
 test "evaluator: option_get_or_else on None uses default" {
     // OptionGetOrElse(None, 42) should return 42
     var tree = ExprTree.init();
@@ -2638,7 +2672,7 @@ test "evaluator: option_get_or_else on None uses default" {
     tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // None
     tree.nodes[2] = .{ .tag = .constant, .data = 1 }; // Default: 42
     tree.node_count = 3;
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
     tree.values[1] = .{ .int = 42 };
     tree.value_count = 2;
 

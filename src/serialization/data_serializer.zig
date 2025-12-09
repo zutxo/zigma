@@ -128,8 +128,12 @@ pub const Value = union(enum) {
     /// Reference to option value
     pub const OptionRef = struct {
         inner_type: TypeIndex,
-        /// null if None, otherwise index into values
+        /// null if None, value_idx=0 for simple types (stored in simple_value),
+        /// or index into external values array for complex types
         value_idx: ?u16,
+        /// For simple types (byte, short, int, long, boolean): stores value directly
+        /// Interpret based on inner_type
+        simple_value: i64,
     };
 
     /// Reference to tuple
@@ -438,13 +442,32 @@ fn deserializeOption(
     const flag = reader.readByte() catch |e| return mapVlqError(e);
 
     if (flag == 0) {
-        return .{ .option = .{ .inner_type = inner_idx, .value_idx = null } };
+        return .{ .option = .{ .inner_type = inner_idx, .value_idx = null, .simple_value = 0 } };
     }
 
-    // Would need to deserialize inner value and store index
-    // Skip the inner value for now
-    _ = deserialize(inner_idx, pool, reader, arena) catch {};
-    return error.NotSupported;
+    // Deserialize inner value
+    const inner_value = try deserialize(inner_idx, pool, reader, arena);
+
+    // For simple types, store value inline
+    const simple_val: i64 = switch (inner_value) {
+        .boolean => |b| if (b) 1 else 0,
+        .byte => |b| @as(i64, b),
+        .short => |s| @as(i64, s),
+        .int => |i| @as(i64, i),
+        .long => |l| l,
+        else => {
+            // Complex types not yet supported
+            return error.NotSupported;
+        },
+    };
+
+    return .{
+        .option = .{
+            .inner_type = inner_idx,
+            .value_idx = 0, // 0 indicates simple value stored inline
+            .simple_value = simple_val,
+        },
+    };
 }
 
 fn deserializeTuple2(
