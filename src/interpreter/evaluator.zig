@@ -18,6 +18,7 @@ const memory = @import("memory.zig");
 const expr = @import("../serialization/expr_serializer.zig");
 const data = @import("../serialization/data_serializer.zig");
 const types = @import("../core/types.zig");
+const hash = @import("../crypto/hash.zig");
 
 const Context = context.Context;
 const ExprTree = expr.ExprTree;
@@ -26,6 +27,7 @@ const ExprTag = expr.ExprTag;
 const BinOpKind = expr.BinOpKind;
 const Value = data.Value;
 const TypePool = types.TypePool;
+const BumpAllocator = memory.BumpAllocator;
 
 // ============================================================================
 // Configuration
@@ -39,6 +41,9 @@ const max_value_stack: usize = 256;
 
 /// Default cost limit per evaluation
 const default_cost_limit: u64 = 1_000_000;
+
+/// Arena size for temporary allocations (hash results, etc.)
+const eval_arena_size: usize = 4096;
 
 // Compile-time sanity checks
 comptime {
@@ -74,6 +79,8 @@ pub const EvalError = error{
     UnsupportedExpression,
     /// Invalid binary operation
     InvalidBinOp,
+    /// Out of memory in evaluation arena
+    OutOfMemory,
 };
 
 // ============================================================================
@@ -109,6 +116,9 @@ const FixedCost = struct {
     pub const self_box: u32 = 10;
     pub const inputs: u32 = 10;
     pub const outputs: u32 = 10;
+    pub const blake2b256_base: u32 = 59; // Base cost for CalcBlake2b256
+    pub const sha256_base: u32 = 64; // Base cost for CalcSha256
+    pub const hash_per_byte: u32 = 1; // Per-byte cost for hashing
 };
 
 // ============================================================================
@@ -135,6 +145,9 @@ pub const Evaluator = struct {
     cost_used: u64 = 0,
     cost_limit: u64 = default_cost_limit,
 
+    /// Arena for temporary allocations (hash results, etc.)
+    arena: BumpAllocator(eval_arena_size) = BumpAllocator(eval_arena_size).init(),
+
     pub fn init(tree: *const ExprTree, ctx: *const Context) Evaluator {
         return .{
             .tree = tree,
@@ -157,6 +170,7 @@ pub const Evaluator = struct {
         self.work_sp = 0;
         self.value_sp = 0;
         self.cost_used = 0;
+        self.arena.reset();
 
         // Push root node for evaluation (index 0)
         try self.pushWork(.{ .node_idx = 0, .phase = .evaluate });
@@ -250,6 +264,13 @@ pub const Evaluator = struct {
                 return error.UnsupportedExpression; // TODO: implement collections
             },
 
+            .calc_blake2b256, .calc_sha256 => {
+                // Unary hash operations: push compute phase, then push operand
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Operand is at node_idx+1 (pre-order layout)
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -280,10 +301,56 @@ pub const Evaluator = struct {
                 }
             },
 
+            .calc_blake2b256 => {
+                try self.computeHash(.blake2b256);
+            },
+
+            .calc_sha256 => {
+                try self.computeHash(.sha256);
+            },
+
             else => {
                 // Other node types don't need compute phase
             },
         }
+    }
+
+    /// Hash algorithm type
+    const HashAlgorithm = enum { blake2b256, sha256 };
+
+    /// Compute hash operation
+    fn computeHash(self: *Evaluator, algo: HashAlgorithm) EvalError!void {
+        // PRECONDITION: Input value is on the stack
+        assert(self.value_sp > 0);
+
+        // Pop the input (should be Coll[Byte])
+        const input = try self.popValue();
+        if (input != .coll_byte) return error.TypeMismatch;
+
+        const input_data = input.coll_byte;
+
+        // Add cost: base + per-byte
+        const base_cost: u32 = switch (algo) {
+            .blake2b256 => FixedCost.blake2b256_base,
+            .sha256 => FixedCost.sha256_base,
+        };
+        try self.addCost(base_cost + @as(u32, @truncate(input_data.len)) * FixedCost.hash_per_byte);
+
+        // Compute hash
+        const hash_result: [32]u8 = switch (algo) {
+            .blake2b256 => hash.blake2b256(input_data),
+            .sha256 => hash.sha256(input_data),
+        };
+
+        // Allocate space in arena for the result
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &hash_result);
+
+        // POSTCONDITION: Result is exactly 32 bytes
+        assert(result_slice.len == 32);
+
+        // Push result as Coll[Byte]
+        try self.pushValue(.{ .coll_byte = result_slice });
     }
 
     /// Compute binary operation
@@ -736,4 +803,94 @@ test "evaluator: logical and" {
 
     try std.testing.expect(result == .boolean);
     try std.testing.expect(result.boolean == false);
+}
+
+test "evaluator: calc_blake2b256" {
+    // Build: CalcBlake2b256(Coll[Byte]("abc"))
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .coll_byte = "abc" };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+
+    // Verify against known Blake2b-256("abc") hash
+    const expected = [_]u8{
+        0xbd, 0xdd, 0x81, 0x3c, 0x63, 0x42, 0x39, 0x72,
+        0x31, 0x71, 0xef, 0x3f, 0xee, 0x98, 0x57, 0x9b,
+        0x94, 0x96, 0x4e, 0x3b, 0xb1, 0xcb, 0x3e, 0x42,
+        0x72, 0x62, 0xc8, 0xc0, 0x68, 0xd5, 0x23, 0x19,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, result.coll_byte);
+}
+
+test "evaluator: calc_sha256" {
+    // Build: CalcSha256(Coll[Byte]("abc"))
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .calc_sha256 };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .coll_byte = "abc" };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+
+    // Verify against known SHA-256("abc") hash (NIST test vector)
+    const expected = [_]u8{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, result.coll_byte);
+}
+
+test "evaluator: calc_blake2b256 empty input" {
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .coll_byte = "" };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+}
+
+test "evaluator: hash type mismatch" {
+    // Try to hash a non-byte-collection (should fail)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .int = 42 }; // Not a Coll[Byte]
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectError(error.TypeMismatch, eval.evaluate());
 }

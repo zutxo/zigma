@@ -17,6 +17,7 @@ pub const logical = @import("ops/logical.zig");
 pub const box = @import("ops/box.zig");
 pub const context_ops = @import("ops/context_ops.zig");
 pub const collection = @import("ops/collection.zig");
+pub const crypto = @import("ops/crypto.zig");
 
 // Re-export common error types
 pub const ArithmeticError = arithmetic.ArithmeticError;
@@ -34,6 +35,7 @@ comptime {
     _ = box;
     _ = context_ops;
     _ = collection;
+    _ = crypto;
 }
 
 test "ops: module imports work" {
@@ -41,4 +43,6 @@ test "ops: module imports work" {
     _ = try arithmetic.add(i32, 1, 2);
     _ = comparison.lt(i32, 1, 2);
     _ = logical.logicalAnd(true, true);
+    _ = crypto.calcBlake2b256("test");
+    _ = crypto.calcSha256("test");
 }

@@ -61,6 +61,10 @@ pub const ExprTag = enum(u8) {
     self_box,
     /// If-then-else
     if_then_else,
+    /// CalcBlake2b256 hash (opcode 0xCB)
+    calc_blake2b256,
+    /// CalcSha256 hash (opcode 0xCC)
+    calc_sha256,
     /// Unsupported opcode
     unsupported,
 };
@@ -301,6 +305,9 @@ fn deserializeWithDepth(
             opcodes.OR => try deserializeBinOp(tree, reader, arena, .or_op, depth),
             // If-then-else
             opcodes.If => try deserializeIf(tree, reader, arena, depth),
+            // Crypto hash operations (unary: input -> Coll[Byte])
+            opcodes.CalcBlake2b256 => try deserializeUnaryOp(tree, reader, arena, .calc_blake2b256, depth),
+            opcodes.CalcSha256 => try deserializeUnaryOp(tree, reader, arena, .calc_sha256, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -409,6 +416,26 @@ fn deserializeIf(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 
     // Parse else branch
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeUnaryOp(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITION: tag is a valid unary operation
+    assert(tag == .calc_blake2b256 or tag == .calc_sha256);
+
+    // Add the unary op node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .result_type = TypePool.COLL_BYTE, // Hash ops return Coll[Byte]
+    });
+
+    // Parse the single operand
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
