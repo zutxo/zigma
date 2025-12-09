@@ -81,6 +81,12 @@ pub const ExprTag = enum(u8) {
     option_is_defined,
     /// Get value from Option or default (opcode 0xBC)
     option_get_or_else,
+    /// Convert Long to Coll[Byte] (opcode 0x78)
+    long_to_byte_array,
+    /// Convert Coll[Byte] to BigInt (opcode 0x79)
+    byte_array_to_bigint,
+    /// Convert Coll[Byte] to Long (opcode 0x7A)
+    byte_array_to_long,
     /// Unsupported opcode
     unsupported,
 };
@@ -357,6 +363,10 @@ fn deserializeWithDepth(
             opcodes.OptionGet => try deserializeUnaryOp(tree, reader, arena, .option_get, depth),
             opcodes.OptionIsDefined => try deserializeUnaryOp(tree, reader, arena, .option_is_defined, depth),
             opcodes.OptionGetOrElse => try deserializeOptionGetOrElse(tree, reader, arena, depth),
+            // Type conversion operations
+            opcodes.LongToByteArray => try deserializeUnaryOp(tree, reader, arena, .long_to_byte_array, depth),
+            opcodes.ByteArrayToBigInt => try deserializeUnaryOp(tree, reader, arena, .byte_array_to_bigint, depth),
+            opcodes.ByteArrayToLong => try deserializeUnaryOp(tree, reader, arena, .byte_array_to_long, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -477,13 +487,17 @@ fn deserializeUnaryOp(
 ) DeserializeError!void {
     // PRECONDITION: tag is a valid unary operation
     assert(tag == .calc_blake2b256 or tag == .calc_sha256 or
-        tag == .option_get or tag == .option_is_defined);
+        tag == .option_get or tag == .option_is_defined or
+        tag == .long_to_byte_array or tag == .byte_array_to_bigint or
+        tag == .byte_array_to_long);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {
-        .calc_blake2b256, .calc_sha256 => TypePool.COLL_BYTE,
+        .calc_blake2b256, .calc_sha256, .long_to_byte_array => TypePool.COLL_BYTE,
         .option_is_defined => TypePool.BOOLEAN,
         .option_get => TypePool.ANY, // Will be inner type of option at runtime
+        .byte_array_to_long => TypePool.LONG,
+        .byte_array_to_bigint => TypePool.BIG_INT,
         else => TypePool.ANY,
     };
 
