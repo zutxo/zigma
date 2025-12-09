@@ -103,6 +103,10 @@ pub const ExprTag = enum(u8) {
     pair_construct,
     /// Triple constructor (opcode 0xDE) - 3 elements → Triple
     triple_construct,
+    /// Upcast to larger type (opcode 0xE4) - e.g., Int → Long
+    upcast,
+    /// Downcast to smaller type (opcode 0xE5) - e.g., Long → Int, may overflow
+    downcast,
     /// Unsupported opcode
     unsupported,
 };
@@ -399,6 +403,9 @@ fn deserializeWithDepth(
             opcodes.Tuple => try deserializeTuple(tree, reader, arena, depth),
             opcodes.PairConstructor => try deserializePairConstructor(tree, reader, arena, depth),
             opcodes.TripleConstructor => try deserializeTripleConstructor(tree, reader, arena, depth),
+            // Type conversion operations
+            opcodes.Upcast => try deserializeUpcast(tree, reader, arena, depth),
+            opcodes.Downcast => try deserializeDowncast(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -792,6 +799,66 @@ fn deserializeTripleConstructor(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 
     // Parse third element
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeUpcast(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Upcast format: target type + input expression
+    // Reads target type code, then the expression to upcast
+
+    const target_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            else => error.InvalidData,
+        };
+    };
+
+    // Store target type in data field (u16 index)
+    _ = try tree.addNode(.{
+        .tag = .upcast,
+        .data = target_type,
+        .result_type = target_type,
+    });
+
+    // Parse the input expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeDowncast(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Downcast format: target type + input expression
+    // Reads target type code, then the expression to downcast
+
+    const target_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            else => error.InvalidData,
+        };
+    };
+
+    // Store target type in data field (u16 index)
+    _ = try tree.addNode(.{
+        .tag = .downcast,
+        .data = target_type,
+        .result_type = target_type,
+    });
+
+    // Parse the input expression
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 

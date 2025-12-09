@@ -141,6 +141,9 @@ const FixedCost = struct {
     // Tuple operation costs (from opcodes.zig)
     pub const select_field: u32 = 10;
     pub const tuple_construct: u32 = 10;
+    // Type cast costs
+    pub const upcast: u32 = 10;
+    pub const downcast: u32 = 10;
 };
 
 // ============================================================================
@@ -455,6 +458,12 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = first_idx, .phase = .evaluate });
             },
 
+            .upcast, .downcast => {
+                // Unary: numeric value → target type
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -561,6 +570,14 @@ pub const Evaluator = struct {
 
             .tuple_construct, .pair_construct, .triple_construct => {
                 try self.computeTupleConstruct(node.data);
+            },
+
+            .upcast => {
+                try self.computeUpcast(node.data);
+            },
+
+            .downcast => {
+                try self.computeDowncast(node.data);
             },
 
             else => {
@@ -896,6 +913,162 @@ pub const Evaluator = struct {
         assert(self.value_sp > 0);
     }
 
+    /// Compute Upcast - convert to larger numeric type
+    fn computeUpcast(self: *Evaluator, target_type: u16) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.upcast);
+
+        const input = try self.popValue();
+
+        // Upcast conversions: Byte → Short → Int → Long → BigInt
+        const result: Value = switch (target_type) {
+            // Target is Short
+            TypePool.SHORT => switch (input) {
+                .byte => |v| .{ .short = @as(i16, v) },
+                else => return error.TypeMismatch,
+            },
+            // Target is Int
+            TypePool.INT => switch (input) {
+                .byte => |v| .{ .int = @as(i32, v) },
+                .short => |v| .{ .int = @as(i32, v) },
+                else => return error.TypeMismatch,
+            },
+            // Target is Long
+            TypePool.LONG => switch (input) {
+                .byte => |v| .{ .long = @as(i64, v) },
+                .short => |v| .{ .long = @as(i64, v) },
+                .int => |v| .{ .long = @as(i64, v) },
+                else => return error.TypeMismatch,
+            },
+            // Target is BigInt
+            TypePool.BIG_INT => blk: {
+                // Convert numeric to BigInt (big-endian two's complement)
+                var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 0 };
+                switch (input) {
+                    .byte => |v| {
+                        const u: u8 = @bitCast(v);
+                        bigint.bytes[0] = u;
+                        bigint.len = 1;
+                    },
+                    .short => |v| {
+                        const u: u16 = @bitCast(v);
+                        bigint.bytes[0] = @truncate(u >> 8);
+                        bigint.bytes[1] = @truncate(u);
+                        bigint.len = 2;
+                    },
+                    .int => |v| {
+                        const u: u32 = @bitCast(v);
+                        bigint.bytes[0] = @truncate(u >> 24);
+                        bigint.bytes[1] = @truncate(u >> 16);
+                        bigint.bytes[2] = @truncate(u >> 8);
+                        bigint.bytes[3] = @truncate(u);
+                        bigint.len = 4;
+                    },
+                    .long => |v| {
+                        const u: u64 = @bitCast(v);
+                        bigint.bytes[0] = @truncate(u >> 56);
+                        bigint.bytes[1] = @truncate(u >> 48);
+                        bigint.bytes[2] = @truncate(u >> 40);
+                        bigint.bytes[3] = @truncate(u >> 32);
+                        bigint.bytes[4] = @truncate(u >> 24);
+                        bigint.bytes[5] = @truncate(u >> 16);
+                        bigint.bytes[6] = @truncate(u >> 8);
+                        bigint.bytes[7] = @truncate(u);
+                        bigint.len = 8;
+                    },
+                    else => return error.TypeMismatch,
+                }
+                break :blk .{ .big_int = bigint };
+            },
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(result);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute Downcast - convert to smaller numeric type (may overflow)
+    fn computeDowncast(self: *Evaluator, target_type: u16) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.downcast);
+
+        const input = try self.popValue();
+
+        // Downcast conversions: BigInt → Long → Int → Short → Byte
+        // May overflow - returns error.ArithmeticOverflow
+        const result: Value = switch (target_type) {
+            // Target is Byte
+            TypePool.BYTE => switch (input) {
+                .short => |v| blk: {
+                    if (v < -128 or v > 127) return error.ArithmeticOverflow;
+                    break :blk .{ .byte = @truncate(v) };
+                },
+                .int => |v| blk: {
+                    if (v < -128 or v > 127) return error.ArithmeticOverflow;
+                    break :blk .{ .byte = @truncate(v) };
+                },
+                .long => |v| blk: {
+                    if (v < -128 or v > 127) return error.ArithmeticOverflow;
+                    break :blk .{ .byte = @truncate(v) };
+                },
+                else => return error.TypeMismatch,
+            },
+            // Target is Short
+            TypePool.SHORT => switch (input) {
+                .int => |v| blk: {
+                    if (v < -32768 or v > 32767) return error.ArithmeticOverflow;
+                    break :blk .{ .short = @truncate(v) };
+                },
+                .long => |v| blk: {
+                    if (v < -32768 or v > 32767) return error.ArithmeticOverflow;
+                    break :blk .{ .short = @truncate(v) };
+                },
+                else => return error.TypeMismatch,
+            },
+            // Target is Int
+            TypePool.INT => switch (input) {
+                .long => |v| blk: {
+                    if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return error.ArithmeticOverflow;
+                    break :blk .{ .int = @truncate(v) };
+                },
+                else => return error.TypeMismatch,
+            },
+            // Target is Long
+            TypePool.LONG => switch (input) {
+                .big_int => |v| blk: {
+                    // Check if BigInt fits in i64
+                    if (v.len > 8) return error.ArithmeticOverflow;
+                    // Convert big-endian bytes to i64
+                    var u: u64 = 0;
+                    for (v.bytes[0..v.len]) |b| {
+                        u = (u << 8) | b;
+                    }
+                    // Sign extend if negative
+                    if (v.isNegative()) {
+                        // Extend sign bits
+                        const shift: u6 = @intCast(64 - (v.len * 8));
+                        const signed: i64 = @bitCast(u << shift);
+                        break :blk .{ .long = signed >> shift };
+                    }
+                    break :blk .{ .long = @bitCast(u) };
+                },
+                else => return error.TypeMismatch,
+            },
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(result);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
     /// Compute binary operation
     fn computeBinOp(self: *Evaluator, kind: BinOpKind) EvalError!void {
         try self.addCost(FixedCost.comparison);
@@ -1017,7 +1190,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .group_generator => {},
 
             // One child
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field => {
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast => {
                 next = self.findSubtreeEnd(next);
             },
 
