@@ -75,6 +75,12 @@ pub const ExprTag = enum(u8) {
     func_value,
     /// Function application (opcode 0xF5)
     apply,
+    /// Get value from Option (opcode 0xBA) - errors if None
+    option_get,
+    /// Check if Option is defined (opcode 0xBB) - returns boolean
+    option_is_defined,
+    /// Get value from Option or default (opcode 0xBC)
+    option_get_or_else,
     /// Unsupported opcode
     unsupported,
 };
@@ -347,6 +353,10 @@ fn deserializeWithDepth(
             opcodes.BlockValue => try deserializeBlockValue(tree, reader, arena, depth),
             // Function application
             opcodes.Apply => try deserializeApply(tree, reader, arena, depth),
+            // Option operations
+            opcodes.OptionGet => try deserializeUnaryOp(tree, reader, arena, .option_get, depth),
+            opcodes.OptionIsDefined => try deserializeUnaryOp(tree, reader, arena, .option_is_defined, depth),
+            opcodes.OptionGetOrElse => try deserializeOptionGetOrElse(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -466,12 +476,21 @@ fn deserializeUnaryOp(
     depth: u8,
 ) DeserializeError!void {
     // PRECONDITION: tag is a valid unary operation
-    assert(tag == .calc_blake2b256 or tag == .calc_sha256);
+    assert(tag == .calc_blake2b256 or tag == .calc_sha256 or
+        tag == .option_get or tag == .option_is_defined);
+
+    // Determine result type based on operation
+    const result_type: TypeIndex = switch (tag) {
+        .calc_blake2b256, .calc_sha256 => TypePool.COLL_BYTE,
+        .option_is_defined => TypePool.BOOLEAN,
+        .option_get => TypePool.ANY, // Will be inner type of option at runtime
+        else => TypePool.ANY,
+    };
 
     // Add the unary op node first (pre-order)
     _ = try tree.addNode(.{
         .tag = tag,
-        .result_type = TypePool.COLL_BYTE, // Hash ops return Coll[Byte]
+        .result_type = result_type,
     });
 
     // Parse the single operand
@@ -582,6 +601,28 @@ fn deserializeApply(
     while (i < arg_count) : (i += 1) {
         try deserializeWithDepth(tree, reader, arena, depth + 1);
     }
+}
+
+fn deserializeOptionGetOrElse(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // OptionGetOrElse format: option expression + default expression
+    // Returns the value if Some, or the default if None
+
+    // Add the option_get_or_else node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = .option_get_or_else,
+        .result_type = TypePool.ANY, // Will be type of default/inner at runtime
+    });
+
+    // Parse the option expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse the default expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
 fn mapVlqError(err: vlq.DecodeError) DeserializeError {

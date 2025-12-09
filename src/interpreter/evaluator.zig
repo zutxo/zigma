@@ -86,6 +86,8 @@ pub const EvalError = error{
     OutOfMemory,
     /// Undefined variable reference
     UndefinedVariable,
+    /// Tried to get value from None
+    OptionNone,
 };
 
 // ============================================================================
@@ -336,6 +338,19 @@ pub const Evaluator = struct {
                 return error.UnsupportedExpression;
             },
 
+            .option_get, .option_is_defined => {
+                // Unary option operations: push compute phase, then push operand
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .option_get_or_else => {
+                // Binary: option + default, but we evaluate lazily
+                // First evaluate the option, then in compute phase decide what to do
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -388,6 +403,30 @@ pub const Evaluator = struct {
                 // val_def doesn't produce a value on the stack (Unit semantics)
             },
 
+            .option_get => {
+                try self.computeOptionGet();
+            },
+
+            .option_is_defined => {
+                try self.computeOptionIsDefined();
+            },
+
+            .option_get_or_else => {
+                // Option value is on stack, decide whether to use it or evaluate default
+                const opt_val = try self.popValue();
+                if (opt_val != .option) return error.TypeMismatch;
+
+                if (opt_val.option.value_idx) |_| {
+                    // Some(x) - need to get the inner value
+                    // For now we don't have proper Option value storage, error out
+                    return error.UnsupportedExpression;
+                } else {
+                    // None - evaluate the default expression
+                    const default_idx = self.findSubtreeEnd(node_idx + 1);
+                    try self.pushWork(.{ .node_idx = default_idx, .phase = .evaluate });
+                }
+            },
+
             else => {
                 // Other node types don't need compute phase
             },
@@ -430,6 +469,35 @@ pub const Evaluator = struct {
 
         // Push result as Coll[Byte]
         try self.pushValue(.{ .coll_byte = result_slice });
+    }
+
+    /// Compute OptionGet - extract value from Some, error on None
+    fn computeOptionGet(self: *Evaluator) EvalError!void {
+        try self.addCost(15); // OptionGet cost from opcodes
+
+        const opt_val = try self.popValue();
+        if (opt_val != .option) return error.TypeMismatch;
+
+        if (opt_val.option.value_idx) |_| {
+            // Some(x) - need to get the inner value
+            // For now we don't have proper Option value storage
+            // This would require storing values in a separate array
+            return error.UnsupportedExpression;
+        } else {
+            // None - error
+            return error.OptionNone;
+        }
+    }
+
+    /// Compute OptionIsDefined - return true if Some, false if None
+    fn computeOptionIsDefined(self: *Evaluator) EvalError!void {
+        try self.addCost(15); // OptionIsDefined cost from opcodes
+
+        const opt_val = try self.popValue();
+        if (opt_val != .option) return error.TypeMismatch;
+
+        const is_defined = opt_val.option.value_idx != null;
+        try self.pushValue(.{ .boolean = is_defined });
     }
 
     /// Compute binary operation
@@ -553,7 +621,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box => {},
 
             // One child
-            .calc_blake2b256, .calc_sha256 => {
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined => {
                 next = self.findSubtreeEnd(next);
             },
 
@@ -563,9 +631,9 @@ pub const Evaluator = struct {
             },
 
             // Two children
-            .bin_op => {
-                next = self.findSubtreeEnd(next); // Left
-                next = self.findSubtreeEnd(next); // Right
+            .bin_op, .option_get_or_else => {
+                next = self.findSubtreeEnd(next); // Left / Option
+                next = self.findSubtreeEnd(next); // Right / Default
             },
 
             // Three children
@@ -1132,4 +1200,81 @@ test "evaluator: nested binary ops with proper tree navigation" {
 
     try std.testing.expect(result == .int);
     try std.testing.expectEqual(@as(i32, 6), result.int);
+}
+
+test "evaluator: option_is_defined on None" {
+    // OptionIsDefined(None) should return false
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_is_defined };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    // None value
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == false);
+}
+
+test "evaluator: option_is_defined on Some" {
+    // OptionIsDefined(Some(x)) should return true
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_is_defined };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    // Some value (value_idx is non-null)
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 1 } };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .boolean);
+    try std.testing.expect(result.boolean == true);
+}
+
+test "evaluator: option_get on None errors" {
+    // OptionGet(None) should error with OptionNone
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_get };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectError(error.OptionNone, eval.evaluate());
+}
+
+test "evaluator: option_get_or_else on None uses default" {
+    // OptionGetOrElse(None, 42) should return 42
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_get_or_else };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // None
+    tree.nodes[2] = .{ .tag = .constant, .data = 1 }; // Default: 42
+    tree.node_count = 3;
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null } };
+    tree.values[1] = .{ .int = 42 };
+    tree.value_count = 2;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .int);
+    try std.testing.expectEqual(@as(i32, 42), result.int);
 }
