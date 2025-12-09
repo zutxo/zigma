@@ -111,6 +111,8 @@ pub const ExprTag = enum(u8) {
     upcast,
     /// Downcast to smaller type (opcode 0xE5) - e.g., Long → Int, may overflow
     downcast,
+    /// Concrete collection literal (opcode 0xDC) - Coll[T](item_0, item_1, ...)
+    concrete_collection,
 
     // Header field extraction opcodes (0xE9-0xF2)
     /// Extract version byte from Header (opcode 0xE9)
@@ -445,6 +447,8 @@ fn deserializeWithDepth(
             // Type conversion operations
             opcodes.Upcast => try deserializeUpcast(tree, reader, arena, depth),
             opcodes.Downcast => try deserializeDowncast(tree, reader, arena, depth),
+            // Collection constructors
+            opcodes.ConcreteCollection => try deserializeConcreteCollection(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -901,6 +905,56 @@ fn deserializeDowncast(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
+fn deserializeConcreteCollection(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // ConcreteCollection format: numItems (u16 VLQ) + elementType + items
+    // Format from Scala: w.putUShort(cc.items.size); w.putType(cc.tpe.elemType); items...
+
+    // PRECONDITION: depth check already done in deserializeWithDepth
+    assert(depth < max_expr_depth);
+
+    // Read item count (unsigned short)
+    const num_items = reader.readU16() catch |e| return mapVlqError(e);
+
+    // INVARIANT: collection size is bounded
+    if (num_items > max_constants) return error.ExpressionTooComplex;
+
+    // Read element type
+    const elem_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            else => error.InvalidData,
+        };
+    };
+
+    // Get or create the Coll[T] type
+    const coll_type = tree.type_pool.getColl(elem_type) catch return error.PoolFull;
+
+    // Add the concrete_collection node first (pre-order)
+    // Store item count in data
+    _ = try tree.addNode(.{
+        .tag = .concrete_collection,
+        .data = num_items,
+        .result_type = coll_type,
+    });
+
+    // Parse each item expression
+    var i: u16 = 0;
+    while (i < num_items) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+
+    // POSTCONDITION: all items parsed
+    // (node count increased by 1 + sum of all child nodes)
+}
+
 fn mapVlqError(err: vlq.DecodeError) DeserializeError {
     return switch (err) {
         error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
@@ -1035,4 +1089,78 @@ test "expr_serializer: error on empty input" {
 
     var reader = vlq.Reader.init(&[_]u8{});
     try std.testing.expectError(error.UnexpectedEndOfInput, deserialize(&tree, &reader, &arena));
+}
+
+test "expr_serializer: deserialize ConcreteCollection empty" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // ConcreteCollection[Int]():
+    // 0xDC (ConcreteCollection)
+    // 0x00 (numItems = 0)
+    // 0x04 (element type = Int)
+    var reader = vlq.Reader.init(&[_]u8{ 0xDC, 0x00, 0x04 });
+    try deserialize(&tree, &reader, &arena);
+
+    try std.testing.expectEqual(@as(u16, 1), tree.node_count);
+    try std.testing.expectEqual(ExprTag.concrete_collection, tree.nodes[0].tag);
+    try std.testing.expectEqual(@as(u16, 0), tree.nodes[0].data); // 0 elements
+}
+
+test "expr_serializer: deserialize ConcreteCollection with Int elements" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // ConcreteCollection[Int](1, 2, 3):
+    // 0xDC (ConcreteCollection)
+    // 0x03 (numItems = 3)
+    // 0x04 (element type = Int)
+    // 0x04 0x02 (Int 1)
+    // 0x04 0x04 (Int 2)
+    // 0x04 0x06 (Int 3)
+    var reader = vlq.Reader.init(&[_]u8{
+        0xDC, 0x03, 0x04, // ConcreteCollection(3, Int)
+        0x04, 0x02, // Int(1)
+        0x04, 0x04, // Int(2)
+        0x04, 0x06, // Int(3)
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    // Should have 4 nodes: ConcreteCollection + 3 Int constants
+    try std.testing.expectEqual(@as(u16, 4), tree.node_count);
+    try std.testing.expectEqual(ExprTag.concrete_collection, tree.nodes[0].tag);
+    try std.testing.expectEqual(@as(u16, 3), tree.nodes[0].data); // 3 elements
+
+    // Check individual elements
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[1].tag);
+    try std.testing.expectEqual(@as(i32, 1), tree.values[0].int);
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[2].tag);
+    try std.testing.expectEqual(@as(i32, 2), tree.values[1].int);
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[3].tag);
+    try std.testing.expectEqual(@as(i32, 3), tree.values[2].int);
+}
+
+test "expr_serializer: deserialize nested ConcreteCollection" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // ConcreteCollection[Coll[Byte]](single element Coll[Byte]):
+    // 0xDC (ConcreteCollection)
+    // 0x01 (numItems = 1)
+    // 0x0E (element type = Coll[Byte] = 12 + 2)
+    // Nested: 0x0E 0x02 0xAB 0xCD (Coll[Byte] with 2 bytes)
+    var reader = vlq.Reader.init(&[_]u8{
+        0xDC, 0x01, 0x0E, // ConcreteCollection(1, Coll[Byte])
+        0x0E, 0x02, 0xAB, 0xCD, // Coll[Byte] constant: 2 bytes, 0xAB 0xCD
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    // Should have 2 nodes: ConcreteCollection + 1 Coll[Byte] constant
+    try std.testing.expectEqual(@as(u16, 2), tree.node_count);
+    try std.testing.expectEqual(ExprTag.concrete_collection, tree.nodes[0].tag);
+    try std.testing.expectEqual(@as(u16, 1), tree.nodes[0].data); // 1 element
+
+    // Check nested collection constant
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[1].tag);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAB, 0xCD }, tree.values[0].coll_byte);
 }

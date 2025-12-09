@@ -502,6 +502,25 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = first_idx, .phase = .evaluate });
             },
 
+            .concrete_collection => {
+                // N-ary: n elements → Coll[T]
+                const elem_count = node.data;
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Push elements in reverse order so first element evaluates first
+                var idx = node_idx + 1;
+                var indices: [256]u16 = undefined;
+                var i: u16 = 0;
+                while (i < elem_count) : (i += 1) {
+                    indices[i] = idx;
+                    idx = self.findSubtreeEnd(idx);
+                }
+                // Push in reverse order
+                while (i > 0) {
+                    i -= 1;
+                    try self.pushWork(.{ .node_idx = indices[i], .phase = .evaluate });
+                }
+            },
+
             .upcast, .downcast => {
                 // Unary: numeric value → target type
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
@@ -631,6 +650,10 @@ pub const Evaluator = struct {
 
             .tuple_construct, .pair_construct, .triple_construct => {
                 try self.computeTupleConstruct(node.data);
+            },
+
+            .concrete_collection => {
+                try self.computeConcreteCollection(node.data, node.result_type);
             },
 
             .upcast => {
@@ -981,6 +1004,58 @@ pub const Evaluator = struct {
             .start = @truncate(start),
             .len = @truncate(elem_count),
         } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute concrete collection - create Coll[T] from n values on stack
+    fn computeConcreteCollection(self: *Evaluator, elem_count: u16, coll_type: types.TypeIndex) EvalError!void {
+        // PRECONDITION: Value stack has at least elem_count values
+        assert(self.value_sp >= elem_count);
+
+        try self.addCost(FixedCost.tuple_construct); // Same cost model as tuple
+
+        // INVARIANT: Element count is bounded
+        assert(elem_count <= 256);
+
+        // Get element type from Coll[T]
+        // For Coll[Byte], use specialized handling
+        const stype = self.tree.type_pool.get(coll_type);
+        const elem_type = if (stype == .coll) stype.coll else TypePool.ANY;
+
+        // Special case: Coll[Byte] - store as contiguous byte array
+        if (elem_type == TypePool.BYTE) {
+            const result_slice = self.arena.allocSlice(u8, elem_count) catch return error.OutOfMemory;
+            var i: u16 = elem_count;
+            while (i > 0) {
+                i -= 1;
+                const val = try self.popValue();
+                if (val != .byte) return error.TypeMismatch;
+                result_slice[i] = @bitCast(val.byte);
+            }
+            try self.pushValue(.{ .coll_byte = result_slice });
+        } else {
+            // Generic collection: store elements in values array
+            const start = self.values_sp;
+            if (start + elem_count > self.values.len) return error.OutOfMemory;
+
+            // Pop elements in reverse order (last on stack = first in collection)
+            var i: u16 = elem_count;
+            while (i > 0) {
+                i -= 1;
+                const val = try self.popValue();
+                self.values[start + i] = val;
+            }
+            self.values_sp = start + elem_count;
+
+            // Create collection reference
+            try self.pushValue(.{ .coll = .{
+                .elem_type = elem_type,
+                .start = @truncate(start),
+                .len = elem_count,
+            } });
+        }
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -1566,6 +1641,15 @@ pub const Evaluator = struct {
 
             // tuple_construct: elem_count children
             .tuple_construct => {
+                const elem_count = node.data;
+                var i: u16 = 0;
+                while (i < elem_count) : (i += 1) {
+                    next = self.findSubtreeEnd(next);
+                }
+            },
+
+            // concrete_collection: elem_count children (same as tuple_construct)
+            .concrete_collection => {
                 const elem_count = node.data;
                 var i: u16 = 0;
                 while (i < elem_count) : (i += 1) {
