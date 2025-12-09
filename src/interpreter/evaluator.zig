@@ -918,9 +918,16 @@ pub const Evaluator = struct {
         // PRECONDITION: Value stack has at least one value
         assert(self.value_sp > 0);
 
+        // PRECONDITION: target_type is a valid numeric type
+        assert(target_type == TypePool.SHORT or target_type == TypePool.INT or
+            target_type == TypePool.LONG or target_type == TypePool.BIG_INT);
+
         try self.addCost(FixedCost.upcast);
 
         const input = try self.popValue();
+
+        // INVARIANT: Input must be a numeric value
+        assert(input == .byte or input == .short or input == .int or input == .long);
 
         // Upcast conversions: Byte → Short → Int → Long → BigInt
         const result: Value = switch (target_type) {
