@@ -16,6 +16,7 @@ pub const comparison = @import("ops/comparison.zig");
 pub const logical = @import("ops/logical.zig");
 pub const box = @import("ops/box.zig");
 pub const context_ops = @import("ops/context_ops.zig");
+pub const collection = @import("ops/collection.zig");
 
 // Re-export common error types
 pub const ArithmeticError = arithmetic.ArithmeticError;
@@ -23,6 +24,7 @@ pub const Order = comparison.Order;
 
 // Re-export context error type
 pub const ContextError = context_ops.ContextError;
+pub const CollectionError = collection.CollectionError;
 
 // Pull in tests from all submodules
 comptime {
@@ -31,6 +33,7 @@ comptime {
     _ = logical;
     _ = box;
     _ = context_ops;
+    _ = collection;
 }
 
 test "ops: module imports work" {
