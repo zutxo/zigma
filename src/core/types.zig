@@ -116,6 +116,31 @@ comptime {
     assert(max_pool_types >= 32);
 }
 
+/// Maximum tuple elements for inline storage
+pub const max_tuple_elements: usize = 10;
+
+/// Tuple with N elements (5-10), inline storage for SType.tuple
+pub const TupleN = struct {
+    elements: [max_tuple_elements]TypeIndex,
+    len: u8, // 5-10
+
+    // Compile-time assertions (ZIGMA_STYLE)
+    comptime {
+        assert(max_tuple_elements >= 5);
+        assert(max_tuple_elements <= 255); // len fits in u8
+        assert(@sizeOf(TupleN) <= 32); // Reasonable size
+    }
+
+    pub fn get(self: TupleN, idx: usize) TypeIndex {
+        assert(idx < self.len);
+        return self.elements[idx];
+    }
+
+    pub fn slice(self: *const TupleN) []const TypeIndex {
+        return self.elements[0..self.len];
+    }
+};
+
 /// Runtime type representation using tagged union.
 /// Composite types store indices into TypePool to avoid recursion.
 pub const SType = union(enum) {
@@ -138,7 +163,8 @@ pub const SType = union(enum) {
     pair: struct { first: TypeIndex, second: TypeIndex },
     triple: struct { a: TypeIndex, b: TypeIndex, c: TypeIndex },
     quadruple: struct { a: TypeIndex, b: TypeIndex, c: TypeIndex, d: TypeIndex },
-    tuple: []const TypeIndex, // 5+ elements
+    /// Tuple with 5+ elements (inline storage, max 10)
+    tuple: TupleN,
 
     // Function type (v6+)
     func: struct {
@@ -382,6 +408,53 @@ pub const TypePool = struct {
         // POSTCONDITION: Result is valid index with correct type
         assert(result < self.count);
         assert(self.types[result] == .pair);
+
+        return result;
+    }
+
+    /// Get or create a TupleN (5-10 elements) type
+    pub fn getTupleN(self: *TypePool, elements: []const TypeIndex) error{PoolFull}!TypeIndex {
+        // PRECONDITION: Valid length for tuple5+
+        assert(elements.len >= 5);
+        assert(elements.len <= max_tuple_elements);
+        // PRECONDITION: All element indices are valid
+        for (elements) |e| {
+            assert(e < self.count);
+        }
+
+        // Build TupleN structure
+        var tuple = TupleN{
+            .elements = undefined,
+            .len = @intCast(elements.len),
+        };
+        for (elements, 0..) |e, i| {
+            tuple.elements[i] = e;
+        }
+        // Zero-fill remaining slots
+        for (elements.len..max_tuple_elements) |i| {
+            tuple.elements[i] = 0;
+        }
+
+        // Search existing
+        for (self.types[first_dynamic..self.count], first_dynamic..) |t, i| {
+            if (t == .tuple and t.tuple.len == elements.len) {
+                var matches = true;
+                for (0..elements.len) |j| {
+                    if (t.tuple.elements[j] != elements[j]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) return @intCast(i);
+            }
+        }
+
+        // Create new
+        const result = try self.add(.{ .tuple = tuple });
+
+        // POSTCONDITION: Result is valid index with correct type
+        assert(result < self.count);
+        assert(self.types[result] == .tuple);
 
         return result;
     }

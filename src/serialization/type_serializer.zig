@@ -160,23 +160,24 @@ fn deserializeWithDepth(
         },
 
         // Tuple 5+: read length, parse N types
-        .tuple5plus => {
+        .tuple5plus => blk: {
             const len = reader.readByte() catch |err| switch (err) {
                 error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
                 error.Overflow => return error.Overflow,
             };
 
-            // Validate tuple length (5-255)
+            // Validate tuple length (5-max)
             if (len < 5) return error.InvalidTupleLength;
+            if (len > types.max_tuple_elements) return error.InvalidTupleLength;
 
-            // TODO: Full tuple5plus support requires slice storage in TypePool
-            // For now, skip the bytes and return error
-            // Parse and discard element types to consume input correctly
+            // Parse element types
+            var elements: [types.max_tuple_elements]types.TypeIndex = undefined;
             var i: u8 = 0;
             while (i < len) : (i += 1) {
-                _ = try deserializeWithDepth(pool, reader, depth + 1);
+                elements[i] = try deserializeWithDepth(pool, reader, depth + 1);
             }
-            return error.InvalidTupleLength; // TODO: tuple slice support
+
+            break :blk pool.getTupleN(elements[0..len]) catch return error.PoolFull;
         },
 
         // Function type (v6+)
@@ -342,12 +343,12 @@ fn serializeWithDepth(
             written += try serializeWithDepth(pool, q.d, buf[written..], depth + 1);
             return written;
         },
-        .tuple => |indices| {
+        .tuple => |tuple_n| {
             if (buf.len < 2) return error.BufferTooSmall;
             buf[0] = types.TypeConstrCode.tuple5plus;
-            buf[1] = @truncate(indices.len);
+            buf[1] = tuple_n.len;
             var written: usize = 2;
-            for (indices) |idx| {
+            for (tuple_n.slice()) |idx| {
                 written += try serializeWithDepth(pool, idx, buf[written..], depth + 1);
             }
             return written;
@@ -563,6 +564,50 @@ test "type_serializer: deserialize quadruple" {
     try std.testing.expectEqual(TypePool.INT, quad_type.quadruple.b);
     try std.testing.expectEqual(TypePool.INT, quad_type.quadruple.c);
     try std.testing.expectEqual(TypePool.INT, quad_type.quadruple.d);
+}
+
+test "type_serializer: deserialize tuple5plus" {
+    var pool = TypePool.init();
+
+    // (Int, Int, Int, Int, Int) = 0x60 (tuple5plus) + 0x05 (len) + 5x 0x04 (Int)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x60, 0x05, 0x04, 0x04, 0x04, 0x04, 0x04 });
+    const tuple_idx = try deserialize(&pool, &r1);
+    const tuple_type = pool.get(tuple_idx);
+    try std.testing.expect(tuple_type == .tuple);
+    try std.testing.expectEqual(@as(u8, 5), tuple_type.tuple.len);
+    for (0..5) |i| {
+        try std.testing.expectEqual(TypePool.INT, tuple_type.tuple.get(i));
+    }
+}
+
+test "type_serializer: roundtrip tuple5plus" {
+    var pool = TypePool.init();
+    var buf: [32]u8 = undefined;
+
+    // Create a 5-tuple of Ints
+    const elements = [_]types.TypeIndex{ TypePool.INT, TypePool.LONG, TypePool.BYTE, TypePool.SHORT, TypePool.BOOLEAN };
+    const tuple_idx = try pool.getTupleN(&elements);
+
+    // Serialize
+    const len = try serialize(&pool, tuple_idx, &buf);
+    try std.testing.expectEqual(@as(usize, 7), len); // 1 (code) + 1 (len) + 5 (elements)
+    try std.testing.expectEqual(@as(u8, types.TypeConstrCode.tuple5plus), buf[0]);
+    try std.testing.expectEqual(@as(u8, 5), buf[1]); // length
+
+    // Deserialize and verify
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result_idx = try deserialize(&pool, &reader);
+    const result_type = pool.get(result_idx);
+    try std.testing.expect(result_type == .tuple);
+    try std.testing.expectEqual(@as(u8, 5), result_type.tuple.len);
+}
+
+test "type_serializer: tuple5plus too large" {
+    var pool = TypePool.init();
+
+    // Length 11 (exceeds max 10)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x60, 0x0B, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 });
+    try std.testing.expectError(error.InvalidTupleLength, deserialize(&pool, &r1));
 }
 
 test "type_serializer: roundtrip primitives" {

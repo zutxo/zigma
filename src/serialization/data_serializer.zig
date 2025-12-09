@@ -254,7 +254,7 @@ pub fn deserialize(
         .pair => |p| deserializeTuple2(p.first, p.second, pool, reader, arena),
         .triple => |tr| deserializeTuple3(tr.a, tr.b, tr.c, pool, reader, arena),
         .quadruple => |q| deserializeTuple4(q.a, q.b, q.c, q.d, pool, reader, arena),
-        .tuple => |indices| deserializeTupleN(indices, pool, reader, arena),
+        .tuple => |tuple_n| deserializeTupleN(tuple_n.slice(), pool, reader, arena),
         .func => error.NotSupported,
         // Object types cannot be deserialized as data
         .any, .box, .avl_tree, .context, .header, .pre_header, .global => error.NotSupported,
