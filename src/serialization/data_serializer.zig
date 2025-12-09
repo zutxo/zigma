@@ -150,6 +150,20 @@ pub const Value = union(enum) {
         pow_nonce: [8]u8,
         pow_distance: [32]u8,
         votes: [3]u8,
+
+        // Compile-time assertions (ZIGMA_STYLE requirement)
+        comptime {
+            // HeaderRef must be reasonably sized for stack allocation
+            assert(@sizeOf(HeaderRef) <= 512);
+            assert(@sizeOf(HeaderRef) >= 256);
+
+            // Verify field sizes match Ergo protocol
+            assert(@sizeOf([32]u8) == 32); // Hash sizes
+            assert(@sizeOf([33]u8) == 33); // Compressed EC points
+            assert(@sizeOf([44]u8) == 44); // AVL+ digest
+            assert(@sizeOf([3]u8) == 3); // Votes
+            assert(@sizeOf([8]u8) == 8); // PoW nonce
+        }
     };
 };
 

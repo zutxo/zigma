@@ -1186,137 +1186,238 @@ pub const Evaluator = struct {
 
     /// Compute ExtractVersion (0xE9): Header → Byte
     fn computeExtractVersion(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: version fits in i8
+        assert(header.version <= 127);
+
         try self.pushValue(.{ .byte = @intCast(header.version) });
+
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractParentId (0xEA): Header → Coll[Byte] 32b
     fn computeExtractParentId(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: parent_id is 32 bytes
+        assert(header.parent_id.len == 32);
+
         const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.parent_id);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractAdProofsRoot (0xEB): Header → Coll[Byte] 32b
     fn computeExtractAdProofsRoot(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: ad_proofs_root is 32 bytes
+        assert(header.ad_proofs_root.len == 32);
+
         const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.ad_proofs_root);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractStateRoot (0xEC): Header → AvlTree digest 44b
     fn computeExtractStateRoot(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: state_root is 44 bytes (AVL+ digest)
+        assert(header.state_root.len == 44);
+
         const result_slice = self.arena.allocSlice(u8, 44) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.state_root);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractTransactionsRoot (0xED): Header → Coll[Byte] 32b
     fn computeExtractTxsRoot(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: transactions_root is 32 bytes
+        assert(header.transactions_root.len == 32);
+
         const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.transactions_root);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractTimestamp (0xEE): Header → Long
     fn computeExtractTimestamp(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: timestamp fits in i64
+        assert(header.timestamp <= @as(u64, @intCast(std.math.maxInt(i64))));
+
         try self.pushValue(.{ .long = @intCast(header.timestamp) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractNBits (0xEF): Header → Long
     fn computeExtractNBits(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: n_bits fits in i64
+        assert(header.n_bits <= @as(u64, @intCast(std.math.maxInt(i64))));
+
         try self.pushValue(.{ .long = @intCast(header.n_bits) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractDifficulty (0xF0): Header → BigInt 32b
     fn computeExtractDifficulty(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: pow_distance is 32 bytes
+        assert(header.pow_distance.len == 32);
+
         // Return pow_distance as BigInt (32 bytes)
         var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 32 };
         @memcpy(bigint.bytes[0..32], &header.pow_distance);
         try self.pushValue(.{ .big_int = bigint });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractVotes (0xF1): Header → Coll[Byte] 3b
     fn computeExtractVotes(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: votes is 3 bytes
+        assert(header.votes.len == 3);
+
         const result_slice = self.arena.allocSlice(u8, 3) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.votes);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute ExtractMinerRewards (0xF2): Header → Coll[Byte] 33b (miner pubkey)
     fn computeExtractMinerRewards(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
         assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
         try self.addCost(FixedCost.extract_header_field);
 
         const header_val = try self.popValue();
         if (header_val != .header) return error.TypeMismatch;
 
         const header = header_val.header;
+
+        // INVARIANT: miner_pk is 33 bytes with valid SEC1 prefix
+        assert(header.miner_pk.len == 33);
+        assert(header.miner_pk[0] == 0x02 or header.miner_pk[0] == 0x03 or header.miner_pk[0] == 0x00);
+
         const result_slice = self.arena.allocSlice(u8, 33) catch return error.OutOfMemory;
         @memcpy(result_slice, &header.miner_pk);
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
     }
 
     // ========================================================================
