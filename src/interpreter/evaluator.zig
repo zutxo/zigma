@@ -493,10 +493,16 @@ pub const Evaluator = struct {
 
     /// Compute OptionGet - extract value from Some, error on None
     fn computeOptionGet(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
         try self.addCost(15); // OptionGet cost from opcodes
 
         const opt_val = try self.popValue();
         if (opt_val != .option) return error.TypeMismatch;
+
+        // INVARIANT: Option type is well-formed
+        assert(opt_val.option.inner_type != 0); // Has valid inner type
 
         if (opt_val.option.value_idx) |_| {
             // Some(x) - need to get the inner value
@@ -504,30 +510,42 @@ pub const Evaluator = struct {
             // This would require storing values in a separate array
             return error.UnsupportedExpression;
         } else {
-            // None - error
+            // None - error per ErgoTree semantics
             return error.OptionNone;
         }
     }
 
     /// Compute OptionIsDefined - return true if Some, false if None
     fn computeOptionIsDefined(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
         try self.addCost(15); // OptionIsDefined cost from opcodes
 
         const opt_val = try self.popValue();
         if (opt_val != .option) return error.TypeMismatch;
 
+        // INVARIANT: Option type is well-formed
+        assert(opt_val.option.inner_type != 0);
+
         const is_defined = opt_val.option.value_idx != null;
         try self.pushValue(.{ .boolean = is_defined });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
     }
 
     /// Compute LongToByteArray - convert Long to big-endian Coll[Byte]
     fn computeLongToByteArray(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
         try self.addCost(17); // LongToByteArray cost from opcodes
 
         const input = try self.popValue();
         if (input != .long) return error.TypeMismatch;
 
-        // Convert to big-endian bytes
+        // Convert to big-endian bytes (network byte order)
         const result_slice = self.arena.allocSlice(u8, 8) catch return error.OutOfMemory;
         const value: u64 = @bitCast(input.long);
         result_slice[0] = @truncate(value >> 56);
@@ -539,11 +557,20 @@ pub const Evaluator = struct {
         result_slice[6] = @truncate(value >> 8);
         result_slice[7] = @truncate(value);
 
+        // POSTCONDITION: Result is exactly 8 bytes
+        assert(result_slice.len == 8);
+
         try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
     }
 
     /// Compute ByteArrayToLong - convert big-endian Coll[Byte] to Long
     fn computeByteArrayToLong(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
         try self.addCost(16); // ByteArrayToLong cost from opcodes
 
         const input = try self.popValue();
@@ -552,7 +579,10 @@ pub const Evaluator = struct {
         const bytes = input.coll_byte;
         if (bytes.len != 8) return error.InvalidData;
 
-        // Convert from big-endian bytes
+        // INVARIANT: Input is exactly 8 bytes
+        assert(bytes.len == 8);
+
+        // Convert from big-endian bytes (network byte order)
         const value: u64 = (@as(u64, bytes[0]) << 56) |
             (@as(u64, bytes[1]) << 48) |
             (@as(u64, bytes[2]) << 40) |
@@ -563,10 +593,16 @@ pub const Evaluator = struct {
             @as(u64, bytes[7]);
 
         try self.pushValue(.{ .long = @bitCast(value) });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
     }
 
     /// Compute ByteArrayToBigInt - convert Coll[Byte] to BigInt
     fn computeByteArrayToBigInt(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
         try self.addCost(30); // ByteArrayToBigInt cost from opcodes
 
         const input = try self.popValue();
@@ -575,12 +611,18 @@ pub const Evaluator = struct {
         const bytes = input.coll_byte;
         if (bytes.len == 0 or bytes.len > data.max_bigint_bytes) return error.InvalidData;
 
+        // INVARIANT: Input length is valid for BigInt
+        assert(bytes.len > 0 and bytes.len <= data.max_bigint_bytes);
+
         // Store as big-endian bytes in BigInt
         // Sign is determined by the high bit of first byte (two's complement)
         var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(bytes.len) };
 
         @memcpy(bigint.bytes[0..bytes.len], bytes);
         try self.pushValue(.{ .big_int = bigint });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
     }
 
     /// Compute binary operation
@@ -1457,4 +1499,99 @@ test "evaluator: long_to_byte_array roundtrip" {
 
     try std.testing.expect(result == .long);
     try std.testing.expectEqual(@as(i64, 12345678901234), result.long);
+}
+
+test "evaluator: long_to_byte_array negative value" {
+    // LongToByteArray(-1) should produce 0xFFFFFFFFFFFFFFFF
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .long_to_byte_array };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .long = -1 };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .coll_byte);
+    const expected = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    try std.testing.expectEqualSlices(u8, &expected, result.coll_byte);
+}
+
+test "evaluator: long_to_byte_array min value" {
+    // LongToByteArray(Long.MIN_VALUE) roundtrip
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .byte_array_to_long };
+    tree.nodes[1] = .{ .tag = .long_to_byte_array };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 3;
+    tree.values[0] = .{ .long = std.math.minInt(i64) };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .long);
+    try std.testing.expectEqual(std.math.minInt(i64), result.long);
+}
+
+test "evaluator: long_to_byte_array max value" {
+    // LongToByteArray(Long.MAX_VALUE) roundtrip
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .byte_array_to_long };
+    tree.nodes[1] = .{ .tag = .long_to_byte_array };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 3;
+    tree.values[0] = .{ .long = std.math.maxInt(i64) };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .long);
+    try std.testing.expectEqual(std.math.maxInt(i64), result.long);
+}
+
+test "evaluator: byte_array_to_bigint empty errors" {
+    // ByteArrayToBigInt with empty input should error
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .byte_array_to_bigint };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .coll_byte = &[_]u8{} }; // Empty
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectError(error.InvalidData, eval.evaluate());
+}
+
+test "evaluator: byte_array_to_bigint negative" {
+    // ByteArrayToBigInt with high bit set should be negative
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .byte_array_to_bigint };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+    tree.values[0] = .{ .coll_byte = &[_]u8{ 0xFF, 0x00 } }; // High bit set
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .big_int);
+    try std.testing.expect(result.big_int.isNegative()); // Should be negative
 }
