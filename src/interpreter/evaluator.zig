@@ -95,6 +95,8 @@ pub const EvalError = error{
     InvalidGroupElement,
     /// Tuple field index out of bounds
     IndexOutOfBounds,
+    /// Invalid context state (missing headers, etc.)
+    InvalidContext,
 };
 
 // ============================================================================
@@ -320,6 +322,29 @@ pub const Evaluator = struct {
                     .source = .inputs,
                     .index = self.ctx.self_index,
                 } });
+            },
+
+            .miner_pk => {
+                // MinerPubKey: returns miner's public key from pre-header
+                // PRECONDITION: Pre-header has valid miner_pk
+                const pk = self.ctx.pre_header.miner_pk;
+                // INVARIANT: SEC1 compressed point (0x02 or 0x03 prefix, or 0x00 for identity)
+                assert(pk[0] == 0x02 or pk[0] == 0x03 or pk[0] == 0x00);
+                try self.addCost(100); // MinerPubKey cost from opcodes.zig
+                try self.pushValue(.{ .group_element = pk });
+            },
+
+            .last_block_utxo_root => {
+                // LastBlockUtxoRootHash: returns UTXO state root from last header
+                // PRECONDITION: At least one header in context
+                if (self.ctx.headers.len == 0) {
+                    return error.InvalidContext;
+                }
+                // INVARIANT: First header (index 0) is most recent
+                const state_root = self.ctx.headers[0].state_root;
+                try self.addCost(15); // LastBlockUtxoRootHash cost from opcodes.zig
+                // Return as byte collection (44-byte AVL+ digest)
+                try self.pushValue(.{ .coll_byte = &state_root });
             },
 
             .calc_blake2b256, .calc_sha256 => {
@@ -1482,7 +1507,7 @@ pub const Evaluator = struct {
 
         switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .group_generator => {},
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => {},
 
             // One child
             .calc_blake2b256,
@@ -2469,4 +2494,78 @@ test "evaluator: inputs with empty context still valid" {
     // Even with single input, returns valid box_coll
     try std.testing.expect(result == .box_coll);
     try std.testing.expectEqual(Value.BoxCollRef{ .source = .inputs }, result.box_coll);
+}
+
+test "evaluator: miner_pk returns group element" {
+    // MinerPubKey accessor returns pre-header miner public key
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .miner_pk };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    // Set a valid compressed EC point (0x02 prefix)
+    ctx.pre_header.miner_pk = [_]u8{0x02} ++ [_]u8{0xAB} ** 32;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is a group element (33 bytes)
+    try std.testing.expect(result == .group_element);
+    try std.testing.expectEqual(@as(u8, 0x02), result.group_element[0]);
+    try std.testing.expectEqual(@as(u8, 0xAB), result.group_element[1]);
+}
+
+test "evaluator: miner_pk with 0x03 prefix" {
+    // Edge case: miner_pk with odd y-coordinate prefix
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .miner_pk };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.pre_header.miner_pk = [_]u8{0x03} ++ [_]u8{0xCD} ** 32;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .group_element);
+    try std.testing.expectEqual(@as(u8, 0x03), result.group_element[0]);
+}
+
+test "evaluator: last_block_utxo_root returns state root" {
+    // LastBlockUtxoRootHash returns first header's state root
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .last_block_utxo_root };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    // Create header with known state root
+    var header = context.testHeader();
+    header.state_root = [_]u8{0xDE} ** 44;
+    const test_headers = [_]context.HeaderView{header};
+    ctx.headers = &test_headers;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is byte collection with 44-byte AVL+ digest
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 44), result.coll_byte.len);
+    try std.testing.expectEqual(@as(u8, 0xDE), result.coll_byte[0]);
+}
+
+test "evaluator: last_block_utxo_root no headers errors" {
+    // LastBlockUtxoRootHash with no headers should error
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .last_block_utxo_root };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs); // No headers
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectError(error.InvalidContext, eval.evaluate());
 }

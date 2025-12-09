@@ -59,6 +59,10 @@ pub const ExprTag = enum(u8) {
     outputs,
     /// Self box
     self_box,
+    /// Miner public key from pre-header (opcode 0xAA)
+    miner_pk,
+    /// Last block UTXO root hash from headers (opcode 0xA6)
+    last_block_utxo_root,
     /// If-then-else
     if_then_else,
     /// CalcBlake2b256 hash (opcode 0xCB)
@@ -373,6 +377,18 @@ fn deserializeWithDepth(
                 _ = try tree.addNode(.{
                     .tag = .self_box,
                     .result_type = TypePool.BOX,
+                });
+            },
+            opcodes.MinerPubKey => {
+                _ = try tree.addNode(.{
+                    .tag = .miner_pk,
+                    .result_type = TypePool.GROUP_ELEMENT,
+                });
+            },
+            opcodes.LastBlockUtxoRootHash => {
+                _ = try tree.addNode(.{
+                    .tag = .last_block_utxo_root,
+                    .result_type = TypePool.AVL_TREE,
                 });
             },
             // Comparison operations
