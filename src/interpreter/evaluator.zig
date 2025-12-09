@@ -39,6 +39,9 @@ const max_work_stack: usize = 256;
 /// Maximum value stack depth
 const max_value_stack: usize = 256;
 
+/// Maximum variable bindings (matches expr_serializer.max_val_defs)
+const max_var_bindings: usize = 64;
+
 /// Default cost limit per evaluation
 const default_cost_limit: u64 = 1_000_000;
 
@@ -81,6 +84,8 @@ pub const EvalError = error{
     InvalidBinOp,
     /// Out of memory in evaluation arena
     OutOfMemory,
+    /// Undefined variable reference
+    UndefinedVariable,
 };
 
 // ============================================================================
@@ -148,6 +153,10 @@ pub const Evaluator = struct {
     /// Arena for temporary allocations (hash results, etc.)
     arena: BumpAllocator(eval_arena_size) = BumpAllocator(eval_arena_size).init(),
 
+    /// Variable bindings (varId -> Value)
+    /// null = unbound, non-null = bound value
+    var_bindings: [max_var_bindings]?Value = [_]?Value{null} ** max_var_bindings,
+
     pub fn init(tree: *const ExprTree, ctx: *const Context) Evaluator {
         return .{
             .tree = tree,
@@ -171,6 +180,7 @@ pub const Evaluator = struct {
         self.value_sp = 0;
         self.cost_used = 0;
         self.arena.reset();
+        self.var_bindings = [_]?Value{null} ** max_var_bindings;
 
         // Push root node for evaluation (index 0)
         try self.pushWork(.{ .node_idx = 0, .phase = .evaluate });
@@ -243,16 +253,20 @@ pub const Evaluator = struct {
 
             .bin_op => {
                 // Binary op: push compute phase, then push children
-                // Children are at node_idx+1 and node_idx+2 (pre-order layout)
+                // Left child at node_idx+1, right child after left subtree
+                const left_idx = node_idx + 1;
+                const right_idx = self.findSubtreeEnd(left_idx);
+
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 // Push right child first (will be evaluated second, popped first)
-                try self.pushWork(.{ .node_idx = node_idx + 2, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
                 // Push left child second (will be evaluated first)
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
             },
 
             .if_then_else => {
                 // If-then-else: evaluate condition first, then decide branch
+                // Condition at node_idx+1, then at node_idx+2, else after then subtree
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 // Condition is at node_idx+1
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
@@ -269,6 +283,57 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 // Operand is at node_idx+1 (pre-order layout)
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .val_use => {
+                // Variable reference: look up value from bindings
+                try self.addCost(FixedCost.constant);
+                const var_id = node.data;
+                if (var_id >= max_var_bindings) return error.UndefinedVariable;
+                const value = self.var_bindings[var_id] orelse return error.UndefinedVariable;
+                try self.pushValue(value);
+            },
+
+            .val_def => {
+                // Variable definition: evaluate RHS, then store binding
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // RHS is at node_idx+1
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .block_value => {
+                // Block with let bindings: evaluate each ValDef, then result
+                // Stack order: push last-to-execute first
+                // We want: ValDef0, ValDef1, ..., Result (in execution order)
+                // So push: Result, then ValDefs in reverse order
+                const item_count = node.data;
+
+                // First, find all indices
+                var indices: [max_var_bindings + 1]u16 = undefined;
+                var idx = node_idx + 1;
+                var i: u16 = 0;
+                while (i < item_count) : (i += 1) {
+                    indices[i] = idx;
+                    idx = self.findSubtreeEnd(idx);
+                }
+                indices[item_count] = idx; // Result expression index
+
+                // Push result first (will be evaluated last)
+                try self.pushWork(.{ .node_idx = indices[item_count], .phase = .evaluate });
+
+                // Push ValDefs in reverse order (so first ValDef is evaluated first)
+                if (item_count > 0) {
+                    i = item_count;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.pushWork(.{ .node_idx = indices[i], .phase = .evaluate });
+                    }
+                }
+            },
+
+            .func_value, .apply => {
+                // Function values and application - not yet implemented
+                return error.UnsupportedExpression;
             },
 
             .unsupported => {
@@ -292,12 +357,16 @@ pub const Evaluator = struct {
                 const cond = try self.popValue();
                 if (cond != .boolean) return error.TypeMismatch;
 
-                // Then branch at node_idx+2, else at node_idx+3
-                // (condition was at node_idx+1)
+                // Find then and else branch indices
+                // Condition is at node_idx+1, then after condition, else after then
+                const cond_idx = node_idx + 1;
+                const then_idx = self.findSubtreeEnd(cond_idx);
+                const else_idx = self.findSubtreeEnd(then_idx);
+
                 if (cond.boolean) {
-                    try self.pushWork(.{ .node_idx = node_idx + 2, .phase = .evaluate });
+                    try self.pushWork(.{ .node_idx = then_idx, .phase = .evaluate });
                 } else {
-                    try self.pushWork(.{ .node_idx = node_idx + 3, .phase = .evaluate });
+                    try self.pushWork(.{ .node_idx = else_idx, .phase = .evaluate });
                 }
             },
 
@@ -307,6 +376,16 @@ pub const Evaluator = struct {
 
             .calc_sha256 => {
                 try self.computeHash(.sha256);
+            },
+
+            .val_def => {
+                // Store the evaluated RHS in variable bindings
+                const var_id = node.data;
+                const value = try self.popValue();
+                if (var_id < max_var_bindings) {
+                    self.var_bindings[var_id] = value;
+                }
+                // val_def doesn't produce a value on the stack (Unit semantics)
             },
 
             else => {
@@ -459,6 +538,66 @@ pub const Evaluator = struct {
         if (self.cost_used > self.cost_limit) {
             return error.CostLimitExceeded;
         }
+    }
+
+    /// Find the index after a subtree (next sibling position)
+    /// This walks the tree structure to find where a subtree ends.
+    fn findSubtreeEnd(self: *const Evaluator, node_idx: u16) u16 {
+        if (node_idx >= self.tree.node_count) return self.tree.node_count;
+
+        const node = self.tree.nodes[node_idx];
+        var next = node_idx + 1;
+
+        switch (node.tag) {
+            // Leaf nodes - no children
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box => {},
+
+            // One child
+            .calc_blake2b256, .calc_sha256 => {
+                next = self.findSubtreeEnd(next);
+            },
+
+            // val_def has one child (RHS)
+            .val_def => {
+                next = self.findSubtreeEnd(next);
+            },
+
+            // Two children
+            .bin_op => {
+                next = self.findSubtreeEnd(next); // Left
+                next = self.findSubtreeEnd(next); // Right
+            },
+
+            // Three children
+            .if_then_else => {
+                next = self.findSubtreeEnd(next); // Condition
+                next = self.findSubtreeEnd(next); // Then
+                next = self.findSubtreeEnd(next); // Else
+            },
+
+            // block_value: item_count children + result
+            .block_value => {
+                const item_count = node.data;
+                var i: u16 = 0;
+                while (i < item_count) : (i += 1) {
+                    next = self.findSubtreeEnd(next);
+                }
+                next = self.findSubtreeEnd(next); // Result
+            },
+
+            // func_value: body expression
+            .func_value => {
+                next = self.findSubtreeEnd(next);
+            },
+
+            // apply: function + 1 arg (v5.x only single-arg)
+            .apply => {
+                next = self.findSubtreeEnd(next); // Function
+                next = self.findSubtreeEnd(next); // Arg
+            },
+        }
+
+        return next;
     }
 };
 
@@ -893,4 +1032,104 @@ test "evaluator: hash type mismatch" {
 
     var eval = Evaluator.init(&tree, &ctx);
     try std.testing.expectError(error.TypeMismatch, eval.evaluate());
+}
+
+test "evaluator: val_use undefined variable" {
+    // ValUse for undefined variable should error
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .val_use, .data = 0 };
+    tree.node_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectError(error.UndefinedVariable, eval.evaluate());
+}
+
+test "evaluator: simple block with one binding" {
+    // { val x = 42; x }
+    // Pre-order: [block_value(1), val_def(0), constant(42), val_use(0)]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .block_value, .data = 1 }; // 1 ValDef
+    tree.nodes[1] = .{ .tag = .val_def, .data = 0 }; // varId = 0
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // RHS = 42
+    tree.nodes[3] = .{ .tag = .val_use, .data = 0 }; // Result = x
+    tree.node_count = 4;
+    tree.values[0] = .{ .int = 42 };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .int);
+    try std.testing.expectEqual(@as(i32, 42), result.int);
+}
+
+test "evaluator: block with two bindings and addition" {
+    // { val x = 10; val y = 20; x + y }
+    // Pre-order:
+    //   [0] block_value(2)
+    //   [1] val_def(0)
+    //   [2] constant(10)
+    //   [3] val_def(1)
+    //   [4] constant(20)
+    //   [5] bin_op(plus)
+    //   [6] val_use(0)  <- x
+    //   [7] val_use(1)  <- y
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .block_value, .data = 2 }; // 2 ValDefs
+    tree.nodes[1] = .{ .tag = .val_def, .data = 0 }; // x
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // 10
+    tree.nodes[3] = .{ .tag = .val_def, .data = 1 }; // y
+    tree.nodes[4] = .{ .tag = .constant, .data = 1 }; // 20
+    tree.nodes[5] = .{ .tag = .bin_op, .data = @intFromEnum(BinOpKind.plus) };
+    tree.nodes[6] = .{ .tag = .val_use, .data = 0 }; // x
+    tree.nodes[7] = .{ .tag = .val_use, .data = 1 }; // y
+    tree.node_count = 8;
+    tree.values[0] = .{ .int = 10 };
+    tree.values[1] = .{ .int = 20 };
+    tree.value_count = 2;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .int);
+    try std.testing.expectEqual(@as(i32, 30), result.int);
+}
+
+test "evaluator: nested binary ops with proper tree navigation" {
+    // (1 + 2) + 3 to test that findSubtreeEnd works correctly
+    // Pre-order:
+    //   [0] bin_op(plus)
+    //   [1] bin_op(plus)
+    //   [2] constant(1)
+    //   [3] constant(2)
+    //   [4] constant(3)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .bin_op, .data = @intFromEnum(BinOpKind.plus) };
+    tree.nodes[1] = .{ .tag = .bin_op, .data = @intFromEnum(BinOpKind.plus) };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 };
+    tree.nodes[3] = .{ .tag = .constant, .data = 1 };
+    tree.nodes[4] = .{ .tag = .constant, .data = 2 };
+    tree.node_count = 5;
+    tree.values[0] = .{ .int = 1 };
+    tree.values[1] = .{ .int = 2 };
+    tree.values[2] = .{ .int = 3 };
+    tree.value_count = 3;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    try std.testing.expect(result == .int);
+    try std.testing.expectEqual(@as(i32, 6), result.int);
 }

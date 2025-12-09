@@ -65,6 +65,16 @@ pub const ExprTag = enum(u8) {
     calc_blake2b256,
     /// CalcSha256 hash (opcode 0xCC)
     calc_sha256,
+    /// Variable reference (opcode 0x72) - data = varId
+    val_use,
+    /// Variable definition (opcode 0x73) - data = varId
+    val_def,
+    /// Block with let bindings (opcode 0x74) - data = item count
+    block_value,
+    /// Function value / lambda (opcode for func expressions)
+    func_value,
+    /// Function application (opcode 0xF5)
+    apply,
     /// Unsupported opcode
     unsupported,
 };
@@ -125,6 +135,9 @@ pub const ExprNode = struct {
 // Deserializer State
 // ============================================================================
 
+/// Maximum number of variable definitions in a block
+const max_val_defs: usize = 64;
+
 /// Deserialized expression tree
 pub const ExprTree = struct {
     /// Expression nodes in pre-order (depth-first)
@@ -142,6 +155,10 @@ pub const ExprTree = struct {
     /// Type pool
     type_pool: TypePool = TypePool.init(),
 
+    /// ValDef type store: maps varId -> TypeIndex
+    /// Used during deserialization so ValUse can look up types
+    val_def_types: [max_val_defs]TypeIndex = [_]TypeIndex{TypePool.UNIT} ** max_val_defs,
+
     pub fn init() ExprTree {
         return .{};
     }
@@ -151,6 +168,22 @@ pub const ExprTree = struct {
         self.value_count = 0;
         self.constant_count = 0;
         self.type_pool.reset();
+        self.val_def_types = [_]TypeIndex{TypePool.UNIT} ** max_val_defs;
+    }
+
+    /// Register a ValDef type for later ValUse lookups
+    pub fn setValDefType(self: *ExprTree, var_id: u16, type_idx: TypeIndex) void {
+        if (var_id < max_val_defs) {
+            self.val_def_types[var_id] = type_idx;
+        }
+    }
+
+    /// Get the type of a ValDef by varId
+    pub fn getValDefType(self: *const ExprTree, var_id: u16) TypeIndex {
+        if (var_id < max_val_defs) {
+            return self.val_def_types[var_id];
+        }
+        return TypePool.UNIT; // Fallback
     }
 
     pub fn addNode(self: *ExprTree, node: ExprNode) error{ExpressionTooComplex}!u16 {
@@ -308,6 +341,12 @@ fn deserializeWithDepth(
             // Crypto hash operations (unary: input -> Coll[Byte])
             opcodes.CalcBlake2b256 => try deserializeUnaryOp(tree, reader, arena, .calc_blake2b256, depth),
             opcodes.CalcSha256 => try deserializeUnaryOp(tree, reader, arena, .calc_sha256, depth),
+            // Variable operations
+            opcodes.ValUse => try deserializeValUse(tree, reader),
+            opcodes.ValDef => try deserializeValDef(tree, reader, arena, depth),
+            opcodes.BlockValue => try deserializeBlockValue(tree, reader, arena, depth),
+            // Function application
+            opcodes.Apply => try deserializeApply(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -437,6 +476,112 @@ fn deserializeUnaryOp(
 
     // Parse the single operand
     try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeValUse(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+) DeserializeError!void {
+    // ValUse format: just the varId (VLQ)
+    // Type is looked up from val_def_types store
+    const var_id = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Look up the type from the ValDef store
+    const result_type = tree.getValDefType(@truncate(var_id));
+
+    _ = try tree.addNode(.{
+        .tag = .val_use,
+        .data = @truncate(var_id),
+        .result_type = result_type,
+    });
+}
+
+fn deserializeValDef(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // ValDef format: varId (VLQ) + optional tpeArgs + rhs expression
+    const var_id = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Record the node index for this ValDef
+    const node_idx = try tree.addNode(.{
+        .tag = .val_def,
+        .data = @truncate(var_id),
+    });
+
+    // Parse the right-hand side expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // The rhs node is at node_idx + 1 in pre-order layout
+    // Store its type for later ValUse lookups
+    if (node_idx + 1 < tree.node_count) {
+        const rhs_type = tree.nodes[node_idx + 1].result_type;
+        tree.setValDefType(@truncate(var_id), rhs_type);
+        // Update the ValDef's result_type to match rhs
+        tree.nodes[node_idx].result_type = rhs_type;
+    }
+}
+
+fn deserializeBlockValue(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // BlockValue format: item_count (VLQ) + items (ValDef/FunDef) + result expression
+    const item_count = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Add the block node first (pre-order)
+    const block_idx = try tree.addNode(.{
+        .tag = .block_value,
+        .data = @truncate(item_count),
+    });
+
+    // Parse each item (ValDef or FunDef)
+    var i: u32 = 0;
+    while (i < item_count) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+
+    // Parse the result expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Update block's result type from the result expression
+    // Result is the last parsed expression
+    if (tree.node_count > block_idx + 1) {
+        const result_node_idx = tree.node_count - 1;
+        // Walk back to find the result expression (after all ValDefs)
+        tree.nodes[block_idx].result_type = tree.nodes[result_node_idx].result_type;
+    }
+}
+
+fn deserializeApply(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Apply format: func expression + args count (VLQ) + args expressions
+    // Note: In v5.x only single-argument functions are supported
+
+    // Add the apply node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = .apply,
+    });
+
+    // Parse function expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse args count (should be 1 in practice)
+    const arg_count = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Parse each argument
+    var i: u32 = 0;
+    while (i < arg_count) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
 }
 
 fn mapVlqError(err: vlq.DecodeError) DeserializeError {
