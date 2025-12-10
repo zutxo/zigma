@@ -1204,12 +1204,12 @@ test "expr_serializer: deserialize nested binary ops" {
     var arena = BumpAllocator(256).init();
 
     // AND(GT(HEIGHT, 100), TRUE):
-    // 0xC0 (AND)
-    //   0x91 (GT)
-    //     0xA3 (HEIGHT)
+    // 0x96 (AND = 150 = 112 + 38)
+    //   0x91 (GT = 145 = 112 + 33)
+    //     0xA3 (HEIGHT = 163 = 112 + 51)
     //     0x04 0xC8 0x01 (Int 100)
-    //   0x7F (TRUE)
-    var reader = vlq.Reader.init(&[_]u8{ 0xC0, 0x91, 0xA3, 0x04, 0xC8, 0x01, 0x7F });
+    //   0x7F (TRUE = 127 = 112 + 15)
+    var reader = vlq.Reader.init(&[_]u8{ 0x96, 0x91, 0xA3, 0x04, 0xC8, 0x01, 0x7F });
     try deserialize(&tree, &reader, &arena);
 
     // Should have 5 nodes: AND, GT, HEIGHT, constant, TRUE
@@ -1228,8 +1228,8 @@ test "expr_serializer: deserialize ConstantPlaceholder" {
     var tree = ExprTree.init();
     var arena = BumpAllocator(256).init();
 
-    // ConstantPlaceholder with index 0: 0x76 0x00
-    var reader = vlq.Reader.init(&[_]u8{ 0x76, 0x00 });
+    // ConstantPlaceholder with index 0: 0x73 (115 = 112 + 3) 0x00
+    var reader = vlq.Reader.init(&[_]u8{ 0x73, 0x00 });
     try deserialize(&tree, &reader, &arena);
 
     try std.testing.expectEqual(@as(u16, 1), tree.node_count);
@@ -1250,10 +1250,10 @@ test "expr_serializer: deserialize ConcreteCollection empty" {
     var arena = BumpAllocator(256).init();
 
     // ConcreteCollection[Int]():
-    // 0xDC (ConcreteCollection)
+    // 0x83 (ConcreteCollection = 131 = 112 + 19)
     // 0x00 (numItems = 0)
     // 0x04 (element type = Int)
-    var reader = vlq.Reader.init(&[_]u8{ 0xDC, 0x00, 0x04 });
+    var reader = vlq.Reader.init(&[_]u8{ 0x83, 0x00, 0x04 });
     try deserialize(&tree, &reader, &arena);
 
     try std.testing.expectEqual(@as(u16, 1), tree.node_count);
@@ -1266,14 +1266,14 @@ test "expr_serializer: deserialize ConcreteCollection with Int elements" {
     var arena = BumpAllocator(256).init();
 
     // ConcreteCollection[Int](1, 2, 3):
-    // 0xDC (ConcreteCollection)
+    // 0x83 (ConcreteCollection = 131 = 112 + 19)
     // 0x03 (numItems = 3)
     // 0x04 (element type = Int)
     // 0x04 0x02 (Int 1)
     // 0x04 0x04 (Int 2)
     // 0x04 0x06 (Int 3)
     var reader = vlq.Reader.init(&[_]u8{
-        0xDC, 0x03, 0x04, // ConcreteCollection(3, Int)
+        0x83, 0x03, 0x04, // ConcreteCollection(3, Int)
         0x04, 0x02, // Int(1)
         0x04, 0x04, // Int(2)
         0x04, 0x06, // Int(3)
@@ -1299,12 +1299,12 @@ test "expr_serializer: deserialize nested ConcreteCollection" {
     var arena = BumpAllocator(256).init();
 
     // ConcreteCollection[Coll[Byte]](single element Coll[Byte]):
-    // 0xDC (ConcreteCollection)
+    // 0x83 (ConcreteCollection = 131 = 112 + 19)
     // 0x01 (numItems = 1)
     // 0x0E (element type = Coll[Byte] = 12 + 2)
     // Nested: 0x0E 0x02 0xAB 0xCD (Coll[Byte] with 2 bytes)
     var reader = vlq.Reader.init(&[_]u8{
-        0xDC, 0x01, 0x0E, // ConcreteCollection(1, Coll[Byte])
+        0x83, 0x01, 0x0E, // ConcreteCollection(1, Coll[Byte])
         0x0E, 0x02, 0xAB, 0xCD, // Coll[Byte] constant: 2 bytes, 0xAB 0xCD
     });
     try deserialize(&tree, &reader, &arena);
