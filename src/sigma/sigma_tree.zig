@@ -14,6 +14,10 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const secp256k1 = @import("../crypto/secp256k1.zig");
+const timing = @import("../crypto/timing.zig");
+
+const Point = secp256k1.Point;
 
 // ============================================================================
 // Cryptographic Primitive Types
@@ -26,7 +30,7 @@ pub const ProveDlog = struct {
     /// Public key: g^x (SEC1 compressed, 33 bytes)
     public_key: [33]u8,
 
-    /// Create from public key bytes
+    /// Create from public key bytes (no validation)
     pub fn init(pk: [33]u8) ProveDlog {
         // Precondition: public key has valid compressed prefix (0x02 or 0x03)
         assert(pk[0] == 0x02 or pk[0] == 0x03);
@@ -39,9 +43,30 @@ pub const ProveDlog = struct {
         return result;
     }
 
-    /// Check equality
+    /// Create from public key bytes with curve validation
+    /// CRITICAL: Use this for untrusted input to ensure point is on curve
+    pub fn initValidated(pk: [33]u8) !ProveDlog {
+        // PRECONDITION 1: valid compressed prefix
+        assert(pk[0] == 0x02 or pk[0] == 0x03 or isAllZeros(&pk));
+
+        // Validate point is on curve (or infinity)
+        _ = Point.decode(&pk) catch return error.InvalidGroupElement;
+
+        const result = ProveDlog{ .public_key = pk };
+
+        // POSTCONDITION: stored key matches input
+        assert(std.mem.eql(u8, &result.public_key, &pk));
+        return result;
+    }
+
+    /// Check equality (NOT constant-time)
     pub fn eql(a: ProveDlog, b: ProveDlog) bool {
         return std.mem.eql(u8, &a.public_key, &b.public_key);
+    }
+
+    /// Constant-time equality (for cryptographic use)
+    pub fn constantTimeEql(a: ProveDlog, b: ProveDlog) bool {
+        return timing.constantTimeEqlFixed(33, &a.public_key, &b.public_key);
     }
 };
 
@@ -58,14 +83,69 @@ pub const ProveDHTuple = struct {
     /// v = h^x (SEC1 compressed, 33 bytes)
     v: [33]u8,
 
-    /// Check equality
+    /// Create from raw bytes (no validation)
+    pub fn init(g: [33]u8, h: [33]u8, u: [33]u8, v: [33]u8) ProveDHTuple {
+        return .{ .g = g, .h = h, .u = u, .v = v };
+    }
+
+    /// Create from bytes with curve validation on all 4 points
+    /// CRITICAL: Use this for untrusted input
+    /// All 4 group elements MUST be validated before cryptographic use
+    pub fn initValidated(g: [33]u8, h: [33]u8, u: [33]u8, v: [33]u8) !ProveDHTuple {
+        // PRECONDITION 1: All points have valid prefix or are all-zeros (infinity)
+        assert(g[0] == 0x02 or g[0] == 0x03 or isAllZeros(&g));
+        assert(h[0] == 0x02 or h[0] == 0x03 or isAllZeros(&h));
+        assert(u[0] == 0x02 or u[0] == 0x03 or isAllZeros(&u));
+        assert(v[0] == 0x02 or v[0] == 0x03 or isAllZeros(&v));
+
+        // Validate all 4 points are on curve
+        _ = Point.decode(&g) catch return error.InvalidGroupElement;
+        _ = Point.decode(&h) catch return error.InvalidGroupElement;
+        _ = Point.decode(&u) catch return error.InvalidGroupElement;
+        _ = Point.decode(&v) catch return error.InvalidGroupElement;
+
+        const result = ProveDHTuple{ .g = g, .h = h, .u = u, .v = v };
+
+        // POSTCONDITION: all bytes stored correctly
+        assert(std.mem.eql(u8, &result.g, &g));
+        assert(std.mem.eql(u8, &result.h, &h));
+        assert(std.mem.eql(u8, &result.u, &u));
+        assert(std.mem.eql(u8, &result.v, &v));
+
+        return result;
+    }
+
+    /// Check equality (NOT constant-time)
     pub fn eql(a: ProveDHTuple, b: ProveDHTuple) bool {
         return std.mem.eql(u8, &a.g, &b.g) and
             std.mem.eql(u8, &a.h, &b.h) and
             std.mem.eql(u8, &a.u, &b.u) and
             std.mem.eql(u8, &a.v, &b.v);
     }
+
+    /// Constant-time equality (for cryptographic use)
+    /// CRITICAL: No early exit - always examines all bytes
+    pub fn constantTimeEql(a: ProveDHTuple, b: ProveDHTuple) bool {
+        const g_eq = timing.constantTimeEqlFixed(33, &a.g, &b.g);
+        const h_eq = timing.constantTimeEqlFixed(33, &a.h, &b.h);
+        const u_eq = timing.constantTimeEqlFixed(33, &a.u, &b.u);
+        const v_eq = timing.constantTimeEqlFixed(33, &a.v, &b.v);
+        // Combine results without short-circuit evaluation
+        return g_eq and h_eq and u_eq and v_eq;
+    }
 };
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Check if a byte array is all zeros (represents point at infinity)
+fn isAllZeros(bytes: []const u8) bool {
+    for (bytes) |b| {
+        if (b != 0) return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // SigmaBoolean Tree

@@ -13,6 +13,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const hash = @import("../crypto/hash.zig");
+const timing = @import("../crypto/timing.zig");
 const sigma_tree = @import("sigma_tree.zig");
 
 const SigmaBoolean = sigma_tree.SigmaBoolean;
@@ -100,9 +101,10 @@ pub const Challenge = struct {
         return c;
     }
 
-    /// Check equality
+    /// Check equality (constant-time to prevent timing attacks)
+    /// CRITICAL: Uses constant-time comparison - no early exit
     pub fn eql(self: Challenge, other: Challenge) bool {
-        return std.mem.eql(u8, &self.bytes, &other.bytes);
+        return timing.constantTimeEqlFixed(SOUNDNESS_BYTES, &self.bytes, &other.bytes);
     }
 
     /// Check if zero

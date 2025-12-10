@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const timing = @import("timing.zig");
 
 // ============================================================================
 // Error Types
@@ -109,10 +110,18 @@ pub const FieldElement = struct {
             self.limbs[2] == 0 and self.limbs[3] == 0;
     }
 
-    /// Check equality
+    /// Check equality (NOT constant-time - use constantTimeEql for crypto)
     pub fn eql(a: FieldElement, b: FieldElement) bool {
         return a.limbs[0] == b.limbs[0] and a.limbs[1] == b.limbs[1] and
             a.limbs[2] == b.limbs[2] and a.limbs[3] == b.limbs[3];
+    }
+
+    /// Constant-time equality comparison (for cryptographic use)
+    /// CRITICAL: No early exit - always examines all limbs
+    pub fn constantTimeEql(a: FieldElement, b: FieldElement) bool {
+        const a_bytes = a.toBytes();
+        const b_bytes = b.toBytes();
+        return timing.constantTimeEqlFixed(32, &a_bytes, &b_bytes);
     }
 
     /// Addition mod p
@@ -458,11 +467,19 @@ pub const Point = struct {
         return result;
     }
 
-    /// Check equality
+    /// Check equality (NOT constant-time - use constantTimeEql for crypto)
     pub fn eql(a: Point, b: Point) bool {
         if (a.is_infinity and b.is_infinity) return true;
         if (a.is_infinity != b.is_infinity) return false;
         return a.x.eql(b.x) and a.y.eql(b.y);
+    }
+
+    /// Constant-time equality comparison (for cryptographic use)
+    /// CRITICAL: No early exit - encodes both points and compares bytes
+    pub fn constantTimeEql(a: Point, b: Point) bool {
+        const a_bytes = a.encode();
+        const b_bytes = b.encode();
+        return timing.constantTimeEqlFixed(33, &a_bytes, &b_bytes);
     }
 
     /// Point negation: -P = (x, -y)
@@ -542,6 +559,7 @@ pub const Point = struct {
     }
 
     /// Scalar multiplication: k * P using double-and-add
+    /// WARNING: NOT constant-time - use mulConstantTime for crypto
     pub fn mul(self: Point, k: [4]u64) Point {
         // Precondition: point is valid (on curve or infinity)
         assert(self.is_infinity or self.isValid());
@@ -571,6 +589,88 @@ pub const Point = struct {
         // Postcondition: result is valid (on curve or infinity)
         assert(result.is_infinity or result.isValid());
         return result;
+    }
+
+    /// Constant-time scalar multiplication using Montgomery ladder
+    /// CRITICAL: Always performs same operations regardless of scalar bits
+    ///
+    /// Uses the Montgomery ladder algorithm which maintains two points R0 and R1
+    /// such that R1 - R0 = P throughout the computation. This provides:
+    /// - Constant-time execution (same ops for all scalar bits)
+    /// - Protection against simple power analysis
+    /// - Protection against timing attacks
+    pub fn mulConstantTime(self: Point, k: [4]u64) Point {
+        // Precondition: point is valid (on curve or infinity)
+        assert(self.is_infinity or self.isValid());
+
+        if (self.is_infinity) return infinity;
+
+        // Check for zero scalar (constant-time check)
+        const is_zero = timing.constantTimeEqU64(k[0] | k[1] | k[2] | k[3], 0);
+        if (is_zero == 1) return infinity;
+
+        // Montgomery ladder: maintain R0, R1 such that R1 = R0 + P
+        var r0 = infinity;
+        var r1 = self;
+
+        // Process bits from MSB to LSB
+        // Start from bit 255 (most significant) down to 0
+        var i: i32 = 255;
+        while (i >= 0) : (i -= 1) {
+            const bit_pos: u32 = @intCast(i);
+            const limb_idx = bit_pos / 64;
+            const bit_idx: u6 = @intCast(bit_pos % 64);
+            const bit: u1 = @truncate(k[limb_idx] >> bit_idx);
+
+            // Constant-time conditional swap: if bit == 1, swap R0 and R1
+            // This is the key to constant-time operation
+            conditionalSwapPoints(&r0, &r1, bit);
+
+            // After potential swap:
+            // bit == 0: r0 unchanged, r1 unchanged
+            // bit == 1: r0 <-> r1 swapped
+            r1 = r0.add(r1); // R1 = R0 + R1
+            r0 = r0.double(); // R0 = 2 * R0
+
+            // Swap back
+            conditionalSwapPoints(&r0, &r1, bit);
+        }
+
+        // Postcondition: result is valid (on curve or infinity)
+        assert(r0.is_infinity or r0.isValid());
+        return r0;
+    }
+
+    /// Helper: Constant-time conditional swap of two points
+    /// If choice == 1, swap a and b; if choice == 0, leave unchanged
+    /// CRITICAL: No branching on choice value
+    fn conditionalSwapPoints(a: *Point, b: *Point, choice: u1) void {
+        // Swap x coordinates
+        conditionalSwapFieldElements(&a.x, &b.x, choice);
+        // Swap y coordinates
+        conditionalSwapFieldElements(&a.y, &b.y, choice);
+        // Swap infinity flags
+        conditionalSwapBool(&a.is_infinity, &b.is_infinity, choice);
+    }
+
+    /// Helper: Constant-time conditional swap of two field elements
+    fn conditionalSwapFieldElements(a: *FieldElement, b: *FieldElement, choice: u1) void {
+        const mask: u64 = @as(u64, 0) -% @as(u64, choice);
+        for (0..4) |i| {
+            const diff = mask & (a.limbs[i] ^ b.limbs[i]);
+            a.limbs[i] ^= diff;
+            b.limbs[i] ^= diff;
+        }
+    }
+
+    /// Helper: Constant-time conditional swap of two bools
+    fn conditionalSwapBool(a: *bool, b: *bool, choice: u1) void {
+        const a_int: u8 = @intFromBool(a.*);
+        const b_int: u8 = @intFromBool(b.*);
+        const mask: u8 = @as(u8, 0) -% @as(u8, choice);
+        const diff = mask & (a_int ^ b_int);
+        a.* = (a_int ^ diff) != 0;
+        b.* = (b_int ^ diff) != 0;
     }
 };
 
@@ -700,4 +800,69 @@ test "secp256k1: invalid prefix rejected" {
     @memset(bad_encoding[1..], 0);
 
     try std.testing.expectError(error.InvalidEncoding, Point.decode(&bad_encoding));
+}
+
+// ============================================================================
+// Constant-Time Tests
+// ============================================================================
+
+test "secp256k1: constantTimeEql Point equal" {
+    try std.testing.expect(Point.G.constantTimeEql(Point.G));
+    try std.testing.expect(Point.infinity.constantTimeEql(Point.infinity));
+}
+
+test "secp256k1: constantTimeEql Point different" {
+    const two_g = Point.G.double();
+    try std.testing.expect(!Point.G.constantTimeEql(two_g));
+    try std.testing.expect(!Point.G.constantTimeEql(Point.infinity));
+}
+
+test "secp256k1: constantTimeEql FieldElement" {
+    const a = FieldElement.fromInt(42);
+    const b = FieldElement.fromInt(42);
+    const c = FieldElement.fromInt(43);
+
+    try std.testing.expect(a.constantTimeEql(b));
+    try std.testing.expect(!a.constantTimeEql(c));
+}
+
+test "secp256k1: mulConstantTime by 1" {
+    const result = Point.G.mulConstantTime(.{ 1, 0, 0, 0 });
+    try std.testing.expect(result.eql(Point.G));
+}
+
+test "secp256k1: mulConstantTime by 2" {
+    const result = Point.G.mulConstantTime(.{ 2, 0, 0, 0 });
+    const expected = Point.G.double();
+    try std.testing.expect(result.eql(expected));
+}
+
+test "secp256k1: mulConstantTime matches mul" {
+    // Test with various scalars
+    const scalars = [_][4]u64{
+        .{ 1, 0, 0, 0 },
+        .{ 2, 0, 0, 0 },
+        .{ 7, 0, 0, 0 },
+        .{ 256, 0, 0, 0 },
+        .{ 0xDEADBEEF, 0, 0, 0 },
+        .{ 0, 1, 0, 0 }, // Larger scalar
+    };
+
+    for (scalars) |k| {
+        const result_ct = Point.G.mulConstantTime(k);
+        const result_var = Point.G.mul(k);
+        try std.testing.expect(result_ct.eql(result_var));
+    }
+}
+
+test "secp256k1: mulConstantTime by 0" {
+    const result = Point.G.mulConstantTime(.{ 0, 0, 0, 0 });
+    try std.testing.expect(result.is_infinity);
+}
+
+test "secp256k1: mulConstantTime n * G = O (order test)" {
+    // n * G should equal infinity using constant-time mult
+    // This verifies Montgomery ladder correctness
+    const result = Point.G.mulConstantTime(N);
+    try std.testing.expect(result.is_infinity);
 }

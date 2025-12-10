@@ -16,9 +16,14 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const secp256k1 = @import("../crypto/secp256k1.zig");
+const gf2_192_poly = @import("../crypto/gf2_192_poly.zig");
 const challenge_mod = @import("challenge.zig");
 const sigma_tree = @import("sigma_tree.zig");
 const schnorr = @import("schnorr.zig");
+const dh_tuple = @import("dh_tuple.zig");
+
+const GF2_192 = @import("../crypto/gf2_192.zig").GF2_192;
+const GF2_192_Poly = gf2_192_poly.GF2_192_Poly;
 
 const Point = secp256k1.Point;
 const Challenge = challenge_mod.Challenge;
@@ -56,6 +61,10 @@ pub const VerifierError = error{
     ProofTooLarge,
     /// Proof tree exceeds maximum depth
     ProofTooDeep,
+    /// Invalid polynomial coefficients in THRESHOLD proof
+    InvalidPolynomial,
+    /// THRESHOLD k value is invalid
+    InvalidThreshold,
 };
 
 // ============================================================================
@@ -320,6 +329,100 @@ pub fn parseOrProof(
     };
 }
 
+/// Parse proof for a THRESHOLD node (k-of-n)
+///
+/// THRESHOLD challenge distribution uses polynomial interpolation over GF(2^192):
+/// - Root challenge is the polynomial's constant term (coeff0)
+/// - Additional n-k polynomial coefficients are read from the proof
+/// - Child i gets challenge Q(i) where Q is the polynomial
+///
+/// Proof structure:
+/// - Root challenge (24 bytes)
+/// - Polynomial coefficients 1..n-k (each 24 bytes)
+/// - Child proofs (each child is parsed recursively)
+pub fn parseThresholdProof(
+    k: u16,
+    children: []const *const SigmaBoolean,
+    reader: *ProofReader,
+    challenge_opt: ?Challenge,
+    ctx: *VerifierContext,
+) VerifierError!UncheckedTree {
+    const n = children.len;
+
+    // PRECONDITION: k must be valid (1 <= k <= n)
+    if (k == 0 or k > n) return error.InvalidThreshold;
+    // PRECONDITION: children count is bounded
+    assert(n <= MAX_CHILDREN);
+    // PRECONDITION: context has valid state
+    assert(ctx.node_count <= MAX_TREE_NODES);
+
+    // Step 1: Get root challenge
+    const root_challenge = challenge_opt orelse try reader.readChallenge();
+
+    // Step 2: Read n-k polynomial coefficients
+    // Polynomial has k coefficients total: coeff0 (root challenge) + k-1 additional
+    // Wait, re-reading the Scala: the polynomial is of degree n-k
+    // So we need n-k coefficients AFTER the constant term
+    // Total polynomial coefficients = n-k+1
+    const num_extra_coeffs = n - @as(usize, k);
+    const poly_bytes_len = num_extra_coeffs * SOUNDNESS_BYTES;
+    const poly_bytes = if (num_extra_coeffs > 0)
+        try reader.read(poly_bytes_len)
+    else
+        &[_]u8{};
+
+    // Step 3: Construct polynomial with root challenge as coeff0
+    const poly = GF2_192_Poly.fromRootAndMore(root_challenge.bytes, poly_bytes) catch
+        return error.InvalidPolynomial;
+
+    // Allocate from pre-allocated pool
+    var parsed_children = try ctx.allocateNodes(@intCast(n));
+
+    // Step 4: Parse each child with challenge Q(i) where i ∈ {1, 2, ..., n}
+    for (children, 0..) |child, i| {
+        // Child indices are 1-based (1, 2, ..., n)
+        const child_index: u8 = @intCast(i + 1);
+        const child_challenge_gf = poly.evaluateAt(child_index);
+        const child_challenge = Challenge{ .bytes = child_challenge_gf.toBytes() };
+
+        parsed_children[i] = try parseProofTree(child.*, reader, child_challenge, ctx);
+    }
+
+    // POSTCONDITION: all children parsed
+    assert(parsed_children.len == n);
+
+    return UncheckedTree{
+        .cthreshold = .{
+            .challenge = root_challenge,
+            .k = @intCast(k),
+            .children = parsed_children,
+            .polynomial_coeffs = poly_bytes,
+        },
+    };
+}
+
+/// Parse proof for ProveDHTuple
+/// Verifier Steps 1-3: Parse proof, get challenge, read response
+pub fn parseDHTupleProof(
+    proposition: ProveDHTuple,
+    reader: *ProofReader,
+    challenge_opt: ?Challenge,
+) VerifierError!UncheckedDHTuple {
+    // Step 2: Get challenge (either from parent or read from proof)
+    const challenge = challenge_opt orelse try reader.readChallenge();
+
+    // Step 3: Read response z
+    const response = try reader.readResponse();
+
+    return UncheckedDHTuple{
+        .proposition = proposition,
+        .challenge = challenge,
+        .response = response,
+        .commitment_a = null, // Will be computed in Step 4
+        .commitment_b = null,
+    };
+}
+
 /// Parse proof tree (uses context for pre-allocated storage)
 pub fn parseProofTree(
     prop: SigmaBoolean,
@@ -334,10 +437,10 @@ pub fn parseProofTree(
         .trivial_true => .trivial_true,
         .trivial_false => .trivial_false,
         .prove_dlog => |dlog| .{ .schnorr = try parseSchnorrProof(dlog, reader, challenge_opt) },
-        .prove_dh_tuple => error.UnsupportedProposition, // TODO: Phase 6.5
+        .prove_dh_tuple => |dht| .{ .dh_tuple = try parseDHTupleProof(dht, reader, challenge_opt) },
         .cand => |and_node| try parseAndProof(and_node.children, reader, challenge_opt, ctx),
         .cor => |or_node| try parseOrProof(or_node.children, reader, challenge_opt, ctx),
-        .cthreshold => error.UnsupportedProposition, // TODO: Phase 6.5
+        .cthreshold => |th| try parseThresholdProof(th.k, th.children, reader, challenge_opt, ctx),
     };
 }
 
@@ -368,6 +471,29 @@ fn computeSchnorrCommitment(unchecked: *UncheckedSchnorr) VerifierError!void {
     assert(unchecked.commitment != null);
 }
 
+/// Compute commitments for a DH tuple proof leaf
+/// a = g^z * u^(-e), b = h^z * v^(-e)
+fn computeDHTupleCommitment(unchecked: *UncheckedDHTuple) VerifierError!void {
+    // PRECONDITION: response has valid size
+    assert(unchecked.response.len == SCALAR_SIZE);
+    // PRECONDITION: commitments not already computed
+    assert(unchecked.commitment_a == null);
+    assert(unchecked.commitment_b == null);
+
+    const result = dh_tuple.computeCommitment(
+        unchecked.proposition,
+        unchecked.challenge,
+        dh_tuple.SecondMessage{ .z = unchecked.response },
+    ) catch return error.CommitmentMismatch;
+
+    unchecked.commitment_a = result.a;
+    unchecked.commitment_b = result.b;
+
+    // POSTCONDITION: both commitments are now set
+    assert(unchecked.commitment_a != null);
+    assert(unchecked.commitment_b != null);
+}
+
 /// Compute commitments for all leaves in the tree (non-recursive)
 /// Uses explicit work stack following TigerBeetle pattern
 pub fn computeCommitments(tree: *UncheckedTree) VerifierError!void {
@@ -396,7 +522,7 @@ pub fn computeCommitments(tree: *UncheckedTree) VerifierError!void {
         switch (node.*) {
             .trivial_true, .trivial_false => {},
             .schnorr => |*s| try computeSchnorrCommitment(s),
-            .dh_tuple => return error.UnsupportedProposition,
+            .dh_tuple => |*d| try computeDHTupleCommitment(d),
             .cand => |*and_node| {
                 // Push children (reverse order for correct processing)
                 try pushChildren(and_node.children, &work_stack, &work_sp);
@@ -404,7 +530,9 @@ pub fn computeCommitments(tree: *UncheckedTree) VerifierError!void {
             .cor => |*or_node| {
                 try pushChildren(or_node.children, &work_stack, &work_sp);
             },
-            .cthreshold => return error.UnsupportedProposition,
+            .cthreshold => |*th_node| {
+                try pushChildren(th_node.children, &work_stack, &work_sp);
+            },
         }
     }
 
@@ -515,7 +643,7 @@ fn serializeForFiatShamir(tree: *const UncheckedTree, buffer: []u8) VerifierErro
         switch (node.*) {
             .trivial_true, .trivial_false => return error.UnsupportedProposition,
             .schnorr => |s| try serializeSchnorrLeaf(&s, buffer, &pos),
-            .dh_tuple => return error.UnsupportedProposition,
+            .dh_tuple => |d| try serializeDHTupleLeaf(&d, buffer, &pos),
             .cand => |and_node| {
                 try serializeConnectiveHeader(.and_connective, and_node.children.len, buffer, &pos);
                 try pushChildrenConst(and_node.children, &work_stack, &work_sp);
@@ -524,7 +652,10 @@ fn serializeForFiatShamir(tree: *const UncheckedTree, buffer: []u8) VerifierErro
                 try serializeConnectiveHeader(.or_connective, or_node.children.len, buffer, &pos);
                 try pushChildrenConst(or_node.children, &work_stack, &work_sp);
             },
-            .cthreshold => return error.UnsupportedProposition,
+            .cthreshold => |th_node| {
+                try serializeThresholdHeader(th_node.k, th_node.children.len, buffer, &pos);
+                try pushChildrenConst(th_node.children, &work_stack, &work_sp);
+            },
         }
     }
 
@@ -567,7 +698,54 @@ fn serializeSchnorrLeaf(s: *const UncheckedSchnorr, buffer: []u8, pos: *usize) V
     // POSTCONDITION: wrote exactly 73 bytes
 }
 
-/// Serialize AND/OR/THRESHOLD header for Fiat-Shamir
+/// Serialize a DH tuple leaf node for Fiat-Shamir
+/// Format: LEAF_PREFIX || propLen || propBytes || commitLen || commitBytes
+/// propBytes = 0x08 || ProveDHTuple opcode || g || h || u || v (134 bytes)
+/// commitBytes = a || b (66 bytes)
+fn serializeDHTupleLeaf(d: *const UncheckedDHTuple, buffer: []u8, pos: *usize) VerifierError!void {
+    // PRECONDITION: sufficient buffer space (1 + 2 + 134 + 2 + 66 = 205 bytes)
+    if (pos.* + 205 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: commitments computed
+    const commitment_a = d.commitment_a orelse return error.CommitmentMismatch;
+    const commitment_b = d.commitment_b orelse return error.CommitmentMismatch;
+
+    // Leaf prefix
+    buffer[pos.*] = challenge_mod.LEAF_PREFIX;
+    pos.* += 1;
+
+    // Proposition bytes (0x08 || ProveDHTuple opcode || g || h || u || v = 134 bytes)
+    const prop_len: i16 = 134;
+    buffer[pos.*] = @intCast((prop_len >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(prop_len & 0xFF);
+    pos.* += 2;
+    buffer[pos.*] = 0x08; // ErgoTree header v0
+    buffer[pos.* + 1] = 0xce; // ProveDHTuple opcode
+    pos.* += 2;
+    @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.g);
+    pos.* += 33;
+    @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.h);
+    pos.* += 33;
+    @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.u);
+    pos.* += 33;
+    @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.v);
+    pos.* += 33;
+
+    // Commitment bytes (a || b = 66 bytes)
+    const commit_a_bytes = commitment_a.encode();
+    const commit_b_bytes = commitment_b.encode();
+    const commit_len: i16 = 66;
+    buffer[pos.*] = @intCast((commit_len >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(commit_len & 0xFF);
+    pos.* += 2;
+    @memcpy(buffer[pos.* .. pos.* + 33], &commit_a_bytes);
+    pos.* += 33;
+    @memcpy(buffer[pos.* .. pos.* + 33], &commit_b_bytes);
+    pos.* += 33;
+
+    // POSTCONDITION: wrote exactly 205 bytes
+}
+
+/// Serialize AND/OR header for Fiat-Shamir
 fn serializeConnectiveHeader(
     connective: challenge_mod.ConjectureType,
     children_count: usize,
@@ -590,6 +768,38 @@ fn serializeConnectiveHeader(
     pos.* += 2;
 
     // POSTCONDITION: wrote exactly 4 bytes
+}
+
+/// Serialize THRESHOLD header for Fiat-Shamir
+/// Format: INTERNAL_NODE_PREFIX || threshold_type || children_count (i16) || k (u8)
+fn serializeThresholdHeader(
+    k: u8,
+    children_count: usize,
+    buffer: []u8,
+    pos: *usize,
+) VerifierError!void {
+    // PRECONDITION: sufficient buffer space (1 + 1 + 2 + 1 = 5 bytes)
+    if (pos.* + 5 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: children count bounded
+    assert(children_count <= MAX_CHILDREN);
+    // PRECONDITION: k is valid
+    assert(k >= 1 and k <= children_count);
+
+    buffer[pos.*] = challenge_mod.INTERNAL_NODE_PREFIX;
+    pos.* += 1;
+    buffer[pos.*] = @intFromEnum(challenge_mod.ConjectureType.threshold);
+    pos.* += 1;
+
+    const count_i16: i16 = @intCast(children_count);
+    buffer[pos.*] = @intCast((count_i16 >> 8) & 0xFF);
+    buffer[pos.* + 1] = @intCast(count_i16 & 0xFF);
+    pos.* += 2;
+
+    // k value (threshold)
+    buffer[pos.*] = k;
+    pos.* += 1;
+
+    // POSTCONDITION: wrote exactly 5 bytes
 }
 
 /// Push const children onto work stack in reverse order
