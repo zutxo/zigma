@@ -125,6 +125,8 @@ pub const ExprTag = enum(u8) {
     fold,
     /// Filter: Coll[A] × (A → Boolean) → Coll[A] (opcode 0xB5)
     filter,
+    /// FlatMap: Coll[A] × (A → Coll[B]) → Coll[B] (opcode 0xB8)
+    flat_map,
 
     // Header field extraction opcodes (0xE9-0xF2)
     /// Extract version byte from Header (opcode 0xE9)
@@ -453,9 +455,14 @@ fn deserializeWithDepth(
             opcodes.MultiplyGroup => try deserializeBinaryGroupOp(tree, reader, arena, .multiply_group, depth),
             // Tuple operations
             opcodes.SelectField => try deserializeSelectField(tree, reader, arena, depth),
+            opcodes.Select1 => try deserializeSelectN(tree, reader, arena, 0, depth),
+            opcodes.Select2 => try deserializeSelectN(tree, reader, arena, 1, depth),
+            opcodes.Select3 => try deserializeSelectN(tree, reader, arena, 2, depth),
+            opcodes.Select4 => try deserializeSelectN(tree, reader, arena, 3, depth),
+            opcodes.Select5 => try deserializeSelectN(tree, reader, arena, 4, depth),
             opcodes.Tuple => try deserializeTuple(tree, reader, arena, depth),
-            opcodes.PairConstructor => try deserializePairConstructor(tree, reader, arena, depth),
-            opcodes.TripleConstructor => try deserializeTripleConstructor(tree, reader, arena, depth),
+            // NOTE: PairConstructor/TripleConstructor not in canonical Scala opcodes
+            // Tuple construction uses the Tuple opcode with element count from type
             // Type conversion operations
             opcodes.Upcast => try deserializeUpcast(tree, reader, arena, depth),
             opcodes.Downcast => try deserializeDowncast(tree, reader, arena, depth),
@@ -467,6 +474,7 @@ fn deserializeWithDepth(
             opcodes.ForAll => try deserializeCollectionHOF(tree, reader, arena, .for_all, depth),
             opcodes.Fold => try deserializeFold(tree, reader, arena, depth),
             opcodes.Filter => try deserializeCollectionHOF(tree, reader, arena, .filter, depth),
+            opcodes.FlatMapCollection => try deserializeCollectionHOF(tree, reader, arena, .flat_map, depth),
             // FuncValue
             opcodes.FuncValue => try deserializeFuncValue(tree, reader, arena, depth),
             else => {
@@ -517,8 +525,8 @@ fn deserializeConstant(
         };
     };
 
-    // Parse the value
-    const value = data_serializer.deserialize(type_idx, &tree.type_pool, reader, arena) catch |e| {
+    // Parse the value (pass null for value_pool - not needed during deserialization)
+    const value = data_serializer.deserialize(type_idx, &tree.type_pool, reader, arena, null) catch |e| {
         return switch (e) {
             error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
             error.Overflow => error.Overflow,
@@ -785,6 +793,35 @@ fn deserializeSelectField(
         .data = @truncate(field_idx -| 1), // Convert 1-based to 0-based, saturating
         .result_type = TypePool.ANY, // Determined at runtime from tuple type
     });
+
+    // Parse the tuple expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+/// Deserialize Select1-5 (fixed field index, no VLQ)
+fn deserializeSelectN(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    field_idx: u16,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(field_idx < 5); // Select1-5 only (0-4)
+    assert(depth < max_expr_depth); // Depth not exceeded
+    assert(tree.node_count < tree.nodes.len); // Space available in tree
+
+    // Select1-5 format: just the tuple expression (field index is implicit from opcode)
+
+    // Add the select_field node first (pre-order)
+    const node_idx = try tree.addNode(.{
+        .tag = .select_field,
+        .data = field_idx, // Already 0-based (Select1 = 0, Select2 = 1, etc.)
+        .result_type = TypePool.ANY, // Determined at runtime from tuple type
+    });
+
+    // POSTCONDITION: Node was added
+    assert(node_idx < tree.node_count);
 
     // Parse the tuple expression
     try deserializeWithDepth(tree, reader, arena, depth + 1);

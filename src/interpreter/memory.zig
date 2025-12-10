@@ -12,6 +12,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const types = @import("../core/types.zig");
+const value_pool = @import("value_pool.zig");
+
+pub const ValuePool = value_pool.ValuePool;
 
 // ============================================================================
 // Configuration
@@ -287,6 +290,9 @@ pub const EvalPools = struct {
     /// Type pool (shared, rarely changes)
     type_pool: types.TypePool,
 
+    /// Value pool for nested/complex values (Options, Tuples, Collections)
+    values: ValuePool,
+
     /// Value stack for computation
     value_stack: StackAllocator(ValueIndex, max_value_stack),
 
@@ -306,6 +312,7 @@ pub const EvalPools = struct {
     pub fn init() EvalPools {
         return .{
             .type_pool = types.TypePool.init(),
+            .values = ValuePool.init(),
             .value_stack = StackAllocator(ValueIndex, max_value_stack).init(),
             .bindings = BindingMap(ValueIndex, max_bindings).init(),
             .frames = StackAllocator(FrameMarker, max_eval_depth).init(),
@@ -322,6 +329,7 @@ pub const EvalPools = struct {
         self.frames.reset();
         self.arena.reset();
         self.type_pool.reset();
+        self.values.reset();
         self.cost_used = 0;
     }
 

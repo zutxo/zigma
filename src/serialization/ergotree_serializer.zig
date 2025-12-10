@@ -247,8 +247,8 @@ fn parseConstants(
             };
         };
 
-        // Parse value
-        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena) catch |e| {
+        // Parse value (pass null for value_pool - not needed during deserialization)
+        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, null) catch |e| {
             return switch (e) {
                 error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
                 error.Overflow => error.Overflow,

@@ -48,171 +48,227 @@ pub const OpInfo = struct {
 };
 
 // ============================================================================
-// Opcode Constants
+// Opcode Constants - CANONICAL VALUES FROM SCALA OpCodes.scala
 // ============================================================================
+// Formula: opcode = 112 (LastConstantCode) + shift
+// Source: sigmastate/data/shared/src/main/scala/sigma/serialization/OpCodes.scala
 
 /// Constant type range (used for constant encoding)
 pub const constant_first: OpCode = 1;
 pub const constant_last: OpCode = 111;
 
-/// Variable operations
-pub const TaggedVariable: OpCode = 113; // 0x71
-pub const ValUse: OpCode = 114; // 0x72
-pub const ValDef: OpCode = 115; // 0x73 (NOTE: Wrong! Should be 214 per Scala - see zigma-a5q)
-pub const FunDef: OpCode = 117; // 0x75 (NOTE: Wrong! Should be 215 per Scala - see zigma-a5q)
-pub const BlockValue: OpCode = 116; // 0x74 (NOTE: Wrong! Should be 216 per Scala - see zigma-a5q)
-pub const FuncValue: OpCode = 131; // 0x83 (NOTE: Wrong! Should be 217 per Scala - see zigma-a5q) - using 131 to avoid conflict
+// ---------------------------------------------------------------------------
+// Variables (shift 1-4)
+// ---------------------------------------------------------------------------
+pub const TaggedVariable: OpCode = 113; // shift 1
+pub const ValUse: OpCode = 114; // shift 2
+pub const ConstantPlaceholder: OpCode = 115; // shift 3
+pub const SubstConstants: OpCode = 116; // shift 4
 
-/// Boolean literals
-pub const TrueLeaf: OpCode = 127; // 0x7F
-pub const FalseLeaf: OpCode = 128; // 0x80
-pub const UnitConstant: OpCode = 129; // 0x81
+// ---------------------------------------------------------------------------
+// Type conversions (shift 10-14)
+// ---------------------------------------------------------------------------
+pub const LongToByteArray: OpCode = 122; // shift 10
+pub const ByteArrayToBigInt: OpCode = 123; // shift 11
+pub const ByteArrayToLong: OpCode = 124; // shift 12
+pub const Downcast: OpCode = 125; // shift 13
+pub const Upcast: OpCode = 126; // shift 14
 
-/// Constant operations
-pub const ConstantPlaceholder: OpCode = 118; // 0x76
-pub const SubstConstants: OpCode = 119; // 0x77
-pub const LongToByteArray: OpCode = 120; // 0x78
-pub const ByteArrayToBigInt: OpCode = 121; // 0x79
-pub const ByteArrayToLong: OpCode = 122; // 0x7A
+// ---------------------------------------------------------------------------
+// Literals (shift 15-21)
+// ---------------------------------------------------------------------------
+pub const TrueLeaf: OpCode = 127; // shift 15
+pub const FalseLeaf: OpCode = 128; // shift 16
+pub const UnitConstant: OpCode = 129; // shift 17
+pub const GroupGenerator: OpCode = 130; // shift 18
+pub const ConcreteCollection: OpCode = 131; // shift 19
+// reserved: shift 20
+pub const ConcreteCollectionBooleanConstant: OpCode = 133; // shift 21
 
-/// Serialization operations
-pub const Deserialize: OpCode = 130; // 0x82
+// ---------------------------------------------------------------------------
+// Tuple operations (shift 22-28)
+// ---------------------------------------------------------------------------
+pub const Tuple: OpCode = 134; // shift 22
+pub const Select1: OpCode = 135; // shift 23
+pub const Select2: OpCode = 136; // shift 24
+pub const Select3: OpCode = 137; // shift 25
+pub const Select4: OpCode = 138; // shift 26
+pub const Select5: OpCode = 139; // shift 27
+pub const SelectField: OpCode = 140; // shift 28
 
-/// Comparison operations (shift 31-36)
-pub const LT: OpCode = 143; // 0x8F - less than
-pub const LE: OpCode = 144; // 0x90 - less or equal
-pub const GT: OpCode = 145; // 0x91 - greater than
-pub const GE: OpCode = 146; // 0x92 - greater or equal
-pub const EQ: OpCode = 147; // 0x93 - equality
-pub const NEQ: OpCode = 148; // 0x94 - inequality
+// ---------------------------------------------------------------------------
+// Relations (shift 31-40)
+// ---------------------------------------------------------------------------
+pub const LT: OpCode = 143; // shift 31
+pub const LE: OpCode = 144; // shift 32
+pub const GT: OpCode = 145; // shift 33
+pub const GE: OpCode = 146; // shift 34
+pub const EQ: OpCode = 147; // shift 35
+pub const NEQ: OpCode = 148; // shift 36
+pub const If: OpCode = 149; // shift 37
+pub const AND: OpCode = 150; // shift 38
+pub const OR: OpCode = 151; // shift 39
+pub const AtLeast: OpCode = 152; // shift 40
 
-/// Conditional
-pub const If: OpCode = 149; // 0x95
+// ---------------------------------------------------------------------------
+// Arithmetic (shift 41-50)
+// ---------------------------------------------------------------------------
+pub const Minus: OpCode = 153; // shift 41
+pub const Plus: OpCode = 154; // shift 42
+pub const Xor: OpCode = 155; // shift 43 - byte array XOR
+pub const Multiply: OpCode = 156; // shift 44
+pub const Division: OpCode = 157; // shift 45
+pub const Modulo: OpCode = 158; // shift 46
+pub const Exponentiate: OpCode = 159; // shift 47
+pub const MultiplyGroup: OpCode = 160; // shift 48
+pub const Min: OpCode = 161; // shift 49
+pub const Max: OpCode = 162; // shift 50
 
-/// Arithmetic operations (shift 41-50)
-pub const Minus: OpCode = 153; // 0x99
-pub const Plus: OpCode = 154; // 0x9A
-pub const Multiply: OpCode = 156; // 0x9C
-pub const Division: OpCode = 157; // 0x9D
-pub const Modulo: OpCode = 158; // 0x9E
-pub const Negation: OpCode = 155; // 0x9B
-pub const Min: OpCode = 159; // 0x9F
-pub const Max: OpCode = 160; // 0xA0
+// ---------------------------------------------------------------------------
+// Environment/Context (shift 51-60)
+// ---------------------------------------------------------------------------
+pub const Height: OpCode = 163; // shift 51
+pub const Inputs: OpCode = 164; // shift 52
+pub const Outputs: OpCode = 165; // shift 53
+pub const LastBlockUtxoRootHash: OpCode = 166; // shift 54
+pub const Self: OpCode = 167; // shift 55
+// reserved: shift 56-59
+pub const MinerPubkey: OpCode = 172; // shift 60
 
-/// Context operations (shift 51-60)
-pub const Height: OpCode = 163; // 0xA3
-pub const Inputs: OpCode = 164; // 0xA4
-pub const Outputs: OpCode = 165; // 0xA5
-pub const LastBlockUtxoRootHash: OpCode = 166; // 0xA6
-pub const Self: OpCode = 167; // 0xA7
-pub const Context: OpCode = 168; // 0xA8
-pub const Global: OpCode = 169; // 0xA9
-pub const MinerPubKey: OpCode = 170; // 0xAA
+// ---------------------------------------------------------------------------
+// Collection operations (shift 61-72)
+// ---------------------------------------------------------------------------
+pub const MapCollection: OpCode = 173; // shift 61
+pub const Exists: OpCode = 174; // shift 62
+pub const ForAll: OpCode = 175; // shift 63
+pub const Fold: OpCode = 176; // shift 64
+pub const SizeOf: OpCode = 177; // shift 65
+pub const ByIndex: OpCode = 178; // shift 66
+pub const Append: OpCode = 179; // shift 67
+pub const Slice: OpCode = 180; // shift 68
+pub const Filter: OpCode = 181; // shift 69
+pub const AvlTree: OpCode = 182; // shift 70
+pub const AvlTreeGet: OpCode = 183; // shift 71
+pub const FlatMapCollection: OpCode = 184; // shift 72
 
-/// Collection operations (shift 61-80)
-pub const MapCollection: OpCode = 173; // 0xAD
-pub const Exists: OpCode = 174; // 0xAE
-pub const ForAll: OpCode = 175; // 0xAF
-pub const Fold: OpCode = 176; // 0xB0
-pub const SizeOf: OpCode = 177; // 0xB1
-pub const ByIndex: OpCode = 178; // 0xB2
-pub const Slice: OpCode = 179; // 0xB3
-pub const Append: OpCode = 180; // 0xB4
-pub const Filter: OpCode = 181; // 0xB5
-pub const Flatmap: OpCode = 182; // 0xB6
-pub const Zip: OpCode = 183; // 0xB7
-pub const Indices: OpCode = 184; // 0xB8
-pub const GetVar: OpCode = 185; // 0xB9
-pub const OptionGet: OpCode = 186; // 0xBA
-pub const OptionIsDefined: OpCode = 187; // 0xBB
-pub const OptionGetOrElse: OpCode = 188; // 0xBC
+// ---------------------------------------------------------------------------
+// Box operations (shift 81-87)
+// ---------------------------------------------------------------------------
+pub const ExtractAmount: OpCode = 193; // shift 81
+pub const ExtractScriptBytes: OpCode = 194; // shift 82
+pub const ExtractBytes: OpCode = 195; // shift 83
+pub const ExtractBytesWithNoRef: OpCode = 196; // shift 84
+pub const ExtractId: OpCode = 197; // shift 85
+pub const ExtractRegisterAs: OpCode = 198; // shift 86
+pub const ExtractCreationInfo: OpCode = 199; // shift 87
 
-/// Tuple operations
-pub const SelectField: OpCode = 189; // 0xBD
-pub const Tuple: OpCode = 190; // 0xBE
+// ---------------------------------------------------------------------------
+// Crypto (shift 91-99)
+// ---------------------------------------------------------------------------
+pub const CalcBlake2b256: OpCode = 203; // shift 91
+pub const CalcSha256: OpCode = 204; // shift 92
+pub const ProveDlog: OpCode = 205; // shift 93
+pub const ProveDHTuple: OpCode = 206; // shift 94
+pub const SigmaPropIsProven: OpCode = 207; // shift 95
+pub const SigmaPropBytes: OpCode = 208; // shift 96
+pub const BoolToSigmaProp: OpCode = 209; // shift 97
+pub const TrivialPropFalse: OpCode = 210; // shift 98
+pub const TrivialPropTrue: OpCode = 211; // shift 99
 
-/// Logical operations
-pub const LogicalNot: OpCode = 191; // 0xBF
-pub const AND: OpCode = 192; // 0xC0 (binary logical and)
-pub const OR: OpCode = 193; // 0xC1 (binary logical or)
-pub const XorOf: OpCode = 255; // 0xFF
+// ---------------------------------------------------------------------------
+// Deserialization (shift 100-101)
+// ---------------------------------------------------------------------------
+pub const DeserializeContext: OpCode = 212; // shift 100
+pub const DeserializeRegister: OpCode = 213; // shift 101
 
-/// Bitwise operations
-pub const BitOr: OpCode = 194; // 0xC2
-pub const BitAnd: OpCode = 195; // 0xC3
-pub const BitXor: OpCode = 196; // 0xC4
-pub const BitNot: OpCode = 197; // 0xC5
-pub const BitShiftLeft: OpCode = 198; // 0xC6
-pub const BitShiftRight: OpCode = 199; // 0xC7
-pub const BitShiftRightZeroed: OpCode = 200; // 0xC8
+// ---------------------------------------------------------------------------
+// Block/Function (shift 102-109)
+// ---------------------------------------------------------------------------
+pub const ValDef: OpCode = 214; // shift 102
+pub const FunDef: OpCode = 215; // shift 103
+pub const BlockValue: OpCode = 216; // shift 104
+pub const FuncValue: OpCode = 217; // shift 105
+pub const FuncApply: OpCode = 218; // shift 106
+pub const PropertyCall: OpCode = 219; // shift 107
+pub const MethodCall: OpCode = 220; // shift 108
+pub const Global: OpCode = 221; // shift 109
 
-/// Sigma protocol operations
-pub const SigmaAnd: OpCode = 201; // 0xC9
-pub const SigmaOr: OpCode = 202; // 0xCA
-pub const AtLeast: OpCode = 209; // 0xD1
+// ---------------------------------------------------------------------------
+// Option constructors (shift 110-111) - deprecated in Scala
+// ---------------------------------------------------------------------------
+pub const SomeValue: OpCode = 222; // shift 110 - deprecated
+pub const NoneValue: OpCode = 223; // shift 111 - deprecated
 
-/// Crypto operations (shift 91-100)
-pub const CalcBlake2b256: OpCode = 203; // 0xCB
-pub const CalcSha256: OpCode = 204; // 0xCC
-pub const ProveDlog: OpCode = 205; // 0xCD
-pub const ProveDHTuple: OpCode = 206; // 0xCE
-pub const DecodePoint: OpCode = 208; // 0xD0
-pub const GroupGenerator: OpCode = 210; // 0xD2
-pub const Exponentiate: OpCode = 211; // 0xD3
-pub const MultiplyGroup: OpCode = 212; // 0xD4
+// ---------------------------------------------------------------------------
+// Option operations (shift 115-118)
+// ---------------------------------------------------------------------------
+pub const GetVar: OpCode = 227; // shift 115
+pub const OptionGet: OpCode = 228; // shift 116
+pub const OptionGetOrElse: OpCode = 229; // shift 117
+pub const OptionIsDefined: OpCode = 230; // shift 118
 
-/// Box operations (shift 101-110)
-pub const ExtractRegisterAs: OpCode = 213; // 0xD5
-pub const ExtractAmount: OpCode = 214; // 0xD6
-pub const ExtractScriptBytes: OpCode = 215; // 0xD7
-pub const ExtractBytes: OpCode = 216; // 0xD8
-pub const ExtractBytesWithNoRef: OpCode = 217; // 0xD9
-pub const ExtractId: OpCode = 218; // 0xDA
-pub const ExtractCreationInfo: OpCode = 219; // 0xDB
+// ---------------------------------------------------------------------------
+// Modular arithmetic (shift 119-121) - deprecated in Scala
+// ---------------------------------------------------------------------------
+pub const ModQ: OpCode = 231; // shift 119 - deprecated
+pub const PlusModQ: OpCode = 232; // shift 120 - deprecated
+pub const MinusModQ: OpCode = 233; // shift 121 - deprecated
 
-/// Collection constructors
-pub const ConcreteCollection: OpCode = 220; // 0xDC
-pub const PairConstructor: OpCode = 221; // 0xDD
-pub const TripleConstructor: OpCode = 222; // 0xDE
+// ---------------------------------------------------------------------------
+// Sigma operations (shift 122-125)
+// ---------------------------------------------------------------------------
+pub const SigmaAnd: OpCode = 234; // shift 122
+pub const SigmaOr: OpCode = 235; // shift 123
+pub const BinOr: OpCode = 236; // shift 124
+pub const BinAnd: OpCode = 237; // shift 125
 
-/// AVL tree operations
-pub const TreeLookup: OpCode = 223; // 0xDF
-pub const CreateAvlTree: OpCode = 224; // 0xE0
-pub const TreeModifications: OpCode = 225; // 0xE1
+// ---------------------------------------------------------------------------
+// More crypto (shift 126)
+// ---------------------------------------------------------------------------
+pub const DecodePoint: OpCode = 238; // shift 126
 
-/// String/byte operations
-pub const ByteArrayToString: OpCode = 226; // 0xE2
-pub const StringToByteArray: OpCode = 227; // 0xE3
+// ---------------------------------------------------------------------------
+// Unary operations (shift 127-131)
+// ---------------------------------------------------------------------------
+pub const LogicalNot: OpCode = 239; // shift 127
+pub const Negation: OpCode = 240; // shift 128
+pub const BitInversion: OpCode = 241; // shift 129
+pub const BitOr: OpCode = 242; // shift 130
+pub const BitAnd: OpCode = 243; // shift 131
 
-/// Type operations
-pub const Upcast: OpCode = 228; // 0xE4
-pub const Downcast: OpCode = 229; // 0xE5
+// ---------------------------------------------------------------------------
+// XOR operations (shift 132-133)
+// ---------------------------------------------------------------------------
+pub const BinXor: OpCode = 244; // shift 132
+pub const BitXor: OpCode = 245; // shift 133
 
-/// Logical collection operations
-pub const AllOf: OpCode = 230; // 0xE6
-pub const AnyOf: OpCode = 231; // 0xE7
+// ---------------------------------------------------------------------------
+// Bit shifts (shift 134-136)
+// ---------------------------------------------------------------------------
+pub const BitShiftRight: OpCode = 246; // shift 134
+pub const BitShiftLeft: OpCode = 247; // shift 135
+pub const BitShiftRightZeroed: OpCode = 248; // shift 136
 
-/// Serialization
-pub const Serialize: OpCode = 232; // 0xE8
+// ---------------------------------------------------------------------------
+// Collection shifts (shift 137-141) - deprecated in Scala
+// ---------------------------------------------------------------------------
+pub const CollShiftRight: OpCode = 249; // shift 137 - deprecated
+pub const CollShiftLeft: OpCode = 250; // shift 138 - deprecated
+pub const CollShiftRightZeroed: OpCode = 251; // shift 139 - deprecated
+pub const CollRotateLeft: OpCode = 252; // shift 140 - deprecated
+pub const CollRotateRight: OpCode = 253; // shift 141 - deprecated
 
-/// Header operations
-pub const ExtractVersion: OpCode = 233; // 0xE9
-pub const ExtractParentId: OpCode = 234; // 0xEA
-pub const ExtractAdProofsRoot: OpCode = 235; // 0xEB
-pub const ExtractStateRoot: OpCode = 236; // 0xEC
-pub const ExtractTransactionsRoot: OpCode = 237; // 0xED
-pub const ExtractTimestamp: OpCode = 238; // 0xEE
-pub const ExtractNBits: OpCode = 239; // 0xEF
-pub const ExtractDifficulty: OpCode = 240; // 0xF0
-pub const ExtractVotes: OpCode = 241; // 0xF1
-pub const ExtractMinerRewards: OpCode = 242; // 0xF2
+// ---------------------------------------------------------------------------
+// Context and XorOf (shift 142-143)
+// ---------------------------------------------------------------------------
+pub const Context: OpCode = 254; // shift 142
+pub const XorOf: OpCode = 255; // shift 143
 
-/// Property access (method calls)
-pub const PropertyCall: OpCode = 243; // 0xF3
-pub const MethodCall: OpCode = 244; // 0xF4
-
-/// Apply function
-pub const Apply: OpCode = 245; // 0xF5
+// ---------------------------------------------------------------------------
+// Legacy aliases for backwards compatibility
+// ---------------------------------------------------------------------------
+pub const Apply: OpCode = FuncApply;
+pub const MinerPubKey: OpCode = MinerPubkey; // case-insensitive alias
 
 // ============================================================================
 // Opcode Metadata Table
@@ -224,164 +280,166 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         // Constants (type codes) - no cost as they're handled specially
         constant_first...constant_last => null,
 
-        // Variables
+        // Variables (shift 1-4)
         TaggedVariable => .{ .name = "TaggedVariable", .code = TaggedVariable, .category = .variable, .cost = 10 },
         ValUse => .{ .name = "ValUse", .code = ValUse, .category = .variable, .cost = 10 },
-        ValDef => .{ .name = "ValDef", .code = ValDef, .category = .control, .cost = 10 },
-        FunDef => .{ .name = "FunDef", .code = FunDef, .category = .control, .cost = 10 },
-        BlockValue => .{ .name = "BlockValue", .code = BlockValue, .category = .control, .cost = 10 },
-        FuncValue => .{ .name = "FuncValue", .code = FuncValue, .category = .control, .cost = 20 },
-
-        // Literals
-        TrueLeaf => .{ .name = "TrueLeaf", .code = TrueLeaf, .category = .literal, .cost = 10 },
-        FalseLeaf => .{ .name = "FalseLeaf", .code = FalseLeaf, .category = .literal, .cost = 10 },
-        UnitConstant => .{ .name = "UnitConstant", .code = UnitConstant, .category = .literal, .cost = 10 },
-
-        // Constants
         ConstantPlaceholder => .{ .name = "ConstantPlaceholder", .code = ConstantPlaceholder, .category = .constant, .cost = 10 },
         SubstConstants => .{ .name = "SubstConstants", .code = SubstConstants, .category = .special, .cost = 100 },
+
+        // Type conversions (shift 10-14)
         LongToByteArray => .{ .name = "LongToByteArray", .code = LongToByteArray, .category = .type_ops, .cost = 17 },
         ByteArrayToBigInt => .{ .name = "ByteArrayToBigInt", .code = ByteArrayToBigInt, .category = .type_ops, .cost = 30 },
         ByteArrayToLong => .{ .name = "ByteArrayToLong", .code = ByteArrayToLong, .category = .type_ops, .cost = 16 },
+        Downcast => .{ .name = "Downcast", .code = Downcast, .category = .type_ops, .cost = 10 },
+        Upcast => .{ .name = "Upcast", .code = Upcast, .category = .type_ops, .cost = 10 },
 
-        // Serialization
-        Deserialize => .{ .name = "Deserialize", .code = Deserialize, .category = .special, .cost = 100 },
+        // Literals (shift 15-21)
+        TrueLeaf => .{ .name = "TrueLeaf", .code = TrueLeaf, .category = .literal, .cost = 10 },
+        FalseLeaf => .{ .name = "FalseLeaf", .code = FalseLeaf, .category = .literal, .cost = 10 },
+        UnitConstant => .{ .name = "UnitConstant", .code = UnitConstant, .category = .literal, .cost = 10 },
+        GroupGenerator => .{ .name = "GroupGenerator", .code = GroupGenerator, .category = .crypto, .cost = 10 },
+        ConcreteCollection => .{ .name = "ConcreteCollection", .code = ConcreteCollection, .category = .collection, .cost = 20 },
+        ConcreteCollectionBooleanConstant => .{ .name = "ConcreteCollectionBooleanConstant", .code = ConcreteCollectionBooleanConstant, .category = .collection, .cost = 20 },
 
-        // Comparison
+        // Tuple operations (shift 22-28)
+        Tuple => .{ .name = "Tuple", .code = Tuple, .category = .collection, .cost = 10 },
+        Select1 => .{ .name = "Select1", .code = Select1, .category = .collection, .cost = 10 },
+        Select2 => .{ .name = "Select2", .code = Select2, .category = .collection, .cost = 10 },
+        Select3 => .{ .name = "Select3", .code = Select3, .category = .collection, .cost = 10 },
+        Select4 => .{ .name = "Select4", .code = Select4, .category = .collection, .cost = 10 },
+        Select5 => .{ .name = "Select5", .code = Select5, .category = .collection, .cost = 10 },
+        SelectField => .{ .name = "SelectField", .code = SelectField, .category = .collection, .cost = 10 },
+
+        // Relations (shift 31-40)
         LT => .{ .name = "LT", .code = LT, .category = .comparison, .cost = 36 },
         LE => .{ .name = "LE", .code = LE, .category = .comparison, .cost = 36 },
         GT => .{ .name = "GT", .code = GT, .category = .comparison, .cost = 36 },
         GE => .{ .name = "GE", .code = GE, .category = .comparison, .cost = 36 },
         EQ => .{ .name = "EQ", .code = EQ, .category = .comparison, .cost = 36 },
         NEQ => .{ .name = "NEQ", .code = NEQ, .category = .comparison, .cost = 36 },
-
-        // Conditional
         If => .{ .name = "If", .code = If, .category = .control, .cost = 10 },
+        AND => .{ .name = "AND", .code = AND, .category = .logical, .cost = 36 },
+        OR => .{ .name = "OR", .code = OR, .category = .logical, .cost = 36 },
+        AtLeast => .{ .name = "AtLeast", .code = AtLeast, .category = .sigma, .cost = 100 },
 
-        // Arithmetic
+        // Arithmetic (shift 41-50)
         Minus => .{ .name = "Minus", .code = Minus, .category = .arithmetic, .cost = 36 },
         Plus => .{ .name = "Plus", .code = Plus, .category = .arithmetic, .cost = 36 },
+        Xor => .{ .name = "Xor", .code = Xor, .category = .bitwise, .cost = 36 },
         Multiply => .{ .name = "Multiply", .code = Multiply, .category = .arithmetic, .cost = 41 },
         Division => .{ .name = "Division", .code = Division, .category = .arithmetic, .cost = 41 },
         Modulo => .{ .name = "Modulo", .code = Modulo, .category = .arithmetic, .cost = 41 },
-        Negation => .{ .name = "Negation", .code = Negation, .category = .arithmetic, .cost = 30 },
+        Exponentiate => .{ .name = "Exponentiate", .code = Exponentiate, .category = .crypto, .cost = 5100 },
+        MultiplyGroup => .{ .name = "MultiplyGroup", .code = MultiplyGroup, .category = .crypto, .cost = 250 },
         Min => .{ .name = "Min", .code = Min, .category = .arithmetic, .cost = 36 },
         Max => .{ .name = "Max", .code = Max, .category = .arithmetic, .cost = 36 },
 
-        // Context
+        // Environment/Context (shift 51-60)
         Height => .{ .name = "Height", .code = Height, .category = .context, .cost = 26 },
         Inputs => .{ .name = "Inputs", .code = Inputs, .category = .context, .cost = 10 },
         Outputs => .{ .name = "Outputs", .code = Outputs, .category = .context, .cost = 10 },
         LastBlockUtxoRootHash => .{ .name = "LastBlockUtxoRootHash", .code = LastBlockUtxoRootHash, .category = .context, .cost = 15 },
         Self => .{ .name = "Self", .code = Self, .category = .context, .cost = 10 },
-        Context => .{ .name = "Context", .code = Context, .category = .context, .cost = 10 },
-        Global => .{ .name = "Global", .code = Global, .category = .context, .cost = 10 },
-        MinerPubKey => .{ .name = "MinerPubKey", .code = MinerPubKey, .category = .context, .cost = 100 },
+        MinerPubkey => .{ .name = "MinerPubkey", .code = MinerPubkey, .category = .context, .cost = 100 },
 
-        // Collection operations
+        // Collection operations (shift 61-72)
         MapCollection => .{ .name = "MapCollection", .code = MapCollection, .category = .collection, .cost = 20, .per_item_cost = 1 },
         Exists => .{ .name = "Exists", .code = Exists, .category = .collection, .cost = 20, .per_item_cost = 1 },
         ForAll => .{ .name = "ForAll", .code = ForAll, .category = .collection, .cost = 20, .per_item_cost = 1 },
         Fold => .{ .name = "Fold", .code = Fold, .category = .collection, .cost = 20, .per_item_cost = 1 },
         SizeOf => .{ .name = "SizeOf", .code = SizeOf, .category = .collection, .cost = 14 },
         ByIndex => .{ .name = "ByIndex", .code = ByIndex, .category = .collection, .cost = 30 },
-        Slice => .{ .name = "Slice", .code = Slice, .category = .collection, .cost = 20, .per_item_cost = 2 },
         Append => .{ .name = "Append", .code = Append, .category = .collection, .cost = 20, .per_item_cost = 2 },
+        Slice => .{ .name = "Slice", .code = Slice, .category = .collection, .cost = 20, .per_item_cost = 2 },
         Filter => .{ .name = "Filter", .code = Filter, .category = .collection, .cost = 20, .per_item_cost = 1 },
-        Flatmap => .{ .name = "Flatmap", .code = Flatmap, .category = .collection, .cost = 60, .per_item_cost = 10 },
-        Zip => .{ .name = "Zip", .code = Zip, .category = .collection, .cost = 20, .per_item_cost = 1 },
-        Indices => .{ .name = "Indices", .code = Indices, .category = .collection, .cost = 20, .per_item_cost = 1 },
-        GetVar => .{ .name = "GetVar", .code = GetVar, .category = .collection, .cost = 100 },
-        OptionGet => .{ .name = "OptionGet", .code = OptionGet, .category = .collection, .cost = 15 },
-        OptionIsDefined => .{ .name = "OptionIsDefined", .code = OptionIsDefined, .category = .collection, .cost = 15 },
-        OptionGetOrElse => .{ .name = "OptionGetOrElse", .code = OptionGetOrElse, .category = .collection, .cost = 20 },
+        AvlTree => .{ .name = "AvlTree", .code = AvlTree, .category = .crypto, .cost = 100 },
+        AvlTreeGet => .{ .name = "AvlTreeGet", .code = AvlTreeGet, .category = .crypto, .cost = 200 },
+        FlatMapCollection => .{ .name = "FlatMapCollection", .code = FlatMapCollection, .category = .collection, .cost = 60, .per_item_cost = 10 },
 
-        // Tuple
-        SelectField => .{ .name = "SelectField", .code = SelectField, .category = .collection, .cost = 10 },
-        Tuple => .{ .name = "Tuple", .code = Tuple, .category = .collection, .cost = 10 },
-
-        // Logical
-        LogicalNot => .{ .name = "LogicalNot", .code = LogicalNot, .category = .logical, .cost = 11 },
-        AND => .{ .name = "AND", .code = AND, .category = .logical, .cost = 36 },
-        OR => .{ .name = "OR", .code = OR, .category = .logical, .cost = 36 },
-        XorOf => .{ .name = "XorOf", .code = XorOf, .category = .logical, .cost = 20 },
-
-        // Bitwise
-        BitOr => .{ .name = "BitOr", .code = BitOr, .category = .bitwise, .cost = 36 },
-        BitAnd => .{ .name = "BitAnd", .code = BitAnd, .category = .bitwise, .cost = 36 },
-        BitXor => .{ .name = "BitXor", .code = BitXor, .category = .bitwise, .cost = 36 },
-        BitNot => .{ .name = "BitNot", .code = BitNot, .category = .bitwise, .cost = 30 },
-        BitShiftLeft => .{ .name = "BitShiftLeft", .code = BitShiftLeft, .category = .bitwise, .cost = 36 },
-        BitShiftRight => .{ .name = "BitShiftRight", .code = BitShiftRight, .category = .bitwise, .cost = 36 },
-        BitShiftRightZeroed => .{ .name = "BitShiftRightZeroed", .code = BitShiftRightZeroed, .category = .bitwise, .cost = 36 },
-
-        // Sigma
-        SigmaAnd => .{ .name = "SigmaAnd", .code = SigmaAnd, .category = .sigma, .cost = 20 },
-        SigmaOr => .{ .name = "SigmaOr", .code = SigmaOr, .category = .sigma, .cost = 20 },
-        AtLeast => .{ .name = "AtLeast", .code = AtLeast, .category = .sigma, .cost = 100 },
-
-        // Crypto
-        CalcBlake2b256 => .{ .name = "CalcBlake2b256", .code = CalcBlake2b256, .category = .crypto, .cost = 59, .per_item_cost = 1 },
-        CalcSha256 => .{ .name = "CalcSha256", .code = CalcSha256, .category = .crypto, .cost = 64, .per_item_cost = 1 },
-        ProveDlog => .{ .name = "ProveDlog", .code = ProveDlog, .category = .crypto, .cost = 100 },
-        ProveDHTuple => .{ .name = "ProveDHTuple", .code = ProveDHTuple, .category = .crypto, .cost = 200 },
-        DecodePoint => .{ .name = "DecodePoint", .code = DecodePoint, .category = .crypto, .cost = 1100 },
-        GroupGenerator => .{ .name = "GroupGenerator", .code = GroupGenerator, .category = .crypto, .cost = 10 },
-        Exponentiate => .{ .name = "Exponentiate", .code = Exponentiate, .category = .crypto, .cost = 5100 },
-        MultiplyGroup => .{ .name = "MultiplyGroup", .code = MultiplyGroup, .category = .crypto, .cost = 250 },
-
-        // Box operations
-        ExtractRegisterAs => .{ .name = "ExtractRegisterAs", .code = ExtractRegisterAs, .category = .box_ops, .cost = 50 },
+        // Box operations (shift 81-87)
         ExtractAmount => .{ .name = "ExtractAmount", .code = ExtractAmount, .category = .box_ops, .cost = 12 },
         ExtractScriptBytes => .{ .name = "ExtractScriptBytes", .code = ExtractScriptBytes, .category = .box_ops, .cost = 20 },
         ExtractBytes => .{ .name = "ExtractBytes", .code = ExtractBytes, .category = .box_ops, .cost = 100 },
         ExtractBytesWithNoRef => .{ .name = "ExtractBytesWithNoRef", .code = ExtractBytesWithNoRef, .category = .box_ops, .cost = 20 },
         ExtractId => .{ .name = "ExtractId", .code = ExtractId, .category = .box_ops, .cost = 12 },
+        ExtractRegisterAs => .{ .name = "ExtractRegisterAs", .code = ExtractRegisterAs, .category = .box_ops, .cost = 50 },
         ExtractCreationInfo => .{ .name = "ExtractCreationInfo", .code = ExtractCreationInfo, .category = .box_ops, .cost = 16 },
 
-        // Collection constructors
-        ConcreteCollection => .{ .name = "ConcreteCollection", .code = ConcreteCollection, .category = .collection, .cost = 20 },
-        PairConstructor => .{ .name = "PairConstructor", .code = PairConstructor, .category = .collection, .cost = 10 },
-        TripleConstructor => .{ .name = "TripleConstructor", .code = TripleConstructor, .category = .collection, .cost = 10 },
+        // Crypto (shift 91-99)
+        CalcBlake2b256 => .{ .name = "CalcBlake2b256", .code = CalcBlake2b256, .category = .crypto, .cost = 59, .per_item_cost = 1 },
+        CalcSha256 => .{ .name = "CalcSha256", .code = CalcSha256, .category = .crypto, .cost = 64, .per_item_cost = 1 },
+        ProveDlog => .{ .name = "ProveDlog", .code = ProveDlog, .category = .crypto, .cost = 100 },
+        ProveDHTuple => .{ .name = "ProveDHTuple", .code = ProveDHTuple, .category = .crypto, .cost = 200 },
+        SigmaPropIsProven => .{ .name = "SigmaPropIsProven", .code = SigmaPropIsProven, .category = .sigma, .cost = 20 },
+        SigmaPropBytes => .{ .name = "SigmaPropBytes", .code = SigmaPropBytes, .category = .sigma, .cost = 35 },
+        BoolToSigmaProp => .{ .name = "BoolToSigmaProp", .code = BoolToSigmaProp, .category = .sigma, .cost = 15 },
+        TrivialPropFalse => .{ .name = "TrivialPropFalse", .code = TrivialPropFalse, .category = .sigma, .cost = 10 },
+        TrivialPropTrue => .{ .name = "TrivialPropTrue", .code = TrivialPropTrue, .category = .sigma, .cost = 10 },
 
-        // AVL tree
-        TreeLookup => .{ .name = "TreeLookup", .code = TreeLookup, .category = .crypto, .cost = 200 },
-        CreateAvlTree => .{ .name = "CreateAvlTree", .code = CreateAvlTree, .category = .crypto, .cost = 100 },
-        TreeModifications => .{ .name = "TreeModifications", .code = TreeModifications, .category = .crypto, .cost = 300 },
+        // Deserialization (shift 100-101)
+        DeserializeContext => .{ .name = "DeserializeContext", .code = DeserializeContext, .category = .special, .cost = 100 },
+        DeserializeRegister => .{ .name = "DeserializeRegister", .code = DeserializeRegister, .category = .special, .cost = 100 },
 
-        // String/byte operations
-        ByteArrayToString => .{ .name = "ByteArrayToString", .code = ByteArrayToString, .category = .type_ops, .cost = 50 },
-        StringToByteArray => .{ .name = "StringToByteArray", .code = StringToByteArray, .category = .type_ops, .cost = 50 },
-
-        // Type operations
-        Upcast => .{ .name = "Upcast", .code = Upcast, .category = .type_ops, .cost = 10 },
-        Downcast => .{ .name = "Downcast", .code = Downcast, .category = .type_ops, .cost = 10 },
-
-        // Logical collection operations
-        AllOf => .{ .name = "AllOf", .code = AllOf, .category = .logical, .cost = 20, .per_item_cost = 1 },
-        AnyOf => .{ .name = "AnyOf", .code = AnyOf, .category = .logical, .cost = 20, .per_item_cost = 1 },
-
-        // Serialization
-        Serialize => .{ .name = "Serialize", .code = Serialize, .category = .special, .cost = 100 },
-
-        // Header operations
-        ExtractVersion => .{ .name = "ExtractVersion", .code = ExtractVersion, .category = .box_ops, .cost = 10 },
-        ExtractParentId => .{ .name = "ExtractParentId", .code = ExtractParentId, .category = .box_ops, .cost = 10 },
-        ExtractAdProofsRoot => .{ .name = "ExtractAdProofsRoot", .code = ExtractAdProofsRoot, .category = .box_ops, .cost = 10 },
-        ExtractStateRoot => .{ .name = "ExtractStateRoot", .code = ExtractStateRoot, .category = .box_ops, .cost = 10 },
-        ExtractTransactionsRoot => .{ .name = "ExtractTransactionsRoot", .code = ExtractTransactionsRoot, .category = .box_ops, .cost = 10 },
-        ExtractTimestamp => .{ .name = "ExtractTimestamp", .code = ExtractTimestamp, .category = .box_ops, .cost = 10 },
-        ExtractNBits => .{ .name = "ExtractNBits", .code = ExtractNBits, .category = .box_ops, .cost = 10 },
-        ExtractDifficulty => .{ .name = "ExtractDifficulty", .code = ExtractDifficulty, .category = .box_ops, .cost = 10 },
-        ExtractVotes => .{ .name = "ExtractVotes", .code = ExtractVotes, .category = .box_ops, .cost = 10 },
-        ExtractMinerRewards => .{ .name = "ExtractMinerRewards", .code = ExtractMinerRewards, .category = .box_ops, .cost = 10 },
-
-        // Property/method access
+        // Block/Function (shift 102-109)
+        ValDef => .{ .name = "ValDef", .code = ValDef, .category = .control, .cost = 10 },
+        FunDef => .{ .name = "FunDef", .code = FunDef, .category = .control, .cost = 10 },
+        BlockValue => .{ .name = "BlockValue", .code = BlockValue, .category = .control, .cost = 10 },
+        FuncValue => .{ .name = "FuncValue", .code = FuncValue, .category = .control, .cost = 20 },
+        FuncApply => .{ .name = "FuncApply", .code = FuncApply, .category = .control, .cost = 20 },
         PropertyCall => .{ .name = "PropertyCall", .code = PropertyCall, .category = .special, .cost = 10 },
         MethodCall => .{ .name = "MethodCall", .code = MethodCall, .category = .special, .cost = 10 },
+        Global => .{ .name = "Global", .code = Global, .category = .context, .cost = 10 },
 
-        // Apply
-        Apply => .{ .name = "Apply", .code = Apply, .category = .control, .cost = 20 },
+        // Option constructors (shift 110-111) - deprecated
+        SomeValue => .{ .name = "SomeValue", .code = SomeValue, .category = .collection, .cost = 15 },
+        NoneValue => .{ .name = "NoneValue", .code = NoneValue, .category = .collection, .cost = 10 },
+
+        // Option operations (shift 115-118)
+        GetVar => .{ .name = "GetVar", .code = GetVar, .category = .context, .cost = 100 },
+        OptionGet => .{ .name = "OptionGet", .code = OptionGet, .category = .collection, .cost = 15 },
+        OptionGetOrElse => .{ .name = "OptionGetOrElse", .code = OptionGetOrElse, .category = .collection, .cost = 20 },
+        OptionIsDefined => .{ .name = "OptionIsDefined", .code = OptionIsDefined, .category = .collection, .cost = 15 },
+
+        // Modular arithmetic (shift 119-121) - deprecated
+        ModQ => .{ .name = "ModQ", .code = ModQ, .category = .crypto, .cost = 100 },
+        PlusModQ => .{ .name = "PlusModQ", .code = PlusModQ, .category = .crypto, .cost = 100 },
+        MinusModQ => .{ .name = "MinusModQ", .code = MinusModQ, .category = .crypto, .cost = 100 },
+
+        // Sigma operations (shift 122-125)
+        SigmaAnd => .{ .name = "SigmaAnd", .code = SigmaAnd, .category = .sigma, .cost = 20 },
+        SigmaOr => .{ .name = "SigmaOr", .code = SigmaOr, .category = .sigma, .cost = 20 },
+        BinOr => .{ .name = "BinOr", .code = BinOr, .category = .logical, .cost = 36 },
+        BinAnd => .{ .name = "BinAnd", .code = BinAnd, .category = .logical, .cost = 36 },
+
+        // More crypto (shift 126)
+        DecodePoint => .{ .name = "DecodePoint", .code = DecodePoint, .category = .crypto, .cost = 1100 },
+
+        // Unary operations (shift 127-131)
+        LogicalNot => .{ .name = "LogicalNot", .code = LogicalNot, .category = .logical, .cost = 11 },
+        Negation => .{ .name = "Negation", .code = Negation, .category = .arithmetic, .cost = 30 },
+        BitInversion => .{ .name = "BitInversion", .code = BitInversion, .category = .bitwise, .cost = 30 },
+        BitOr => .{ .name = "BitOr", .code = BitOr, .category = .bitwise, .cost = 36 },
+        BitAnd => .{ .name = "BitAnd", .code = BitAnd, .category = .bitwise, .cost = 36 },
+
+        // XOR operations (shift 132-133)
+        BinXor => .{ .name = "BinXor", .code = BinXor, .category = .logical, .cost = 36 },
+        BitXor => .{ .name = "BitXor", .code = BitXor, .category = .bitwise, .cost = 36 },
+
+        // Bit shifts (shift 134-136)
+        BitShiftRight => .{ .name = "BitShiftRight", .code = BitShiftRight, .category = .bitwise, .cost = 36 },
+        BitShiftLeft => .{ .name = "BitShiftLeft", .code = BitShiftLeft, .category = .bitwise, .cost = 36 },
+        BitShiftRightZeroed => .{ .name = "BitShiftRightZeroed", .code = BitShiftRightZeroed, .category = .bitwise, .cost = 36 },
+
+        // Collection shifts (shift 137-141) - deprecated
+        CollShiftRight => .{ .name = "CollShiftRight", .code = CollShiftRight, .category = .collection, .cost = 50 },
+        CollShiftLeft => .{ .name = "CollShiftLeft", .code = CollShiftLeft, .category = .collection, .cost = 50 },
+        CollShiftRightZeroed => .{ .name = "CollShiftRightZeroed", .code = CollShiftRightZeroed, .category = .collection, .cost = 50 },
+        CollRotateLeft => .{ .name = "CollRotateLeft", .code = CollRotateLeft, .category = .collection, .cost = 50 },
+        CollRotateRight => .{ .name = "CollRotateRight", .code = CollRotateRight, .category = .collection, .cost = 50 },
+
+        // Context and XorOf (shift 142-143)
+        Context => .{ .name = "Context", .code = Context, .category = .context, .cost = 10 },
+        XorOf => .{ .name = "XorOf", .code = XorOf, .category = .logical, .cost = 20 },
 
         else => null,
     };

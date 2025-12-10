@@ -15,6 +15,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const context = @import("context.zig");
 const memory = @import("memory.zig");
+const value_pool = @import("value_pool.zig");
 const expr = @import("../serialization/expr_serializer.zig");
 const data = @import("../serialization/data_serializer.zig");
 const types = @import("../core/types.zig");
@@ -29,6 +30,9 @@ const BinOpKind = expr.BinOpKind;
 const Value = data.Value;
 const TypePool = types.TypePool;
 const BumpAllocator = memory.BumpAllocator;
+const ValuePool = value_pool.ValuePool;
+const PooledValue = value_pool.PooledValue;
+const null_value_idx = value_pool.null_value_idx;
 
 // ============================================================================
 // Configuration
@@ -54,6 +58,40 @@ comptime {
     assert(max_work_stack >= 64);
     assert(max_value_stack >= 64);
     assert(default_cost_limit > 0);
+}
+
+// ============================================================================
+// Value Conversion
+// ============================================================================
+
+/// Convert a PooledValue back to a Value.
+/// This is used when extracting values from Options, Tuples, and Collections.
+fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
+    // PRECONDITION: pooled value must be valid
+    assert(pooled.type_idx != 0 or pooled.data.primitive == 0); // 0 type only valid for unit
+
+    return switch (pooled.type_idx) {
+        TypePool.UNIT => .unit,
+        TypePool.BOOLEAN => .{ .boolean = pooled.data.primitive != 0 },
+        TypePool.BYTE => .{ .byte = @intCast(pooled.data.primitive) },
+        TypePool.SHORT => .{ .short = @intCast(pooled.data.primitive) },
+        TypePool.INT => .{ .int = @intCast(pooled.data.primitive) },
+        TypePool.LONG => .{ .long = pooled.data.primitive },
+        TypePool.BIG_INT => blk: {
+            var bi: Value.BigInt = .{
+                .bytes = [_]u8{0} ** 32,
+                .len = pooled.data.big_int.len,
+            };
+            @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
+            break :blk .{ .big_int = bi };
+        },
+        TypePool.GROUP_ELEMENT => .{ .group_element = pooled.data.group_element },
+        else => {
+            // Complex types (coll, option, tuple, box) need type-specific handling
+            // For now, return error for unsupported types
+            return error.UnsupportedExpression;
+        },
+    };
 }
 
 // ============================================================================
@@ -97,6 +135,10 @@ pub const EvalError = error{
     IndexOutOfBounds,
     /// Invalid context state (missing headers, etc.)
     InvalidContext,
+    /// Invalid internal state (corrupted pool, etc.)
+    InvalidState,
+    /// Collection exceeds protocol size limit
+    CollectionTooLarge,
 };
 
 // ============================================================================
@@ -188,6 +230,18 @@ pub const Evaluator = struct {
     /// Tuples reference ranges in this array
     values: [max_value_stack]Value = undefined,
     values_sp: u16 = 0,
+
+    /// Memory pools for complex value storage (Options, nested types)
+    pools: MemoryPools = MemoryPools.init(),
+
+    /// Memory pools container
+    const MemoryPools = struct {
+        values: ValuePool = ValuePool.init(),
+
+        fn init() MemoryPools {
+            return .{};
+        }
+    };
 
     pub fn init(tree: *const ExprTree, ctx: *const Context) Evaluator {
         return .{
@@ -548,7 +602,7 @@ pub const Evaluator = struct {
             },
 
             // Collection higher-order functions
-            .map_collection, .exists, .for_all, .filter => {
+            .map_collection, .exists, .for_all, .filter, .flat_map => {
                 // Binary: collection + lambda → result
                 // We evaluate the collection first, then handle lambda in compute phase
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
@@ -632,10 +686,11 @@ pub const Evaluator = struct {
                 const opt_val = try self.popValue();
                 if (opt_val != .option) return error.TypeMismatch;
 
-                if (opt_val.option.value_idx) |_| {
-                    // Some(x) - need to get the inner value
-                    // For now we don't have proper Option value storage, error out
-                    return error.UnsupportedExpression;
+                if (opt_val.option.isSome()) {
+                    // Some(x) - get the inner value from ValuePool
+                    const inner = self.pools.values.get(opt_val.option.value_idx) orelse return error.InvalidState;
+                    const result = try pooledValueToValue(inner);
+                    try self.pushValue(result);
                 } else {
                     // None - evaluate the default expression
                     const default_idx = self.findSubtreeEnd(node_idx + 1);
@@ -705,6 +760,7 @@ pub const Evaluator = struct {
             .map_collection => try self.computeMap(node_idx),
             .filter => try self.computeFilter(node_idx),
             .fold => try self.computeFold(node_idx),
+            .flat_map => try self.computeFlatMap(node_idx),
 
             else => {
                 // Other node types don't need compute phase
@@ -763,25 +819,11 @@ pub const Evaluator = struct {
         // INVARIANT: Option type is well-formed
         assert(opt_val.option.inner_type != 0); // Has valid inner type
 
-        if (opt_val.option.value_idx) |idx| {
-            if (idx == 0) {
-                // Simple value stored inline - extract based on inner_type
-                const inner_type = opt_val.option.inner_type;
-                const simple_val = opt_val.option.simple_value;
-
-                const result: Value = switch (inner_type) {
-                    TypePool.BOOLEAN => .{ .boolean = simple_val != 0 },
-                    TypePool.BYTE => .{ .byte = @intCast(simple_val) },
-                    TypePool.SHORT => .{ .short = @intCast(simple_val) },
-                    TypePool.INT => .{ .int = @intCast(simple_val) },
-                    TypePool.LONG => .{ .long = simple_val },
-                    else => return error.UnsupportedExpression,
-                };
-                try self.pushValue(result);
-            } else {
-                // Complex value in external storage - not yet implemented
-                return error.UnsupportedExpression;
-            }
+        if (opt_val.option.isSome()) {
+            // Get inner value from ValuePool
+            const inner = self.pools.values.get(opt_val.option.value_idx) orelse return error.InvalidState;
+            const result = try pooledValueToValue(inner);
+            try self.pushValue(result);
         } else {
             // None - error per ErgoTree semantics
             return error.OptionNone;
@@ -801,7 +843,7 @@ pub const Evaluator = struct {
         // INVARIANT: Option type is well-formed
         assert(opt_val.option.inner_type != 0);
 
-        const is_defined = opt_val.option.value_idx != null;
+        const is_defined = opt_val.option.isSome();
         try self.pushValue(.{ .boolean = is_defined });
 
         // POSTCONDITION: Result is on stack
@@ -1863,6 +1905,81 @@ pub const Evaluator = struct {
         try self.pushValue(acc);
     }
 
+    /// Compute flatMap: apply function and concatenate results
+    /// Currently only supports Coll[Byte] (f returns Coll[Byte])
+    fn computeFlatMap(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0); // Collection value must be on stack
+        assert(node_idx < self.tree.node_count); // Node index in bounds
+        assert(self.tree.node_count > 0); // Tree not empty
+
+        try self.addCost(FixedCost.collection_base);
+
+        const coll = try self.popValue();
+
+        // Currently only support coll_byte
+        if (coll != .coll_byte) return error.UnsupportedExpression;
+
+        const input = coll.coll_byte;
+
+        // Empty collection: return empty
+        if (input.len == 0) {
+            const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
+            try self.pushValue(.{ .coll_byte = empty });
+            return;
+        }
+
+        // INVARIANT: Input length must be bounded (protocol limit)
+        const MAX_COLLECTION_SIZE = 4096;
+        if (input.len > MAX_COLLECTION_SIZE) return error.CollectionTooLarge;
+
+        // Find the lambda
+        const coll_idx = node_idx + 1;
+        const lambda_idx = self.findSubtreeEnd(coll_idx);
+        assert(lambda_idx < self.tree.node_count); // Lambda must be in bounds
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag != .func_value) return error.InvalidData;
+
+        const body_idx = lambda_idx + 1;
+        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+
+        // Collect results - use temporary buffer then copy
+        var result_len: usize = 0;
+        var temp_results: [256][]const u8 = undefined;
+        var temp_count: usize = 0;
+
+        // Apply function to each element (bounded by MAX_COLLECTION_SIZE check above)
+        for (input) |elem| {
+            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+
+            const mapped = try self.evaluateSubtree(body_idx);
+
+            // Result must be a byte collection
+            if (mapped != .coll_byte) return error.TypeMismatch;
+
+            if (temp_count >= 256) return error.OutOfMemory;
+            temp_results[temp_count] = mapped.coll_byte;
+            result_len += mapped.coll_byte.len;
+            temp_count += 1;
+
+            try self.addCost(FixedCost.collection_per_item);
+        }
+
+        // Allocate and copy results
+        const result = self.arena.allocSlice(u8, result_len) catch return error.OutOfMemory;
+        var offset: usize = 0;
+        for (temp_results[0..temp_count]) |slice| {
+            @memcpy(result[offset..][0..slice.len], slice);
+            offset += slice.len;
+        }
+
+        // POSTCONDITION: All bytes were copied
+        assert(offset == result_len);
+
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
     /// Helper: get element from collection at index
     fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
         _ = self;
@@ -2042,8 +2159,8 @@ pub const Evaluator = struct {
                 next = self.findSubtreeEnd(next); // Arg
             },
 
-            // Collection HOF: map_collection, exists, for_all, filter - 2 children (collection + lambda)
-            .map_collection, .exists, .for_all, .filter => {
+            // Collection HOF: map_collection, exists, for_all, filter, flat_map - 2 children (collection + lambda)
+            .map_collection, .exists, .for_all, .filter, .flat_map => {
                 next = self.findSubtreeEnd(next); // Collection
                 next = self.findSubtreeEnd(next); // Lambda (func_value)
             },
@@ -2599,8 +2716,8 @@ test "evaluator: option_is_defined on None" {
     tree.nodes[0] = .{ .tag = .option_is_defined };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    // None value
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
+    // None value (null_value_idx sentinel)
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null_value_idx } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
@@ -2615,18 +2732,22 @@ test "evaluator: option_is_defined on None" {
 
 test "evaluator: option_is_defined on Some" {
     // OptionIsDefined(Some(x)) should return true
+    // We store inner value in evaluator's ValuePool at index 0
     var tree = ExprTree.init();
     tree.nodes[0] = .{ .tag = .option_is_defined };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    // Some value (value_idx=0 means inline, simple_value=99)
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0, .simple_value = 99 } };
+    // Some value - value_idx=0 references ValuePool
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0 } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
     const ctx = Context.forHeight(100, &inputs);
 
     var eval = Evaluator.init(&tree, &ctx);
+    // Pre-populate ValuePool with the inner value
+    _ = eval.pools.values.storePrimitive(types.TypePool.INT, 99) catch unreachable;
+
     const result = try eval.evaluate();
 
     try std.testing.expect(result == .boolean);
@@ -2639,7 +2760,7 @@ test "evaluator: option_get on None errors" {
     tree.nodes[0] = .{ .tag = .option_get };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null_value_idx } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
@@ -2655,14 +2776,17 @@ test "evaluator: option_get on Some extracts value" {
     tree.nodes[0] = .{ .tag = .option_get };
     tree.nodes[1] = .{ .tag = .constant, .data = 0 };
     tree.node_count = 2;
-    // Some(99) with inline value
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0, .simple_value = 99 } };
+    // Some(99) - value_idx=0 references ValuePool
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = 0 } };
     tree.value_count = 1;
 
     const inputs = [_]context.BoxView{context.testBox()};
     const ctx = Context.forHeight(100, &inputs);
 
     var eval = Evaluator.init(&tree, &ctx);
+    // Pre-populate ValuePool with the inner value (int 99)
+    _ = eval.pools.values.storePrimitive(types.TypePool.INT, 99) catch unreachable;
+
     const result = try eval.evaluate();
 
     try std.testing.expect(result == .int);
@@ -2676,7 +2800,7 @@ test "evaluator: option_get_or_else on None uses default" {
     tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // None
     tree.nodes[2] = .{ .tag = .constant, .data = 1 }; // Default: 42
     tree.node_count = 3;
-    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null, .simple_value = 0 } };
+    tree.values[0] = .{ .option = .{ .inner_type = types.TypePool.INT, .value_idx = null_value_idx } };
     tree.values[1] = .{ .int = 42 };
     tree.value_count = 2;
 
