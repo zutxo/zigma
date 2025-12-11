@@ -507,12 +507,17 @@ pub const Evaluator = struct {
             .apply => {
                 // Apply: evaluate argument, then apply function
                 // Tree structure: [apply] [func_value] [body...] [arg]
+                //
+                // PRECONDITIONS
+                const func_idx = node_idx + 1;
+                assert(func_idx < self.tree.node_count); // func_value must exist
+
                 // Push compute phase first (will run after arg is evaluated)
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
 
                 // Find the argument (after func_value subtree)
-                const func_idx = node_idx + 1;
                 const arg_idx = self.findSubtreeEnd(func_idx);
+                assert(arg_idx < self.tree.node_count); // arg must exist
 
                 // Push argument for evaluation
                 try self.pushWork(.{ .node_idx = arg_idx, .phase = .evaluate });
@@ -2069,6 +2074,9 @@ pub const Evaluator = struct {
 
     /// Compute Apply: bind argument and evaluate function body
     /// Argument value is expected on the value stack
+    ///
+    /// CRITICAL: Variable bindings must be restored even on error to maintain
+    /// correct scoping for subsequent evaluations. Uses errdefer pattern.
     fn computeApply(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp > 0); // Argument must be on stack
@@ -2081,6 +2089,7 @@ pub const Evaluator = struct {
 
         // Find the func_value node (immediately after apply)
         const func_idx = node_idx + 1;
+        assert(func_idx < self.tree.node_count); // func_value must be in bounds
         const func_node = self.tree.nodes[func_idx];
 
         // INVARIANT: func must be a func_value
@@ -2096,18 +2105,22 @@ pub const Evaluator = struct {
 
         // Find the lambda body (immediately after func_value node)
         const body_idx = func_idx + 1;
+        assert(body_idx < self.tree.node_count); // body must be in bounds
 
         // Find argument var_id by scanning body for val_use
         const arg_var_id = self.findLambdaArgId(body_idx) orelse 1; // Default to 1 if not found
 
-        // INVARIANT: var_id must be in bounds
-        assert(arg_var_id < 64);
+        // INVARIANT: var_id must be in bounds of pre-allocated binding array
+        assert(arg_var_id < self.var_bindings.len);
 
         // Save existing binding (for shadowing support)
         const saved_binding = self.var_bindings[arg_var_id];
 
         // Bind argument to var_id
         self.var_bindings[arg_var_id] = arg_value;
+
+        // CRITICAL: Restore binding on error to maintain scoping invariant
+        errdefer self.var_bindings[arg_var_id] = saved_binding;
 
         // Evaluate function body
         const result = try self.evaluateSubtree(body_idx);
