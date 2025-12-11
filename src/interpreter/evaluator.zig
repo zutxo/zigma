@@ -233,6 +233,8 @@ const FixedCost = struct {
     pub const collection_per_item: u32 = 5; // Per-element cost
     // Function application cost
     pub const func_apply: u32 = 20; // From opcodes.zig
+    // Method call cost
+    pub const method_call: u32 = 10; // From opcodes.zig
 };
 
 // ============================================================================
@@ -702,6 +704,35 @@ pub const Evaluator = struct {
                 }
             },
 
+            // Method call (collection methods like zip, indices, reverse)
+            .method_call => {
+                // Method call structure: [method_call] [obj] [args...]
+                // data: low 8 bits = type_code, high 8 bits = method_id
+                // Extract arg count by scanning the tree
+                //
+                // PRECONDITIONS
+                const obj_idx = node_idx + 1;
+                assert(obj_idx < self.tree.node_count);
+
+                // Push compute phase first
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+
+                // Find args by walking past obj
+                const args_start = self.findSubtreeEnd(obj_idx);
+
+                // For now, support 0 or 1 args (zip has 1 arg, indices has 0)
+                // We'll push obj for evaluation, args handled in compute
+                if (args_start < self.tree.node_count and
+                    self.tree.nodes[args_start].tag != .unsupported)
+                {
+                    // Has at least one arg - push it
+                    try self.pushWork(.{ .node_idx = args_start, .phase = .evaluate });
+                }
+
+                // Push obj for evaluation
+                try self.pushWork(.{ .node_idx = obj_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -849,6 +880,9 @@ pub const Evaluator = struct {
 
             // Function application
             .apply => try self.computeApply(node_idx),
+
+            // Method call (collection methods)
+            .method_call => try self.computeMethodCall(node_idx),
 
             else => {
                 // Other node types don't need compute phase
@@ -2136,6 +2170,144 @@ pub const Evaluator = struct {
     }
 
     // ========================================================================
+    // Method Call Operations
+    // ========================================================================
+
+    /// Collection type codes from Rust types/scoll.rs
+    const CollTypeCode: u8 = 12; // TYPE_CODE for Coll
+
+    /// Collection method IDs from Rust types/scoll.rs
+    const CollMethodId = struct {
+        const zip: u8 = 29;
+        const indices: u8 = 14;
+        const reverse: u8 = 30;
+        const starts_with: u8 = 31;
+        const ends_with: u8 = 32;
+    };
+
+    /// Compute method call: dispatch based on type_code and method_id
+    fn computeMethodCall(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(node_idx < self.tree.node_count);
+        assert(self.value_sp > 0); // At least obj on stack
+
+        const node = self.tree.nodes[node_idx];
+
+        // Extract type_code and method_id from data
+        const type_code: u8 = @truncate(node.data & 0xFF);
+        const method_id: u8 = @truncate(node.data >> 8);
+
+        // INVARIANT: Must be a valid method call
+        assert(type_code > 0 or method_id > 0);
+
+        try self.addCost(FixedCost.method_call);
+
+        // Dispatch based on type_code
+        if (type_code == CollTypeCode) {
+            // Collection methods
+            switch (method_id) {
+                CollMethodId.zip => try self.computeZip(node_idx),
+                CollMethodId.indices => try self.computeIndices(),
+                CollMethodId.reverse => try self.computeReverse(),
+                else => return error.UnsupportedExpression,
+            }
+        } else {
+            // Unsupported type
+            return error.UnsupportedExpression;
+        }
+    }
+
+    /// Compute zip: Coll[A].zip(Coll[B]) → Coll[(A, B)]
+    /// Takes shortest length of two collections
+    fn computeZip(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // obj and arg on stack
+        assert(node_idx < self.tree.node_count);
+
+        // Pop arg (second collection) first, then obj (first collection)
+        const arg = try self.popValue();
+        const obj = try self.popValue();
+
+        // Both must be coll_byte for now
+        if (obj != .coll_byte or arg != .coll_byte) return error.TypeMismatch;
+
+        const coll1 = obj.coll_byte;
+        const coll2 = arg.coll_byte;
+
+        // Result length is minimum of both
+        const result_len = @min(coll1.len, coll2.len);
+
+        // Create tuples: each element is a (byte, byte) pair
+        // For coll_byte, we create coll_tuple with 2-element tuples
+        // Store as flat array of pairs for simplicity
+        const result = self.arena.allocSlice(u8, result_len * 2) catch return error.OutOfMemory;
+
+        for (0..result_len) |i| {
+            result[i * 2] = coll1[i];
+            result[i * 2 + 1] = coll2[i];
+        }
+
+        // POSTCONDITION: Result has correct length
+        assert(result.len == result_len * 2);
+
+        // Push as coll_byte (pairs encoded as consecutive bytes)
+        // Note: proper tuple type handling would require coll_tuple
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
+    /// Compute indices: Coll[T] → Coll[Int] (0, 1, 2, ..., len-1)
+    /// Returns array of indices encoded as bytes (each index as single byte for small collections)
+    fn computeIndices(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0); // obj on stack
+
+        const obj = try self.popValue();
+
+        // Get collection length (only coll_byte supported for now)
+        const len: usize = switch (obj) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // INVARIANT: Reasonable collection size (must fit in u8 for byte encoding)
+        if (len > 255) return error.CollectionTooLarge;
+
+        // Allocate result as Coll[Byte] with indices 0..len-1
+        // Note: This is a simplified representation - real impl would use Coll[Int]
+        const result = self.arena.allocSlice(u8, len) catch return error.OutOfMemory;
+
+        for (0..len) |i| {
+            result[i] = @intCast(i);
+        }
+
+        // POSTCONDITION: Result has same length as input
+        assert(result.len == len);
+
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
+    /// Compute reverse: Coll[T] → Coll[T] (elements in reverse order)
+    /// Currently only supports Coll[Byte]
+    fn computeReverse(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0); // obj on stack
+
+        const obj = try self.popValue();
+
+        switch (obj) {
+            .coll_byte => |c| {
+                const result = self.arena.allocSlice(u8, c.len) catch return error.OutOfMemory;
+                for (0..c.len) |i| {
+                    result[i] = c[c.len - 1 - i];
+                }
+                try self.pushValue(.{ .coll_byte = result });
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    // ========================================================================
     // Sigma Proposition Connective Operations
     // ========================================================================
 
@@ -2615,6 +2787,18 @@ pub const Evaluator = struct {
                 const child_count = node.data;
                 var i: u16 = 0;
                 while (i < child_count) : (i += 1) {
+                    next = self.findSubtreeEnd(next);
+                }
+            },
+
+            // method_call: obj + variable args
+            // For now assume 0 or 1 args (indices=0, zip=1)
+            .method_call => {
+                next = self.findSubtreeEnd(next); // Object
+                // Check method_id to determine arg count
+                const method_id: u8 = @truncate(node.data >> 8);
+                // zip (29) has 1 arg, indices (14) and reverse (30) have 0
+                if (method_id == 29) { // zip
                     next = self.findSubtreeEnd(next);
                 }
             },
@@ -3962,4 +4146,144 @@ test "evaluator: apply preserves outer scope after return" {
     // For now, we just verify the shadowing test above passes,
     // which proves inner binding was used during apply.
     // The restore behavior is implicitly tested by subsequent var_bindings usage.
+}
+
+test "evaluator: indices on byte collection" {
+    // Create tree: Coll[Byte](1, 2, 3).indices => Coll(0, 1, 2)
+    var tree: ExprTree = .{};
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // method_call node: type_code=12 (COLL), method_id=14 (indices)
+    // data = (14 << 8) | 12 = 3596
+    tree.nodes[0] = .{ .tag = .method_call, .data = (14 << 8) | 12 };
+    // Object: concrete_collection with 3 bytes (COLL_BYTE = 17)
+    tree.nodes[1] = .{ .tag = .concrete_collection, .data = 3, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // value[0] = 1
+    tree.nodes[3] = .{ .tag = .constant, .data = 1 }; // value[1] = 2
+    tree.nodes[4] = .{ .tag = .constant, .data = 2 }; // value[2] = 3
+    tree.node_count = 5;
+
+    tree.values[0] = .{ .byte = 1 };
+    tree.values[1] = .{ .byte = 2 };
+    tree.values[2] = .{ .byte = 3 };
+    tree.value_count = 3;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be Coll[Byte](0, 1, 2)
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 3), result.coll_byte.len);
+    try std.testing.expectEqual(@as(u8, 0), result.coll_byte[0]);
+    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[1]);
+    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
+}
+
+test "evaluator: reverse byte collection" {
+    // Create tree: Coll[Byte](1, 2, 3).reverse => Coll(3, 2, 1)
+    var tree: ExprTree = .{};
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // method_call node: type_code=12 (COLL), method_id=30 (reverse)
+    // data = (30 << 8) | 12 = 7692
+    tree.nodes[0] = .{ .tag = .method_call, .data = (30 << 8) | 12 };
+    // Object: concrete_collection with 3 bytes (COLL_BYTE = 17)
+    tree.nodes[1] = .{ .tag = .concrete_collection, .data = 3, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // value[0] = 1
+    tree.nodes[3] = .{ .tag = .constant, .data = 1 }; // value[1] = 2
+    tree.nodes[4] = .{ .tag = .constant, .data = 2 }; // value[2] = 3
+    tree.node_count = 5;
+
+    tree.values[0] = .{ .byte = 1 };
+    tree.values[1] = .{ .byte = 2 };
+    tree.values[2] = .{ .byte = 3 };
+    tree.value_count = 3;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be Coll[Byte](3, 2, 1)
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 3), result.coll_byte.len);
+    try std.testing.expectEqual(@as(u8, 3), result.coll_byte[0]);
+    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[1]);
+    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[2]);
+}
+
+test "evaluator: zip two byte collections" {
+    // Simplified test: zip two collections of same length
+    // Coll(1, 2).zip(Coll(3, 4)) => pairs as consecutive bytes
+    var tree: ExprTree = .{};
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // method_call node: type_code=12 (COLL), method_id=29 (zip)
+    // data = (29 << 8) | 12 = 7436
+    tree.nodes[0] = .{ .tag = .method_call, .data = (29 << 8) | 12 };
+    // Object: concrete_collection with 2 bytes (COLL_BYTE = 17)
+    tree.nodes[1] = .{ .tag = .concrete_collection, .data = 2, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // value[0] = 1
+    tree.nodes[3] = .{ .tag = .constant, .data = 1 }; // value[1] = 2
+    // Arg: concrete_collection with 2 bytes (COLL_BYTE = 17)
+    tree.nodes[4] = .{ .tag = .concrete_collection, .data = 2, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[5] = .{ .tag = .constant, .data = 2 }; // value[2] = 3
+    tree.nodes[6] = .{ .tag = .constant, .data = 3 }; // value[3] = 4
+    tree.node_count = 7;
+
+    tree.values[0] = .{ .byte = 1 };
+    tree.values[1] = .{ .byte = 2 };
+    tree.values[2] = .{ .byte = 3 };
+    tree.values[3] = .{ .byte = 4 };
+    tree.value_count = 4;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be pairs: (1,3), (2,4) encoded as [1,3,2,4]
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 4), result.coll_byte.len);
+    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[0]);
+    try std.testing.expectEqual(@as(u8, 3), result.coll_byte[1]);
+    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
+    try std.testing.expectEqual(@as(u8, 4), result.coll_byte[3]);
+}
+
+test "evaluator: zip different length collections" {
+    // zip(Coll(1, 2, 3), Coll(4, 5)) => takes min length (2)
+    var tree: ExprTree = .{};
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // method_call node: type_code=12 (COLL), method_id=29 (zip)
+    tree.nodes[0] = .{ .tag = .method_call, .data = (29 << 8) | 12 };
+    // Object: concrete_collection with 3 bytes (COLL_BYTE = 17)
+    tree.nodes[1] = .{ .tag = .concrete_collection, .data = 3, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[2] = .{ .tag = .constant, .data = 0 };
+    tree.nodes[3] = .{ .tag = .constant, .data = 1 };
+    tree.nodes[4] = .{ .tag = .constant, .data = 2 };
+    // Arg: concrete_collection with 2 bytes (COLL_BYTE = 17)
+    tree.nodes[5] = .{ .tag = .concrete_collection, .data = 2, .result_type = types.TypePool.COLL_BYTE };
+    tree.nodes[6] = .{ .tag = .constant, .data = 3 };
+    tree.nodes[7] = .{ .tag = .constant, .data = 4 };
+    tree.node_count = 8;
+
+    tree.values[0] = .{ .byte = 1 };
+    tree.values[1] = .{ .byte = 2 };
+    tree.values[2] = .{ .byte = 3 };
+    tree.values[3] = .{ .byte = 4 };
+    tree.values[4] = .{ .byte = 5 };
+    tree.value_count = 5;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be 2 pairs (min length): (1,4), (2,5)
+    try std.testing.expect(result == .coll_byte);
+    try std.testing.expectEqual(@as(usize, 4), result.coll_byte.len);
+    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[0]);
+    try std.testing.expectEqual(@as(u8, 4), result.coll_byte[1]);
+    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
+    try std.testing.expectEqual(@as(u8, 5), result.coll_byte[3]);
 }

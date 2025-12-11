@@ -156,6 +156,10 @@ pub const ExprTag = enum(u8) {
     /// Extract miner rewards pubkey from Header (opcode 0xF2)
     extract_miner_rewards,
 
+    /// Method call (opcode 0xDC/220) - obj.method(args)
+    /// data: low 8 bits = type_code, high 8 bits = method_id
+    method_call,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -486,6 +490,8 @@ fn deserializeWithDepth(
             // Sigma proposition connectives
             opcodes.SigmaAnd => try deserializeSigmaConnective(tree, reader, arena, .sigma_and, depth),
             opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
+            // Method call (collection methods like zip, indices, etc.)
+            opcodes.MethodCall => try deserializeMethodCall(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -758,6 +764,59 @@ fn deserializeApply(
     while (i < arg_count) : (i += 1) {
         try deserializeWithDepth(tree, reader, arena, depth + 1);
     }
+}
+
+fn deserializeMethodCall(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // MethodCall format: type_code (1 byte) + method_id (1 byte) + obj + args[]
+    // Reference: Rust ergotree-ir/src/serialization/method_call.rs
+
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Read type code (1 byte) and method_id (1 byte)
+    const type_code = reader.readByte() catch |e| return mapVlqError(e);
+    const method_id = reader.readByte() catch |e| return mapVlqError(e);
+
+    // INVARIANT: valid type code range
+    assert(type_code > 0 or method_id > 0); // At least one must be non-zero
+
+    // Pack type_code and method_id into data field
+    // low 8 bits = type_code, high 8 bits = method_id
+    const data: u16 = @as(u16, method_id) << 8 | @as(u16, type_code);
+
+    // Add the method_call node first (pre-order)
+    const node_idx = try tree.addNode(.{
+        .tag = .method_call,
+        .data = data,
+        .result_type = TypePool.ANY, // Determined at runtime by method
+    });
+
+    // POSTCONDITION: Node was added
+    assert(node_idx < tree.node_count);
+
+    // Parse object expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse args count
+    const arg_count = reader.readU32() catch |e| return mapVlqError(e);
+
+    // INVARIANT: Reasonable arg count
+    if (arg_count > 8) return error.InvalidData;
+
+    // Parse each argument
+    var i: u32 = 0;
+    while (i < arg_count) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+
+    // TODO: Handle explicit type args for generic methods if needed
+    // For now, assume no explicit type args (method_raw.explicit_type_args.len == 0)
 }
 
 fn deserializeOptionGetOrElse(
