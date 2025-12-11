@@ -235,6 +235,9 @@ const FixedCost = struct {
     pub const func_apply: u32 = 20; // From opcodes.zig
     // Method call cost
     pub const method_call: u32 = 10; // From opcodes.zig
+    // Sigma proposition connective costs (from opcodes.zig)
+    pub const sigma_and: u32 = 20;
+    pub const sigma_or: u32 = 20;
 };
 
 // ============================================================================
@@ -1438,11 +1441,18 @@ pub const Evaluator = struct {
 
     /// Compute binary operation
     fn computeBinOp(self: *Evaluator, kind: BinOpKind) EvalError!void {
+        // PRECONDITION: Need two operands on stack
+        assert(self.value_sp >= 2);
+        const initial_sp = self.value_sp;
+
         try self.addCost(FixedCost.comparison);
 
         // Pop right then left (stack order)
         const right = try self.popValue();
         const left = try self.popValue();
+
+        // INVARIANT: Popped exactly 2 values
+        assert(self.value_sp == initial_sp - 2);
 
         switch (kind) {
             // Comparison operations (integer only for now)
@@ -1507,6 +1517,9 @@ pub const Evaluator = struct {
                 try self.pushValue(.{ .boolean = left.boolean != right.boolean });
             },
         }
+
+        // POSTCONDITION: Stack depth changed by -1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
     }
 
     // ========================================================================
@@ -1755,8 +1768,10 @@ pub const Evaluator = struct {
 
     /// Compute exists: returns true if predicate holds for any element
     fn computeExists(self: *Evaluator, node_idx: u16) EvalError!void {
-        // PRECONDITION: Collection value is on stack
+        // PRECONDITIONS
         assert(self.value_sp > 0);
+        assert(node_idx < self.tree.node_count);
+        const initial_sp = self.value_sp;
 
         try self.addCost(FixedCost.collection_base);
 
@@ -1772,6 +1787,8 @@ pub const Evaluator = struct {
         // Empty collection: exists returns false
         if (len == 0) {
             try self.pushValue(.{ .boolean = false });
+            // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+            assert(self.value_sp == initial_sp);
             return;
         }
 
@@ -1799,6 +1816,8 @@ pub const Evaluator = struct {
             if (body_result.boolean) {
                 // Found true: exists succeeds
                 try self.pushValue(.{ .boolean = true });
+                // POSTCONDITION: Stack depth unchanged
+                assert(self.value_sp == initial_sp);
                 return;
             }
 
@@ -1807,12 +1826,16 @@ pub const Evaluator = struct {
 
         // No element satisfied predicate
         try self.pushValue(.{ .boolean = false });
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute forall: returns true if predicate holds for all elements
     fn computeForAll(self: *Evaluator, node_idx: u16) EvalError!void {
-        // PRECONDITION: Collection value is on stack
+        // PRECONDITIONS
         assert(self.value_sp > 0);
+        assert(node_idx < self.tree.node_count);
+        const initial_sp = self.value_sp;
 
         try self.addCost(FixedCost.collection_base);
 
@@ -1828,6 +1851,8 @@ pub const Evaluator = struct {
         // Empty collection: forall returns true
         if (len == 0) {
             try self.pushValue(.{ .boolean = true });
+            // POSTCONDITION: Stack depth unchanged
+            assert(self.value_sp == initial_sp);
             return;
         }
 
@@ -1855,6 +1880,8 @@ pub const Evaluator = struct {
             if (!body_result.boolean) {
                 // Found false: forall fails
                 try self.pushValue(.{ .boolean = false });
+                // POSTCONDITION: Stack depth unchanged
+                assert(self.value_sp == initial_sp);
                 return;
             }
 
@@ -1863,13 +1890,17 @@ pub const Evaluator = struct {
 
         // All elements satisfied predicate
         try self.pushValue(.{ .boolean = true });
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute map: apply function to each element
     /// Currently only supports Coll[Byte] → Coll[Byte]
     fn computeMap(self: *Evaluator, node_idx: u16) EvalError!void {
-        // PRECONDITION: Collection value is on stack
+        // PRECONDITIONS
         assert(self.value_sp > 0);
+        assert(node_idx < self.tree.node_count);
+        const initial_sp = self.value_sp;
 
         try self.addCost(FixedCost.collection_base);
 
@@ -1884,6 +1915,8 @@ pub const Evaluator = struct {
         if (input.len == 0) {
             const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
             try self.pushValue(.{ .coll_byte = empty });
+            // POSTCONDITION: Stack depth unchanged
+            assert(self.value_sp == initial_sp);
             return;
         }
 
@@ -1916,13 +1949,17 @@ pub const Evaluator = struct {
         }
 
         try self.pushValue(.{ .coll_byte = result });
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute filter: keep elements that satisfy predicate
     /// Currently only supports Coll[Byte]
     fn computeFilter(self: *Evaluator, node_idx: u16) EvalError!void {
-        // PRECONDITION: Collection value is on stack
+        // PRECONDITIONS
         assert(self.value_sp > 0);
+        assert(node_idx < self.tree.node_count);
+        const initial_sp = self.value_sp;
 
         try self.addCost(FixedCost.collection_base);
 
@@ -1936,6 +1973,8 @@ pub const Evaluator = struct {
         if (input.len == 0) {
             const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
             try self.pushValue(.{ .coll_byte = empty });
+            // POSTCONDITION: Stack depth unchanged
+            assert(self.value_sp == initial_sp);
             return;
         }
 
@@ -1972,18 +2011,25 @@ pub const Evaluator = struct {
         }
 
         try self.pushValue(.{ .coll_byte = result });
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     /// Compute fold: reduce collection with binary function
     fn computeFold(self: *Evaluator, node_idx: u16) EvalError!void {
-        // PRECONDITION: Collection and zero values are on stack
+        // PRECONDITIONS
         assert(self.value_sp >= 2);
+        assert(node_idx < self.tree.node_count);
+        const initial_sp = self.value_sp;
 
         try self.addCost(FixedCost.collection_base);
 
         // Pop in reverse order: zero was pushed last
         const zero = try self.popValue();
         const coll = try self.popValue();
+
+        // INVARIANT: Popped exactly 2 values
+        assert(self.value_sp == initial_sp - 2);
 
         // Get collection length - only coll_byte supported currently
         const len: usize = switch (coll) {
@@ -1995,6 +2041,8 @@ pub const Evaluator = struct {
         // Empty collection: return zero
         if (len == 0) {
             try self.pushValue(zero);
+            // POSTCONDITION: Net change is -1 (popped 2, pushed 1)
+            assert(self.value_sp == initial_sp - 1);
             return;
         }
 
@@ -2025,6 +2073,8 @@ pub const Evaluator = struct {
         }
 
         try self.pushValue(acc);
+        // POSTCONDITION: Net change is -1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
     }
 
     /// Compute flatMap: apply function and concatenate results
@@ -2291,7 +2341,8 @@ pub const Evaluator = struct {
     /// Currently only supports Coll[Byte]
     fn computeReverse(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
-        assert(self.value_sp > 0); // obj on stack
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
 
         const obj = try self.popValue();
 
@@ -2301,10 +2352,15 @@ pub const Evaluator = struct {
                 for (0..c.len) |i| {
                     result[i] = c[c.len - 1 - i];
                 }
+                // INVARIANT: Result has same length as input
+                assert(result.len == c.len);
                 try self.pushValue(.{ .coll_byte = result });
             },
             else => return error.TypeMismatch,
         }
+
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     // ========================================================================
@@ -2318,7 +2374,7 @@ pub const Evaluator = struct {
         assert(child_count >= 2); // AND must have at least 2 children
         assert(self.value_sp >= child_count); // Children must be on stack
 
-        try self.addCost(20); // SigmaAnd cost from opcodes
+        try self.addCost(FixedCost.sigma_and);
 
         // Pop children in reverse order to build children array
         var children: [256]*const sigma_tree.SigmaBoolean = undefined;
@@ -2351,7 +2407,7 @@ pub const Evaluator = struct {
         assert(child_count >= 2); // OR must have at least 2 children
         assert(self.value_sp >= child_count); // Children must be on stack
 
-        try self.addCost(20); // SigmaOr cost from opcodes
+        try self.addCost(FixedCost.sigma_or);
 
         // Pop children in reverse order to build children array
         var children: [256]*const sigma_tree.SigmaBoolean = undefined;
@@ -2501,7 +2557,20 @@ pub const Evaluator = struct {
     }
 
     /// Serialize SigmaBoolean to bytes
+    /// Note: Uses bounded recursion (max_sigma_depth=16) since sigma trees are shallow.
+    /// Full iterative conversion deferred - sigma depth is protocol-bounded.
     fn serializeSigmaBoolean(self: *Evaluator, node: *const sigma_tree.SigmaBoolean) EvalError![]const u8 {
+        return self.serializeSigmaBooleanWithDepth(node, 0);
+    }
+
+    /// Maximum sigma tree depth (protocol-bounded, typically 2-3 in practice)
+    const max_sigma_depth: u8 = 16;
+
+    /// Internal: serialize with depth tracking to prevent stack overflow
+    fn serializeSigmaBooleanWithDepth(self: *Evaluator, node: *const sigma_tree.SigmaBoolean, depth: u8) EvalError![]const u8 {
+        // PRECONDITION: depth bounded to prevent stack overflow
+        if (depth >= max_sigma_depth) return error.InvalidData;
+
         return switch (node.*) {
             .trivial_true => blk: {
                 const buf = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
@@ -2533,7 +2602,7 @@ pub const Evaluator = struct {
                 var total_len: usize = 2; // marker + count
                 var child_bytes: [256][]const u8 = undefined;
                 for (and_node.children, 0..) |child, idx| {
-                    const child_ser = try self.serializeSigmaBoolean(child);
+                    const child_ser = try self.serializeSigmaBooleanWithDepth(child, depth + 1);
                     child_bytes[idx] = child_ser;
                     total_len += child_ser.len;
                 }
@@ -2552,7 +2621,7 @@ pub const Evaluator = struct {
                 var total_len: usize = 2; // marker + count
                 var child_bytes: [256][]const u8 = undefined;
                 for (or_node.children, 0..) |child, idx| {
-                    const child_ser = try self.serializeSigmaBoolean(child);
+                    const child_ser = try self.serializeSigmaBooleanWithDepth(child, depth + 1);
                     child_bytes[idx] = child_ser;
                     total_len += child_ser.len;
                 }
@@ -2571,7 +2640,7 @@ pub const Evaluator = struct {
                 var total_len: usize = 4; // marker + k(2) + count
                 var child_bytes: [256][]const u8 = undefined;
                 for (th.children, 0..) |child, idx| {
-                    const child_ser = try self.serializeSigmaBoolean(child);
+                    const child_ser = try self.serializeSigmaBooleanWithDepth(child, depth + 1);
                     child_bytes[idx] = child_ser;
                     total_len += child_ser.len;
                 }
@@ -2673,138 +2742,73 @@ pub const Evaluator = struct {
         }
     }
 
-    /// Find the index after a subtree (next sibling position)
-    /// This walks the tree structure to find where a subtree ends.
-    fn findSubtreeEnd(self: *const Evaluator, node_idx: u16) u16 {
-        if (node_idx >= self.tree.node_count) return self.tree.node_count;
+    /// Get child count for a node (used by iterative findSubtreeEnd)
+    /// Returns the number of direct children this node has.
+    fn getNodeChildCount(self: *const Evaluator, node_idx: u16) u16 {
+        // PRECONDITION: node_idx is valid
+        assert(node_idx < self.tree.node_count);
 
         const node = self.tree.nodes[node_idx];
-        var next = node_idx + 1;
 
-        switch (node.tag) {
+        return switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => {},
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => 0,
 
-            // One child
-            .calc_blake2b256,
-            .calc_sha256,
-            .option_get,
-            .option_is_defined,
-            .long_to_byte_array,
-            .byte_array_to_bigint,
-            .byte_array_to_long,
-            .decode_point,
-            .select_field,
-            .upcast,
-            .downcast,
-            // Header extraction (all take one Header child)
-            .extract_version,
-            .extract_parent_id,
-            .extract_ad_proofs_root,
-            .extract_state_root,
-            .extract_txs_root,
-            .extract_timestamp,
-            .extract_n_bits,
-            .extract_difficulty,
-            .extract_votes,
-            .extract_miner_rewards,
-            => {
-                next = self.findSubtreeEnd(next);
-            },
+            // Unary operations (1 child)
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value => 1,
 
-            // val_def has one child (RHS)
-            .val_def => {
-                next = self.findSubtreeEnd(next);
-            },
+            // Binary operations (2 children)
+            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map => 2,
 
-            // Two children
-            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct => {
-                next = self.findSubtreeEnd(next); // Left / Option / Point / First
-                next = self.findSubtreeEnd(next); // Right / Default / Scalar/Point / Second
-            },
+            // Ternary operations (3 children)
+            .if_then_else, .triple_construct, .fold => 3,
 
-            // Three children
-            .if_then_else, .triple_construct => {
-                next = self.findSubtreeEnd(next); // Condition
-                next = self.findSubtreeEnd(next); // Then
-                next = self.findSubtreeEnd(next); // Else
-            },
+            // N-ary with data-driven child count
+            .block_value => node.data + 1, // items + result
+            .tuple_construct, .concrete_collection, .sigma_and, .sigma_or => node.data,
 
-            // block_value: item_count children + result
-            .block_value => {
-                const item_count = node.data;
-                var i: u16 = 0;
-                while (i < item_count) : (i += 1) {
-                    next = self.findSubtreeEnd(next);
-                }
-                next = self.findSubtreeEnd(next); // Result
-            },
-
-            // tuple_construct: elem_count children
-            .tuple_construct => {
-                const elem_count = node.data;
-                var i: u16 = 0;
-                while (i < elem_count) : (i += 1) {
-                    next = self.findSubtreeEnd(next);
-                }
-            },
-
-            // concrete_collection: elem_count children (same as tuple_construct)
-            .concrete_collection => {
-                const elem_count = node.data;
-                var i: u16 = 0;
-                while (i < elem_count) : (i += 1) {
-                    next = self.findSubtreeEnd(next);
-                }
-            },
-
-            // func_value: body expression
-            .func_value => {
-                next = self.findSubtreeEnd(next);
-            },
-
-            // apply: function + 1 arg (v5.x only single-arg)
-            .apply => {
-                next = self.findSubtreeEnd(next); // Function
-                next = self.findSubtreeEnd(next); // Arg
-            },
-
-            // Collection HOF: map_collection, exists, for_all, filter, flat_map - 2 children (collection + lambda)
-            .map_collection, .exists, .for_all, .filter, .flat_map => {
-                next = self.findSubtreeEnd(next); // Collection
-                next = self.findSubtreeEnd(next); // Lambda (func_value)
-            },
-
-            // fold: 3 children (collection + zero + lambda)
-            .fold => {
-                next = self.findSubtreeEnd(next); // Collection
-                next = self.findSubtreeEnd(next); // Zero value
-                next = self.findSubtreeEnd(next); // Lambda (func_value)
-            },
-
-            // sigma_and/sigma_or: child_count children
-            .sigma_and, .sigma_or => {
-                const child_count = node.data;
-                var i: u16 = 0;
-                while (i < child_count) : (i += 1) {
-                    next = self.findSubtreeEnd(next);
-                }
-            },
-
-            // method_call: obj + variable args
-            // For now assume 0 or 1 args (indices=0, zip=1)
-            .method_call => {
-                next = self.findSubtreeEnd(next); // Object
-                // Check method_id to determine arg count
+            // method_call: 1 or 2 (obj + optional arg based on method_id)
+            .method_call => blk: {
                 const method_id: u8 = @truncate(node.data >> 8);
                 // zip (29) has 1 arg, indices (14) and reverse (30) have 0
-                if (method_id == 29) { // zip
-                    next = self.findSubtreeEnd(next);
-                }
+                break :blk if (method_id == 29) 2 else 1;
             },
+        };
+    }
+
+    /// Find the index after a subtree (next sibling position)
+    /// ITERATIVE implementation - no recursion per ZIGMA_STYLE.
+    ///
+    /// Algorithm: Track total remaining children to process. Each node visited
+    /// adds its children to the count and subtracts 1 (itself) until count is 0.
+    fn findSubtreeEnd(self: *const Evaluator, node_idx: u16) u16 {
+        // PRECONDITIONS
+        assert(node_idx <= self.tree.node_count);
+
+        if (node_idx >= self.tree.node_count) return self.tree.node_count;
+
+        // Start with the root node's child count
+        var remaining: u32 = self.getNodeChildCount(node_idx);
+        var current = node_idx + 1;
+
+        // Process children until we've accounted for all of them
+        // Bounded by node_count to prevent infinite loops on malformed input
+        while (remaining > 0 and current < self.tree.node_count) {
+            // INVARIANT: remaining decreases or stays same each iteration
+            const child_count = self.getNodeChildCount(current);
+
+            // Add this node's children, subtract 1 for this node itself
+            remaining = remaining + child_count - 1;
+            current += 1;
+
+            // INVARIANT: current always advances
+            assert(current > node_idx);
         }
 
-        return next;
+        // POSTCONDITION: Result is in valid range
+        assert(current <= self.tree.node_count);
+
+        return current;
     }
 };
 
