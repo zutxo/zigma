@@ -128,6 +128,12 @@ pub const ExprTag = enum(u8) {
     /// FlatMap: Coll[A] × (A → Coll[B]) → Coll[B] (opcode 0xB8)
     flat_map,
 
+    // Sigma proposition connectives (opcodes 0xEA-0xEB after shift)
+    /// SigmaAnd: all child propositions must be proven (opcode 0xEA)
+    sigma_and,
+    /// SigmaOr: at least one child proposition must be proven (opcode 0xEB)
+    sigma_or,
+
     // Header field extraction opcodes (0xE9-0xF2)
     /// Extract version byte from Header (opcode 0xE9)
     extract_version,
@@ -477,6 +483,9 @@ fn deserializeWithDepth(
             opcodes.FlatMapCollection => try deserializeCollectionHOF(tree, reader, arena, .flat_map, depth),
             // FuncValue
             opcodes.FuncValue => try deserializeFuncValue(tree, reader, arena, depth),
+            // Sigma proposition connectives
+            opcodes.SigmaAnd => try deserializeSigmaConnective(tree, reader, arena, .sigma_and, depth),
+            opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -1116,6 +1125,44 @@ fn mapVlqError(err: vlq.DecodeError) DeserializeError {
     };
 }
 
+/// Deserialize SigmaAnd or SigmaOr connective
+/// Format: item_count (VLQ) + item_count × SigmaProp children
+/// Reference: Scala SigmaTransformerSerializer.scala
+fn deserializeSigmaConnective(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    comptime tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITION: tag is sigma_and or sigma_or
+    comptime assert(tag == .sigma_and or tag == .sigma_or);
+
+    // Read item count
+    const item_count = reader.readU32() catch |e| return mapVlqError(e);
+
+    // INVARIANT: Reasonable limit on children
+    if (item_count > max_children) return error.InvalidData;
+    if (item_count < 2) return error.InvalidData; // AND/OR must have at least 2 children
+
+    // Add the connective node
+    // data stores the child count
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .data = @truncate(item_count),
+        .result_type = TypePool.SIGMA_PROP,
+    });
+
+    // Deserialize each child SigmaProp expression
+    var i: u32 = 0;
+    while (i < item_count) : (i += 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+}
+
+/// Maximum children for AND/OR/THRESHOLD
+const max_children: u32 = 255;
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1317,4 +1364,50 @@ test "expr_serializer: deserialize nested ConcreteCollection" {
     // Check nested collection constant
     try std.testing.expectEqual(ExprTag.constant, tree.nodes[1].tag);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAB, 0xCD }, tree.values[0].coll_byte);
+}
+
+test "expr_serializer: deserialize SigmaAnd with TrueLeaf children" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // SigmaAnd opcode = 234 (shift 122)
+    // Format: opcode + child_count (VLQ) + children
+    // Children: 2x TrueLeaf (0x7F)
+    var reader = vlq.Reader.init(&[_]u8{
+        234, // SigmaAnd opcode
+        0x02, // 2 children (VLQ)
+        0x7F, // TrueLeaf
+        0x7F, // TrueLeaf
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    // Should have 3 nodes: SigmaAnd + 2 TrueLeaf
+    try std.testing.expectEqual(@as(u16, 3), tree.node_count);
+    try std.testing.expectEqual(ExprTag.sigma_and, tree.nodes[0].tag);
+    try std.testing.expectEqual(@as(u16, 2), tree.nodes[0].data); // 2 children
+    try std.testing.expectEqual(ExprTag.true_leaf, tree.nodes[1].tag);
+    try std.testing.expectEqual(ExprTag.true_leaf, tree.nodes[2].tag);
+}
+
+test "expr_serializer: deserialize SigmaOr with boolean children" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // SigmaOr opcode = 235 (shift 123)
+    // Format: opcode + child_count (VLQ) + children
+    // Children: TrueLeaf + FalseLeaf
+    var reader = vlq.Reader.init(&[_]u8{
+        235, // SigmaOr opcode
+        0x02, // 2 children (VLQ)
+        0x7F, // TrueLeaf
+        0x80, // FalseLeaf
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    // Should have 3 nodes: SigmaOr + TrueLeaf + FalseLeaf
+    try std.testing.expectEqual(@as(u16, 3), tree.node_count);
+    try std.testing.expectEqual(ExprTag.sigma_or, tree.nodes[0].tag);
+    try std.testing.expectEqual(@as(u16, 2), tree.nodes[0].data); // 2 children
+    try std.testing.expectEqual(ExprTag.true_leaf, tree.nodes[1].tag);
+    try std.testing.expectEqual(ExprTag.false_leaf, tree.nodes[2].tag);
 }

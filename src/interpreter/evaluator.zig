@@ -21,6 +21,7 @@ const data = @import("../serialization/data_serializer.zig");
 const types = @import("../core/types.zig");
 const hash = @import("../crypto/hash.zig");
 const crypto_ops = @import("ops/crypto.zig");
+const sigma_tree = @import("../sigma/sigma_tree.zig");
 
 const Context = context.Context;
 const ExprTree = expr.ExprTree;
@@ -70,28 +71,65 @@ fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
     // PRECONDITION: pooled value must be valid
     assert(pooled.type_idx != 0 or pooled.data.primitive == 0); // 0 type only valid for unit
 
-    return switch (pooled.type_idx) {
-        TypePool.UNIT => .unit,
-        TypePool.BOOLEAN => .{ .boolean = pooled.data.primitive != 0 },
-        TypePool.BYTE => .{ .byte = @intCast(pooled.data.primitive) },
-        TypePool.SHORT => .{ .short = @intCast(pooled.data.primitive) },
-        TypePool.INT => .{ .int = @intCast(pooled.data.primitive) },
-        TypePool.LONG => .{ .long = pooled.data.primitive },
-        TypePool.BIG_INT => blk: {
-            var bi: Value.BigInt = .{
-                .bytes = [_]u8{0} ** 32,
-                .len = pooled.data.big_int.len,
-            };
-            @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
-            break :blk .{ .big_int = bi };
-        },
-        TypePool.GROUP_ELEMENT => .{ .group_element = pooled.data.group_element },
-        else => {
-            // Complex types (coll, option, tuple, box) need type-specific handling
-            // For now, return error for unsupported types
-            return error.UnsupportedExpression;
-        },
-    };
+    const type_idx = pooled.type_idx;
+
+    // Check primitive types by direct index
+    if (type_idx == TypePool.UNIT) return .unit;
+    if (type_idx == TypePool.BOOLEAN) return .{ .boolean = pooled.data.primitive != 0 };
+    if (type_idx == TypePool.BYTE) return .{ .byte = @intCast(pooled.data.primitive) };
+    if (type_idx == TypePool.SHORT) return .{ .short = @intCast(pooled.data.primitive) };
+    if (type_idx == TypePool.INT) return .{ .int = @intCast(pooled.data.primitive) };
+    if (type_idx == TypePool.LONG) return .{ .long = pooled.data.primitive };
+    if (type_idx == TypePool.BIG_INT) {
+        var bi: Value.BigInt = .{
+            .bytes = [_]u8{0} ** 32,
+            .len = pooled.data.big_int.len,
+        };
+        @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
+        return .{ .big_int = bi };
+    }
+    if (type_idx == TypePool.GROUP_ELEMENT) {
+        return .{ .group_element = pooled.data.group_element };
+    }
+    if (type_idx == TypePool.SIGMA_PROP) {
+        return .{ .sigma_prop = .{ .data = pooled.data.sigma_prop.slice() } };
+    }
+    if (type_idx == TypePool.BOX) {
+        // Box stored as source + index reference
+        return .{ .box = .{
+            .source = @enumFromInt(@intFromEnum(pooled.data.box.source)),
+            .index = pooled.data.box.index,
+        } };
+    }
+    if (type_idx == TypePool.COLL_BYTE) {
+        return .{ .coll_byte = pooled.data.byte_slice.slice() };
+    }
+
+    // Check Option types (indices >= OPTION_INT are Option variants)
+    // Options store inner_type + value_idx
+    if (type_idx >= TypePool.OPTION_INT) {
+        return .{ .option = .{
+            .inner_type = pooled.data.option.inner_type,
+            .value_idx = pooled.data.option.value_idx,
+        } };
+    }
+
+    // Check Collection types (indices 17-20 are collections)
+    if (type_idx >= TypePool.COLL_BYTE and type_idx <= TypePool.COLL_COLL_BYTE) {
+        if (type_idx == TypePool.COLL_BYTE) {
+            return .{ .coll_byte = pooled.data.byte_slice.slice() };
+        }
+        // Generic collection
+        return .{ .coll = .{
+            .elem_type = pooled.data.collection.elem_type,
+            .start = pooled.data.collection.start_idx,
+            .len = pooled.data.collection.len,
+        } };
+    }
+
+    // For any remaining complex types, examine data union tag
+    // This handles dynamically-typed tuples and other complex types
+    return error.UnsupportedExpression;
 }
 
 // ============================================================================
@@ -621,6 +659,26 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = coll_idx, .phase = .evaluate });
             },
 
+            // Sigma proposition connectives
+            .sigma_and, .sigma_or => {
+                // N-ary: n SigmaProp children → SigmaProp
+                const child_count = node.data;
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Push children in reverse order so first child evaluates first
+                var idx = node_idx + 1;
+                var indices: [256]u16 = undefined;
+                var i: u16 = 0;
+                while (i < child_count) : (i += 1) {
+                    indices[i] = idx;
+                    idx = self.findSubtreeEnd(idx);
+                }
+                // Push in reverse order
+                while (i > 0) {
+                    i -= 1;
+                    try self.pushWork(.{ .node_idx = indices[i], .phase = .evaluate });
+                }
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -761,6 +819,10 @@ pub const Evaluator = struct {
             .filter => try self.computeFilter(node_idx),
             .fold => try self.computeFold(node_idx),
             .flat_map => try self.computeFlatMap(node_idx),
+
+            // Sigma proposition connectives
+            .sigma_and => try self.computeSigmaAnd(node.data),
+            .sigma_or => try self.computeSigmaOr(node.data),
 
             else => {
                 // Other node types don't need compute phase
@@ -1980,6 +2042,289 @@ pub const Evaluator = struct {
         try self.pushValue(.{ .coll_byte = result });
     }
 
+    // ========================================================================
+    // Sigma Proposition Connective Operations
+    // ========================================================================
+
+    /// Compute SigmaAnd: combine multiple SigmaProp children into conjunction
+    /// Children are expected on the value stack in evaluation order
+    fn computeSigmaAnd(self: *Evaluator, child_count: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(child_count >= 2); // AND must have at least 2 children
+        assert(self.value_sp >= child_count); // Children must be on stack
+
+        try self.addCost(20); // SigmaAnd cost from opcodes
+
+        // Pop children in reverse order to build children array
+        var children: [256]*const sigma_tree.SigmaBoolean = undefined;
+        var i: u16 = child_count;
+        while (i > 0) {
+            i -= 1;
+            const val = try self.popValue();
+            children[i] = try self.extractSigmaBoolean(val);
+        }
+
+        // Allocate children slice in arena
+        const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, child_count) catch return error.OutOfMemory;
+        @memcpy(child_slice, children[0..child_count]);
+
+        // Allocate the SigmaBoolean node itself
+        const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+        node_ptr[0] = .{ .cand = .{ .children = child_slice } };
+
+        // Serialize the SigmaBoolean to bytes for SigmaProp
+        const sigma_bytes = try self.serializeSigmaBoolean(&node_ptr[0]);
+
+        // Push result as SigmaProp
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+    }
+
+    /// Compute SigmaOr: combine multiple SigmaProp children into disjunction
+    /// Children are expected on the value stack in evaluation order
+    fn computeSigmaOr(self: *Evaluator, child_count: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(child_count >= 2); // OR must have at least 2 children
+        assert(self.value_sp >= child_count); // Children must be on stack
+
+        try self.addCost(20); // SigmaOr cost from opcodes
+
+        // Pop children in reverse order to build children array
+        var children: [256]*const sigma_tree.SigmaBoolean = undefined;
+        var i: u16 = child_count;
+        while (i > 0) {
+            i -= 1;
+            const val = try self.popValue();
+            children[i] = try self.extractSigmaBoolean(val);
+        }
+
+        // Allocate children slice in arena
+        const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, child_count) catch return error.OutOfMemory;
+        @memcpy(child_slice, children[0..child_count]);
+
+        // Allocate the SigmaBoolean node itself
+        const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+        node_ptr[0] = .{ .cor = .{ .children = child_slice } };
+
+        // Serialize the SigmaBoolean to bytes for SigmaProp
+        const sigma_bytes = try self.serializeSigmaBoolean(&node_ptr[0]);
+
+        // Push result as SigmaProp
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+    }
+
+    /// Extract SigmaBoolean from a Value (must be sigma_prop or boolean)
+    fn extractSigmaBoolean(self: *Evaluator, val: Value) EvalError!*const sigma_tree.SigmaBoolean {
+        switch (val) {
+            .sigma_prop => |sp| {
+                // Parse SigmaBoolean from serialized bytes
+                return try self.parseSigmaBoolean(sp.data);
+            },
+            .boolean => |b| {
+                // Boolean constant becomes trivial_true or trivial_false
+                const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+                node_ptr[0] = if (b) sigma_tree.sigma_true else sigma_tree.sigma_false;
+                return &node_ptr[0];
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    /// Parse SigmaBoolean from serialized bytes
+    /// Format: type_byte + type-specific data
+    /// Returns parsed node and number of bytes consumed
+    fn parseSigmaBooleanWithLen(self: *Evaluator, bytes: []const u8) EvalError!struct { node: *const sigma_tree.SigmaBoolean, len: usize } {
+        if (bytes.len == 0) return error.InvalidData;
+
+        const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+
+        // Parse based on type byte
+        const type_byte = bytes[0];
+        switch (type_byte) {
+            0xCD => {
+                // ProveDlog: 0xCD + 33-byte public key
+                if (bytes.len < 34) return error.InvalidData;
+                var pk: [33]u8 = undefined;
+                @memcpy(&pk, bytes[1..34]);
+                node_ptr[0] = .{ .prove_dlog = sigma_tree.ProveDlog.init(pk) };
+                return .{ .node = &node_ptr[0], .len = 34 };
+            },
+            0xCE => {
+                // ProveDHTuple: 0xCE + 4×33-byte points = 133 bytes total
+                if (bytes.len < 133) return error.InvalidData;
+                var g: [33]u8 = undefined;
+                var h: [33]u8 = undefined;
+                var u: [33]u8 = undefined;
+                var v: [33]u8 = undefined;
+                @memcpy(&g, bytes[1..34]);
+                @memcpy(&h, bytes[34..67]);
+                @memcpy(&u, bytes[67..100]);
+                @memcpy(&v, bytes[100..133]);
+                node_ptr[0] = .{ .prove_dh_tuple = sigma_tree.ProveDHTuple.init(g, h, u, v) };
+                return .{ .node = &node_ptr[0], .len = 133 };
+            },
+            0x01 => {
+                // TrivialTrue
+                node_ptr[0] = sigma_tree.sigma_true;
+                return .{ .node = &node_ptr[0], .len = 1 };
+            },
+            0x00 => {
+                // TrivialFalse
+                node_ptr[0] = sigma_tree.sigma_false;
+                return .{ .node = &node_ptr[0], .len = 1 };
+            },
+            0x98 => {
+                // CAND: 0x98 + count + children
+                if (bytes.len < 2) return error.InvalidData;
+                const count = bytes[1];
+                if (count < 2) return error.InvalidData;
+
+                const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, count) catch return error.OutOfMemory;
+                var offset: usize = 2;
+                for (0..count) |i| {
+                    const child_result = try self.parseSigmaBooleanWithLen(bytes[offset..]);
+                    child_slice[i] = child_result.node;
+                    offset += child_result.len;
+                }
+                node_ptr[0] = .{ .cand = .{ .children = child_slice } };
+                return .{ .node = &node_ptr[0], .len = offset };
+            },
+            0x99 => {
+                // COR: 0x99 + count + children
+                if (bytes.len < 2) return error.InvalidData;
+                const count = bytes[1];
+                if (count < 2) return error.InvalidData;
+
+                const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, count) catch return error.OutOfMemory;
+                var offset: usize = 2;
+                for (0..count) |i| {
+                    const child_result = try self.parseSigmaBooleanWithLen(bytes[offset..]);
+                    child_slice[i] = child_result.node;
+                    offset += child_result.len;
+                }
+                node_ptr[0] = .{ .cor = .{ .children = child_slice } };
+                return .{ .node = &node_ptr[0], .len = offset };
+            },
+            0x9A => {
+                // CTHRESHOLD: 0x9A + k (2 bytes big-endian) + count + children
+                if (bytes.len < 4) return error.InvalidData;
+                const k: u16 = (@as(u16, bytes[1]) << 8) | bytes[2];
+                const count = bytes[3];
+                if (count < 2) return error.InvalidData;
+
+                const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, count) catch return error.OutOfMemory;
+                var offset: usize = 4;
+                for (0..count) |i| {
+                    const child_result = try self.parseSigmaBooleanWithLen(bytes[offset..]);
+                    child_slice[i] = child_result.node;
+                    offset += child_result.len;
+                }
+                node_ptr[0] = .{ .cthreshold = .{ .k = k, .children = child_slice } };
+                return .{ .node = &node_ptr[0], .len = offset };
+            },
+            else => {
+                // Unknown type - return false as fallback
+                node_ptr[0] = sigma_tree.sigma_false;
+                return .{ .node = &node_ptr[0], .len = 1 };
+            },
+        }
+    }
+
+    /// Parse SigmaBoolean from serialized bytes (convenience wrapper)
+    fn parseSigmaBoolean(self: *Evaluator, bytes: []const u8) EvalError!*const sigma_tree.SigmaBoolean {
+        const result = try self.parseSigmaBooleanWithLen(bytes);
+        return result.node;
+    }
+
+    /// Serialize SigmaBoolean to bytes
+    fn serializeSigmaBoolean(self: *Evaluator, node: *const sigma_tree.SigmaBoolean) EvalError![]const u8 {
+        return switch (node.*) {
+            .trivial_true => blk: {
+                const buf = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
+                buf[0] = 0x01;
+                break :blk buf;
+            },
+            .trivial_false => blk: {
+                const buf = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
+                buf[0] = 0x00;
+                break :blk buf;
+            },
+            .prove_dlog => |dlog| blk: {
+                const buf = self.arena.allocSlice(u8, 34) catch return error.OutOfMemory;
+                buf[0] = 0xCD;
+                @memcpy(buf[1..34], &dlog.public_key);
+                break :blk buf;
+            },
+            .prove_dh_tuple => |dht| blk: {
+                const buf = self.arena.allocSlice(u8, 133) catch return error.OutOfMemory;
+                buf[0] = 0xCE;
+                @memcpy(buf[1..34], &dht.g);
+                @memcpy(buf[34..67], &dht.h);
+                @memcpy(buf[67..100], &dht.u);
+                @memcpy(buf[100..133], &dht.v);
+                break :blk buf;
+            },
+            .cand => |and_node| blk: {
+                // Serialize AND: marker + count + children
+                var total_len: usize = 2; // marker + count
+                var child_bytes: [256][]const u8 = undefined;
+                for (and_node.children, 0..) |child, idx| {
+                    const child_ser = try self.serializeSigmaBoolean(child);
+                    child_bytes[idx] = child_ser;
+                    total_len += child_ser.len;
+                }
+                const buf = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+                buf[0] = 0x98; // AND marker
+                buf[1] = @truncate(and_node.children.len);
+                var offset: usize = 2;
+                for (and_node.children, 0..) |_, idx| {
+                    @memcpy(buf[offset..][0..child_bytes[idx].len], child_bytes[idx]);
+                    offset += child_bytes[idx].len;
+                }
+                break :blk buf;
+            },
+            .cor => |or_node| blk: {
+                // Serialize OR: marker + count + children
+                var total_len: usize = 2; // marker + count
+                var child_bytes: [256][]const u8 = undefined;
+                for (or_node.children, 0..) |child, idx| {
+                    const child_ser = try self.serializeSigmaBoolean(child);
+                    child_bytes[idx] = child_ser;
+                    total_len += child_ser.len;
+                }
+                const buf = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+                buf[0] = 0x99; // OR marker
+                buf[1] = @truncate(or_node.children.len);
+                var offset: usize = 2;
+                for (or_node.children, 0..) |_, idx| {
+                    @memcpy(buf[offset..][0..child_bytes[idx].len], child_bytes[idx]);
+                    offset += child_bytes[idx].len;
+                }
+                break :blk buf;
+            },
+            .cthreshold => |th| blk: {
+                // Serialize THRESHOLD: marker + k + count + children
+                var total_len: usize = 4; // marker + k(2) + count
+                var child_bytes: [256][]const u8 = undefined;
+                for (th.children, 0..) |child, idx| {
+                    const child_ser = try self.serializeSigmaBoolean(child);
+                    child_bytes[idx] = child_ser;
+                    total_len += child_ser.len;
+                }
+                const buf = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+                buf[0] = 0x9A; // THRESHOLD marker
+                buf[1] = @truncate(th.k >> 8);
+                buf[2] = @truncate(th.k);
+                buf[3] = @truncate(th.children.len);
+                var offset: usize = 4;
+                for (th.children, 0..) |_, idx| {
+                    @memcpy(buf[offset..][0..child_bytes[idx].len], child_bytes[idx]);
+                    offset += child_bytes[idx].len;
+                }
+                break :blk buf;
+            },
+        };
+    }
+
     /// Helper: get element from collection at index
     fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
         _ = self;
@@ -2170,6 +2515,15 @@ pub const Evaluator = struct {
                 next = self.findSubtreeEnd(next); // Collection
                 next = self.findSubtreeEnd(next); // Zero value
                 next = self.findSubtreeEnd(next); // Lambda (func_value)
+            },
+
+            // sigma_and/sigma_or: child_count children
+            .sigma_and, .sigma_or => {
+                const child_count = node.data;
+                var i: u16 = 0;
+                while (i < child_count) : (i += 1) {
+                    next = self.findSubtreeEnd(next);
+                }
             },
         }
 
@@ -2814,6 +3168,47 @@ test "evaluator: option_get_or_else on None uses default" {
     try std.testing.expectEqual(@as(i32, 42), result.int);
 }
 
+test "evaluator: option_get on nested Option[Option[Int]]" {
+    // Test extracting inner Option from Option[Option[Int]]
+    // OptionGet(Some(Some(42))) should return Some(42)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .option_get };
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree.node_count = 2;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+
+    // Build nested Option structure in ValuePool:
+    // 1. Store innermost value: Int = 42 at index 0
+    const inner_val_idx = eval.pools.values.storePrimitive(types.TypePool.INT, 42) catch unreachable;
+
+    // 2. Store inner Option: Some(42) at index 1
+    const inner_opt_idx = eval.pools.values.storeOption(
+        types.TypePool.OPTION_INT,
+        types.TypePool.INT,
+        inner_val_idx,
+    ) catch unreachable;
+
+    // 3. The outer Option (constant) references the inner Option
+    // Outer type is Option[Option[Int]], which would have a dynamic type index
+    // For testing, we use a value > OPTION_INT to indicate "some Option type"
+    tree.values[0] = .{ .option = .{
+        .inner_type = types.TypePool.OPTION_INT,
+        .value_idx = inner_opt_idx,
+    } };
+    tree.value_count = 1;
+
+    const result = try eval.evaluate();
+
+    // Result should be the inner Option: Some(42)
+    try std.testing.expect(result == .option);
+    try std.testing.expect(result.option.isSome());
+    try std.testing.expectEqual(types.TypePool.INT, result.option.inner_type);
+}
+
 test "evaluator: long_to_byte_array" {
     // LongToByteArray(0x0102030405060708) should return big-endian bytes
     var tree = ExprTree.init();
@@ -3254,4 +3649,129 @@ test "evaluator: fold on empty collection returns zero" {
     // Empty collection: fold returns zero value
     try std.testing.expect(result == .long);
     try std.testing.expectEqual(@as(i64, 42), result.long);
+}
+
+test "evaluator: sigma_and with two TrueLeaf children" {
+    // SigmaAnd(true, true) should produce a CAND SigmaProp
+    // Tree: [sigma_and(2)] [true_leaf] [true_leaf]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .sigma_and, .data = 2 }; // 2 children
+    tree.nodes[1] = .{ .tag = .true_leaf };
+    tree.nodes[2] = .{ .tag = .true_leaf };
+    tree.node_count = 3;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be a SigmaProp containing CAND
+    try std.testing.expect(result == .sigma_prop);
+    // Serialized form: 0x98 (AND marker) + count + children
+    try std.testing.expect(result.sigma_prop.data.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x98), result.sigma_prop.data[0]); // AND marker
+    try std.testing.expectEqual(@as(u8, 2), result.sigma_prop.data[1]); // 2 children
+}
+
+test "evaluator: sigma_or with two TrueLeaf children" {
+    // SigmaOr(true, true) should produce a COR SigmaProp
+    // Tree: [sigma_or(2)] [true_leaf] [true_leaf]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .sigma_or, .data = 2 }; // 2 children
+    tree.nodes[1] = .{ .tag = .true_leaf };
+    tree.nodes[2] = .{ .tag = .true_leaf };
+    tree.node_count = 3;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be a SigmaProp containing COR
+    try std.testing.expect(result == .sigma_prop);
+    // Serialized form: 0x99 (OR marker) + count + children
+    try std.testing.expect(result.sigma_prop.data.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x99), result.sigma_prop.data[0]); // OR marker
+    try std.testing.expectEqual(@as(u8, 2), result.sigma_prop.data[1]); // 2 children
+}
+
+test "evaluator: sigma_and with ProveDlog children" {
+    // SigmaAnd(pk1, pk2) should produce CAND with two ProveDlog leaves
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .sigma_and, .data = 2 }; // 2 children
+    tree.nodes[1] = .{ .tag = .constant, .data = 0 }; // First SigmaProp
+    tree.nodes[2] = .{ .tag = .constant, .data = 1 }; // Second SigmaProp
+    tree.node_count = 3;
+
+    // Create two ProveDlog sigma props with different public keys
+    // Public keys must start with 0x02 or 0x03 (compressed EC point prefix)
+    var pk1_data: [34]u8 = undefined;
+    pk1_data[0] = 0xCD; // ProveDlog marker
+    pk1_data[1] = 0x02; // Compressed point prefix
+    @memset(pk1_data[2..], 0x01); // pk1 x-coordinate
+
+    var pk2_data: [34]u8 = undefined;
+    pk2_data[0] = 0xCD; // ProveDlog marker
+    pk2_data[1] = 0x03; // Compressed point prefix
+    @memset(pk2_data[2..], 0x02); // pk2 x-coordinate
+
+    tree.values[0] = .{ .sigma_prop = .{ .data = &pk1_data } };
+    tree.values[1] = .{ .sigma_prop = .{ .data = &pk2_data } };
+    tree.value_count = 2;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be SigmaProp with CAND structure
+    try std.testing.expect(result == .sigma_prop);
+    try std.testing.expectEqual(@as(u8, 0x98), result.sigma_prop.data[0]); // AND marker
+    try std.testing.expectEqual(@as(u8, 2), result.sigma_prop.data[1]); // 2 children
+    // Total length: 2 (header) + 34 (pk1) + 34 (pk2) = 70 bytes
+    try std.testing.expectEqual(@as(usize, 70), result.sigma_prop.data.len);
+}
+
+test "evaluator: nested sigma_and(sigma_or, sigma_prop)" {
+    // SigmaAnd(SigmaOr(true, false), pk) - nested structure
+    // Tree: [sigma_and(2)] [sigma_or(2)] [true_leaf] [false_leaf] [constant(pk)]
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .sigma_and, .data = 2 }; // 2 children
+    tree.nodes[1] = .{ .tag = .sigma_or, .data = 2 }; // inner SigmaOr
+    tree.nodes[2] = .{ .tag = .true_leaf };
+    tree.nodes[3] = .{ .tag = .false_leaf };
+    tree.nodes[4] = .{ .tag = .constant, .data = 0 }; // ProveDlog
+    tree.node_count = 5;
+
+    // Create a ProveDlog sigma prop
+    var pk_data: [34]u8 = undefined;
+    pk_data[0] = 0xCD; // ProveDlog marker
+    pk_data[1] = 0x02; // Compressed point prefix
+    @memset(pk_data[2..], 0xAB);
+
+    tree.values[0] = .{ .sigma_prop = .{ .data = &pk_data } };
+    tree.value_count = 1;
+
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be SigmaProp with nested CAND(COR(...), ProveDlog)
+    try std.testing.expect(result == .sigma_prop);
+    try std.testing.expectEqual(@as(u8, 0x98), result.sigma_prop.data[0]); // AND marker
+    try std.testing.expectEqual(@as(u8, 2), result.sigma_prop.data[1]); // 2 children
+    // First child is COR
+    try std.testing.expectEqual(@as(u8, 0x99), result.sigma_prop.data[2]); // OR marker
+
+    // Now parse the result back to verify roundtrip
+    const parsed = try eval.parseSigmaBoolean(result.sigma_prop.data);
+    try std.testing.expect(parsed.* == .cand);
+    try std.testing.expectEqual(@as(usize, 2), parsed.cand.children.len);
+    try std.testing.expect(parsed.cand.children[0].* == .cor);
+    try std.testing.expect(parsed.cand.children[1].* == .prove_dlog);
 }
