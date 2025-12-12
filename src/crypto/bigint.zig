@@ -490,6 +490,72 @@ pub const BigInt256 = struct {
         return result;
     }
 
+    /// Modular multiplicative inverse using Extended Euclidean Algorithm
+    /// Returns x such that (self * x) ≡ 1 (mod m)
+    /// Requires: gcd(self, m) = 1 (coprime)
+    /// Reference: Java BigInteger.modInverse behavior
+    pub fn modInverse(self: BigInt256, m: BigInt256) BigIntError!BigInt256 {
+        // Precondition: modulus must be positive
+        if (m.isZero() or m.isNegative()) return error.DivisionByZero;
+        // Precondition: self must not be zero
+        if (self.isZero()) return error.DivisionByZero;
+
+        // Work with absolute value of self
+        const a_abs = BigInt256{ .limbs = self.limbs, .negative = false };
+
+        // Extended Euclidean Algorithm
+        // Finds x, y such that: a*x + m*y = gcd(a, m)
+        // If gcd = 1, then x is the modular inverse
+
+        var old_r = m;
+        var r = try a_abs.mod(m); // Reduce a mod m first
+        if (r.isZero()) return error.DivisionByZero; // a ≡ 0 (mod m), no inverse
+
+        var old_s = zero;
+        var s = one;
+
+        // Invariant: old_r = old_s * a + old_t * m (we don't track t)
+        // Invariant: r = s * a + t * m
+        while (!r.isZero()) {
+            const quotient = try old_r.div(r);
+
+            // (old_r, r) = (r, old_r - quotient * r)
+            const temp_r = r;
+            const qr = try quotient.mul(r);
+            r = try old_r.sub(qr);
+            old_r = temp_r;
+
+            // (old_s, s) = (s, old_s - quotient * s)
+            const temp_s = s;
+            const qs = try quotient.mul(s);
+            s = try old_s.sub(qs);
+            old_s = temp_s;
+        }
+
+        // old_r is now the GCD
+        // Postcondition: GCD must be 1 for inverse to exist
+        if (!old_r.eql(one)) return error.DivisionByZero;
+
+        // old_s is the coefficient, may be negative
+        // Normalize to range [0, m-1]
+        var result = old_s;
+        if (result.isNegative()) {
+            result = try result.add(m);
+        }
+
+        // If original self was negative, negate result and normalize
+        if (self.isNegative()) {
+            result = try m.sub(result);
+        }
+
+        // Postcondition: result is in range [0, m-1]
+        assert(!result.isNegative());
+        assert(result.compare(m) == .lt);
+        // Postcondition: (self * result) mod m == 1
+        // (Verified by tests, not checked here for performance)
+        return result;
+    }
+
     // ========================================================================
     // Bitwise Operations (on magnitude)
     // ========================================================================
@@ -857,4 +923,80 @@ test "bigint: overflow detection" {
 
 test "bigint: MIN div -1 overflow" {
     try std.testing.expectError(error.Overflow, BigInt256.min_value.div(BigInt256.neg_one));
+}
+
+test "bigint: modInverse basic" {
+    // 3 * 5 = 15 ≡ 1 (mod 7)
+    const a = BigInt256.fromInt(3);
+    const m = BigInt256.fromInt(7);
+
+    const inv = try a.modInverse(m);
+    try std.testing.expect(inv.eql(BigInt256.fromInt(5)));
+
+    // Verify: (a * inv) mod m == 1
+    const product = try a.mul(inv);
+    const check = try product.mod(m);
+    try std.testing.expect(check.eql(BigInt256.one));
+}
+
+test "bigint: modInverse larger values" {
+    // Test with larger numbers
+    const a = BigInt256.fromInt(17);
+    const m = BigInt256.fromInt(43);
+
+    const inv = try a.modInverse(m);
+
+    // Verify: (a * inv) mod m == 1
+    const product = try a.mul(inv);
+    const check = try product.mod(m);
+    try std.testing.expect(check.eql(BigInt256.one));
+}
+
+test "bigint: modInverse when a > m" {
+    // a = 10, m = 7, effective a = 3
+    const a = BigInt256.fromInt(10);
+    const m = BigInt256.fromInt(7);
+
+    const inv = try a.modInverse(m);
+
+    // Verify: (a * inv) mod m == 1
+    const product = try a.mul(inv);
+    const check = try product.mod(m);
+    try std.testing.expect(check.eql(BigInt256.one));
+}
+
+test "bigint: modInverse no inverse exists" {
+    // gcd(6, 9) = 3 ≠ 1, no inverse
+    const a = BigInt256.fromInt(6);
+    const m = BigInt256.fromInt(9);
+
+    try std.testing.expectError(error.DivisionByZero, a.modInverse(m));
+}
+
+test "bigint: modInverse zero modulus" {
+    const a = BigInt256.fromInt(3);
+    try std.testing.expectError(error.DivisionByZero, a.modInverse(BigInt256.zero));
+}
+
+test "bigint: modInverse zero value" {
+    const m = BigInt256.fromInt(7);
+    try std.testing.expectError(error.DivisionByZero, BigInt256.zero.modInverse(m));
+}
+
+test "bigint: modInverse negative value" {
+    // -3 mod 7: inverse of -3 ≡ 4 (mod 7) is 2 (since 4*2 = 8 ≡ 1)
+    const a = BigInt256.fromInt(-3);
+    const m = BigInt256.fromInt(7);
+
+    const inv = try a.modInverse(m);
+
+    // Verify: (a * inv) mod m == 1
+    // -3 * inv should give result ≡ 1 (mod 7)
+    const product = try a.mul(inv);
+    var check = try product.mod(m);
+    // Normalize negative result
+    if (check.isNegative()) {
+        check = try check.add(m);
+    }
+    try std.testing.expect(check.eql(BigInt256.one));
 }
