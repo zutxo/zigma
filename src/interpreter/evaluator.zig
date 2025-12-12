@@ -16,8 +16,11 @@ const assert = std.debug.assert;
 const context = @import("context.zig");
 const memory = @import("memory.zig");
 const value_pool = @import("value_pool.zig");
+const register_cache = @import("register_cache.zig");
 const expr = @import("../serialization/expr_serializer.zig");
 const data = @import("../serialization/data_serializer.zig");
+const type_serializer = @import("../serialization/type_serializer.zig");
+const vlq = @import("../serialization/vlq.zig");
 const types = @import("../core/types.zig");
 const hash = @import("../crypto/hash.zig");
 const crypto_ops = @import("ops/crypto.zig");
@@ -25,16 +28,22 @@ const sigma_tree = @import("../sigma/sigma_tree.zig");
 const avl_tree = @import("../crypto/avl_tree.zig");
 
 const Context = context.Context;
+const BoxView = context.BoxView;
+const Register = context.Register;
 const ExprTree = expr.ExprTree;
 const ExprNode = expr.ExprNode;
 const ExprTag = expr.ExprTag;
 const BinOpKind = expr.BinOpKind;
 const Value = data.Value;
 const TypePool = types.TypePool;
+const TypeIndex = types.TypeIndex;
 const BumpAllocator = memory.BumpAllocator;
 const ValuePool = value_pool.ValuePool;
 const PooledValue = value_pool.PooledValue;
 const null_value_idx = value_pool.null_value_idx;
+const RegisterCache = register_cache.RegisterCache;
+const RegisterCacheEntry = register_cache.RegisterCacheEntry;
+const BoxSource = register_cache.BoxSource;
 
 // ============================================================================
 // Configuration
@@ -242,6 +251,8 @@ const FixedCost = struct {
     // AVL tree operation costs (from opcodes.zig)
     pub const create_avl_tree: u32 = 100;
     pub const tree_lookup: u32 = 800; // High cost due to proof verification
+    // Box extraction costs (from opcodes.zig)
+    pub const extract_register: u32 = 50; // ExtractRegisterAs base cost
 };
 
 // ============================================================================
@@ -286,9 +297,19 @@ pub const Evaluator = struct {
     /// Memory pools container
     const MemoryPools = struct {
         values: ValuePool = ValuePool.init(),
+        register_cache: RegisterCache = RegisterCache.init(),
+        type_pool: TypePool = TypePool.init(),
 
         fn init() MemoryPools {
             return .{};
+        }
+
+        /// Reset transient pools for new evaluation.
+        /// Note: values pool is NOT reset to preserve pre-populated Option inner values.
+        fn reset(self: *MemoryPools) void {
+            self.register_cache.reset();
+            self.type_pool.reset();
+            // self.values is not reset - may contain pre-populated constants
         }
     };
 
@@ -316,6 +337,7 @@ pub const Evaluator = struct {
         self.cost_used = 0;
         self.arena.reset();
         self.var_bindings = [_]?Value{null} ** max_var_bindings;
+        self.pools.reset();
 
         // Push root node for evaluation (index 0)
         try self.pushWork(.{ .node_idx = 0, .phase = .evaluate });
@@ -586,6 +608,12 @@ pub const Evaluator = struct {
 
             .select_field => {
                 // Unary: Tuple → element value
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .extract_register_as => {
+                // Unary: Box → Option[T] (register value with lazy deserialization)
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
@@ -877,6 +905,10 @@ pub const Evaluator = struct {
 
             .select_field => {
                 try self.computeSelectField(node.data);
+            },
+
+            .extract_register_as => {
+                try self.computeExtractRegisterAs(node.data);
             },
 
             .tuple_construct, .pair_construct, .triple_construct => {
@@ -1227,6 +1259,174 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
+    }
+
+    /// Compute ExtractRegisterAs - extract register value from box with lazy loading
+    /// node.data layout: (type_idx << 4) | register_id
+    fn computeExtractRegisterAs(self: *Evaluator, node_data: u16) EvalError!void {
+        // PRECONDITION: Value stack has box value
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.extract_register);
+
+        // Unpack node data: register_id (4 bits) and type_idx (12 bits)
+        const register_id: u4 = @truncate(node_data & 0xF);
+        const type_idx: TypeIndex = @truncate(node_data >> 4);
+
+        // INVARIANT: Register ID is valid (0-9)
+        if (register_id > 9) return error.InvalidData;
+
+        // Pop box value
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        // Convert BoxSource from Value to RegisterCache format
+        const source: BoxSource = switch (box_val.box.source) {
+            .inputs => .inputs,
+            .outputs => .outputs,
+            .data_inputs => .data_inputs,
+        };
+        const box_idx = box_val.box.index;
+        const reg = @as(Register, @enumFromInt(register_id));
+
+        // Load register with caching
+        const result = try self.loadRegister(source, box_idx, reg, type_idx);
+        try self.pushValue(result);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Load register value with lazy deserialization and caching.
+    /// Returns Option[T] - Some(value) if register exists, None if absent.
+    fn loadRegister(
+        self: *Evaluator,
+        source: BoxSource,
+        box_idx: u16,
+        reg: Register,
+        expected_type: TypeIndex,
+    ) EvalError!Value {
+        // PRECONDITION: Register is user-defined (R4-R9)
+        assert(@intFromEnum(reg) >= 4);
+        assert(@intFromEnum(reg) <= 9);
+
+        // Check cache first
+        const cached = self.pools.register_cache.get(source, box_idx, reg);
+
+        switch (cached) {
+            .not_loaded => {
+                // First access - deserialize and cache
+                return self.deserializeAndCacheRegister(source, box_idx, reg, expected_type);
+            },
+            .loaded => |value_idx| {
+                // Cache hit - convert PooledValue to Value wrapped in Option
+                const pooled = self.pools.values.get(value_idx) orelse return error.InvalidState;
+                const inner_val = try pooledValueToValue(pooled);
+                // Store inner value and return Option.Some
+                const stored_idx = try self.storeValueInPool(inner_val, expected_type);
+                return .{ .option = .{ .inner_type = expected_type, .value_idx = stored_idx } };
+            },
+            .absent => {
+                // Register not present - return Option.None
+                return .{ .option = .{ .inner_type = expected_type, .value_idx = null_value_idx } };
+            },
+            .invalid => |_| {
+                // Previous deserialization failed - return error
+                return error.InvalidData;
+            },
+        }
+    }
+
+    /// Deserialize register bytes and cache the result.
+    fn deserializeAndCacheRegister(
+        self: *Evaluator,
+        source: BoxSource,
+        box_idx: u16,
+        reg: Register,
+        expected_type: TypeIndex,
+    ) EvalError!Value {
+        // PRECONDITIONS
+        assert(@intFromEnum(reg) >= 4);
+        assert(@intFromEnum(reg) <= 9);
+
+        // Get the box from context
+        const box = self.getBoxFromSource(source, box_idx) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // Get raw register bytes
+        const raw_bytes = box.getRegister(reg);
+
+        if (raw_bytes == null) {
+            // Register not present - cache and return Option.None
+            self.pools.register_cache.markAbsent(source, box_idx, reg);
+            return .{ .option = .{ .inner_type = expected_type, .value_idx = null_value_idx } };
+        }
+
+        // Deserialize: type is already known from expected_type
+        var reader = vlq.Reader.init(raw_bytes.?);
+
+        // Deserialize value using expected_type (ErgoTree type is embedded in register bytes)
+        // First, read the actual type from the register bytes
+        const actual_type = type_serializer.deserialize(&self.pools.type_pool, &reader) catch {
+            self.pools.register_cache.markInvalid(source, box_idx, reg, .invalid_data);
+            return error.InvalidData;
+        };
+
+        // Deserialize the value
+        const value = data.deserialize(
+            actual_type,
+            &self.pools.type_pool,
+            &reader,
+            &self.arena,
+            &self.pools.values,
+        ) catch {
+            self.pools.register_cache.markInvalid(source, box_idx, reg, .invalid_data);
+            return error.InvalidData;
+        };
+
+        // Store in ValuePool and cache
+        const value_idx = self.storeValueInPool(value, actual_type) catch {
+            self.pools.register_cache.markInvalid(source, box_idx, reg, .pool_exhausted);
+            return error.OutOfMemory;
+        };
+
+        self.pools.register_cache.markLoaded(source, box_idx, reg, value_idx);
+
+        // Return as Option.Some
+        return .{ .option = .{ .inner_type = expected_type, .value_idx = value_idx } };
+    }
+
+    /// Get box from context by source and index
+    fn getBoxFromSource(self: *const Evaluator, source: BoxSource, idx: u16) ?*const BoxView {
+        return switch (source) {
+            .inputs => if (idx < self.ctx.inputs.len) &self.ctx.inputs[idx] else null,
+            .outputs => if (idx < self.ctx.outputs.len) &self.ctx.outputs[idx] else null,
+            .data_inputs => if (idx < self.ctx.data_inputs.len) &self.ctx.data_inputs[idx] else null,
+        };
+    }
+
+    /// Store a Value in the pool and return its index
+    fn storeValueInPool(self: *Evaluator, value: Value, type_idx: TypeIndex) error{OutOfMemory}!u16 {
+        const idx = self.pools.values.alloc() catch return error.OutOfMemory;
+
+        // Convert Value to PooledValue
+        const pooled: PooledValue = switch (value) {
+            .unit => .{ .type_idx = TypePool.UNIT, .data = .{ .primitive = 0 } },
+            .boolean => |b| .{ .type_idx = TypePool.BOOLEAN, .data = .{ .primitive = if (b) 1 else 0 } },
+            .byte => |b| .{ .type_idx = TypePool.BYTE, .data = .{ .primitive = b } },
+            .short => |s| .{ .type_idx = TypePool.SHORT, .data = .{ .primitive = s } },
+            .int => |i| .{ .type_idx = TypePool.INT, .data = .{ .primitive = i } },
+            .long => |l| .{ .type_idx = TypePool.LONG, .data = .{ .primitive = l } },
+            .group_element => |ge| .{ .type_idx = TypePool.GROUP_ELEMENT, .data = .{ .group_element = ge } },
+            .coll_byte => |cb| .{ .type_idx = TypePool.COLL_BYTE, .data = .{ .byte_slice = .{ .ptr = cb.ptr, .len = @intCast(cb.len) } } },
+            .option => |o| .{ .type_idx = type_idx, .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } } },
+            .box => |b| .{ .type_idx = TypePool.BOX, .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } } },
+            else => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } }, // Fallback for complex types
+        };
+
+        self.pools.values.set(idx, pooled);
+        return idx;
     }
 
     /// Compute tuple construction - create tuple from n values on stack
@@ -3211,7 +3411,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as => 1,
 
             // Binary operations (2 children)
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map => 2,
@@ -4749,4 +4949,88 @@ test "evaluator: zip different length collections" {
     try std.testing.expectEqual(@as(u8, 4), result.coll_byte[1]);
     try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
     try std.testing.expectEqual(@as(u8, 5), result.coll_byte[3]);
+}
+
+// ============================================================================
+// ExtractRegisterAs Tests
+// ============================================================================
+
+test "evaluator: extract_register_as absent returns None" {
+    // ExtractRegisterAs on SELF.R4 when R4 is not defined should return None
+    var tree: ExprTree = .{};
+    const box = context.testBox();
+    // Don't set any registers - all should be null
+    const inputs = [_]context.BoxView{box};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // extract_register_as node: register_id=4 (R4), type_idx=4 (INT)
+    // data = (type_idx << 4) | register_id = (4 << 4) | 4 = 68
+    tree.nodes[0] = .{ .tag = .extract_register_as, .data = (TypePool.INT << 4) | 4 };
+    tree.nodes[1] = .{ .tag = .self_box };
+    tree.node_count = 2;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // Result should be Option.None
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+}
+
+test "evaluator: extract_register_as cache hit returns same result" {
+    // Accessing the same register twice should use cache on second access
+    var tree: ExprTree = .{};
+    const box = context.testBox();
+    // R4 not defined
+    const inputs = [_]context.BoxView{box};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // First access: extract_register_as on SELF.R5
+    tree.nodes[0] = .{ .tag = .extract_register_as, .data = (TypePool.INT << 4) | 5 };
+    tree.nodes[1] = .{ .tag = .self_box };
+    tree.node_count = 2;
+
+    var eval = Evaluator.init(&tree, &ctx);
+
+    // First evaluation
+    const result1 = try eval.evaluate();
+    try std.testing.expect(result1 == .option);
+    try std.testing.expectEqual(null_value_idx, result1.option.value_idx);
+
+    // Check cache was populated
+    const cached = eval.pools.register_cache.get(.inputs, 0, .R5);
+    try std.testing.expectEqual(RegisterCacheEntry.absent, cached);
+}
+
+test "evaluator: register_cache reset clears between evaluations" {
+    // Verify register cache is properly reset
+    var tree: ExprTree = .{};
+    const box = context.testBox();
+    const inputs = [_]context.BoxView{box};
+    const ctx = Context.forHeight(100, &inputs);
+
+    tree.nodes[0] = .{ .tag = .extract_register_as, .data = (TypePool.INT << 4) | 6 };
+    tree.nodes[1] = .{ .tag = .self_box };
+    tree.node_count = 2;
+
+    var eval = Evaluator.init(&tree, &ctx);
+
+    // First evaluation populates cache
+    _ = try eval.evaluate();
+    const cached1 = eval.pools.register_cache.get(.inputs, 0, .R6);
+    try std.testing.expectEqual(RegisterCacheEntry.absent, cached1);
+
+    // Manually set a different cache entry
+    eval.pools.register_cache.markLoaded(.inputs, 0, .R7, 42);
+
+    // Second evaluation should reset cache
+    _ = try eval.evaluate();
+
+    // R6 should be repopulated, R7 should be reset to not_loaded
+    const cached2 = eval.pools.register_cache.get(.inputs, 0, .R6);
+    try std.testing.expectEqual(RegisterCacheEntry.absent, cached2);
+
+    const cached3 = eval.pools.register_cache.get(.inputs, 0, .R7);
+    const expected: RegisterCacheEntry = .not_loaded;
+    try std.testing.expectEqual(expected, cached3);
 }

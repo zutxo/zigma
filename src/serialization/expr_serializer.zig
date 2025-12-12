@@ -166,6 +166,11 @@ pub const ExprTag = enum(u8) {
     /// Tree lookup (opcode 0xB7/183) - tree, key, proof → Option[Coll[Byte]]
     tree_lookup,
 
+    // Box extraction operations (opcodes 0xC5-0xC9 / 193-201)
+    /// Extract register value from box (opcode 0xC7/199) - Box, regId, type → Option[T]
+    /// data: low 4 bits = register_id (0-9), rest = type_idx for inner type
+    extract_register_as,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -501,6 +506,8 @@ fn deserializeWithDepth(
             // AVL tree operations
             opcodes.AvlTree => try deserializeCreateAvlTree(tree, reader, arena, depth),
             opcodes.AvlTreeGet => try deserializeTreeLookup(tree, reader, arena, depth),
+            // Box extraction operations
+            opcodes.ExtractRegisterAs => try deserializeExtractRegisterAs(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -981,6 +988,59 @@ fn deserializeSelectN(
 
     // Parse the tuple expression
     try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+/// Deserialize ExtractRegisterAs (opcode 0xC7 / 199)
+/// Serialization format (per Rust): box_expr + register_id (i8) + elem_type
+/// We add the node first (pre-order), then parse child, then read trailing metadata
+fn deserializeExtractRegisterAs(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Add the extract_register_as node first (pre-order) with placeholder data
+    const node_idx = try tree.addNode(.{
+        .tag = .extract_register_as,
+        .data = 0, // Placeholder, will be filled after parsing child
+        .result_type = TypePool.ANY, // Returns Option[T], type known at runtime
+    });
+
+    // Parse the box expression (child node)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Now read the trailing metadata: register_id and elem_type
+    // Read register ID (i8 in Rust, but we treat as unsigned 0-9)
+    const register_id_byte = reader.readByte() catch |e| return mapVlqError(e);
+    const register_id: u4 = @truncate(register_id_byte);
+
+    // INVARIANT: Register ID must be 0-9
+    if (register_id > 9) return error.InvalidData;
+
+    // Read the element type (inner type of Option[T])
+    const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            else => error.InvalidData,
+        };
+    };
+
+    // Pack register_id (4 bits) and type_idx (12 bits) into data field
+    // data = (type_idx << 4) | register_id
+    const data: u16 = (@as(u16, type_idx) << 4) | @as(u16, register_id);
+
+    // Update the node with actual data
+    tree.nodes[node_idx].data = data;
+
+    // POSTCONDITION: Node has valid data
+    assert(tree.nodes[node_idx].tag == .extract_register_as);
 }
 
 fn deserializeTuple(
