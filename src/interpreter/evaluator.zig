@@ -2559,6 +2559,8 @@ pub const Evaluator = struct {
         };
 
         // Construct AvlTreeData
+        // INVARIANT: digest_bytes validated to be correct size
+        assert(digest_bytes.len == avl_tree.digest_size);
         var digest: [avl_tree.digest_size]u8 = undefined;
         @memcpy(&digest, digest_bytes);
         const tree_flags = avl_tree.AvlTreeFlags.fromByte(flags_byte);
@@ -2601,6 +2603,9 @@ pub const Evaluator = struct {
         if (key.len != tree_data.key_length) {
             return error.InvalidData;
         }
+
+        // INVARIANT: key length validated against tree parameters
+        assert(key.len == tree_data.key_length);
 
         // For now, use arena as the verifier's arena
         // This is safe since we're in a single evaluation context

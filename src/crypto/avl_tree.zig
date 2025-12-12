@@ -332,6 +332,10 @@ pub const BatchAVLVerifier = struct {
             return error.InvalidKeyLength;
         }
 
+        // PRECONDITION: Verifier must have valid state
+        assert(self.key_length > 0);
+        assert(self.key_length <= max_key_length);
+
         // Read proof node bytes
         const node_proof = self.readProofBytes() catch return .verification_failed;
         if (node_proof.len == 0) {
