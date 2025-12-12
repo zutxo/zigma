@@ -222,6 +222,7 @@ const FixedCost = struct {
     pub const self_box: u32 = 10;
     pub const inputs: u32 = 10;
     pub const outputs: u32 = 10;
+    pub const data_inputs: u32 = 10; // CONTEXT.dataInputs
     pub const blake2b256_base: u32 = 59; // Base cost for CalcBlake2b256
     pub const sha256_base: u32 = 64; // Base cost for CalcSha256
     pub const hash_per_byte: u32 = 1; // Per-byte cost for hashing
@@ -2480,6 +2481,21 @@ pub const Evaluator = struct {
     /// AvlTree type code from Rust types/savltree.rs
     const AvlTreeTypeCode: u8 = 100; // TYPE_CODE for AvlTree (0x64)
 
+    /// Context type code from Rust types/scontext.rs
+    const ContextTypeCode: u8 = 101; // TYPE_CODE for Context (0x65)
+
+    /// Context method IDs from Rust types/scontext.rs
+    const ContextMethodId = struct {
+        const data_inputs: u8 = 1; // CONTEXT.dataInputs → Coll[Box]
+        const headers: u8 = 2; // CONTEXT.headers → Coll[Header]
+        const pre_header: u8 = 3; // CONTEXT.preHeader → PreHeader
+        const inputs: u8 = 4; // CONTEXT.INPUTS → Coll[Box]
+        const outputs: u8 = 5; // CONTEXT.OUTPUTS → Coll[Box]
+        const height: u8 = 6; // CONTEXT.HEIGHT → Int
+        const self_box: u8 = 7; // CONTEXT.SELF → Box
+        const self_box_index: u8 = 8; // CONTEXT.selfBoxIndex → Int
+    };
+
     /// AvlTree method IDs from Rust types/savltree.rs
     const AvlTreeMethodId = struct {
         const digest: u8 = 8; // tree.digest → Coll[Byte]
@@ -2538,6 +2554,12 @@ pub const Evaluator = struct {
                 AvlTreeMethodId.remove,
                 AvlTreeMethodId.insert_or_update,
                 => return error.UnsupportedExpression,
+                else => return error.UnsupportedExpression,
+            }
+        } else if (type_code == ContextTypeCode) {
+            // Context methods
+            switch (method_id) {
+                ContextMethodId.data_inputs => try self.computeDataInputs(),
                 else => return error.UnsupportedExpression,
             }
         } else {
@@ -2640,6 +2662,32 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
         assert(self.value_sp == initial_sp);
+    }
+
+    // ========================================================================
+    // Context Method Operations
+    // ========================================================================
+
+    /// Compute CONTEXT.dataInputs: returns Coll[Box] of data input boxes
+    /// Data inputs are read-only reference boxes in the transaction
+    fn computeDataInputs(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        // Context object is on stack but we don't actually need it - it's the implicit context
+        assert(self.value_sp > 0);
+
+        // Pop the context object (we don't use it, we use self.ctx directly)
+        _ = try self.popValue();
+
+        try self.addCost(FixedCost.data_inputs);
+
+        // INVARIANT: Data inputs count is bounded
+        assert(self.ctx.data_inputs.len <= context.max_data_inputs);
+
+        // Push box collection reference (same pattern as INPUTS/OUTPUTS)
+        try self.pushValue(.{ .box_coll = .{ .source = .data_inputs } });
+
+        // POSTCONDITION: One value pushed to stack
+        assert(self.value_sp > 0);
     }
 
     // ========================================================================
@@ -5033,4 +5081,31 @@ test "evaluator: register_cache reset clears between evaluations" {
     const cached3 = eval.pools.register_cache.get(.inputs, 0, .R7);
     const expected: RegisterCacheEntry = .not_loaded;
     try std.testing.expectEqual(expected, cached3);
+}
+
+test "evaluator: CONTEXT.dataInputs returns box collection" {
+    // Test method call: CONTEXT.dataInputs
+    // MethodCall pops obj from stack, calls method, pushes result
+    var tree = ExprTree.init();
+
+    // MethodCall node: type_code=101 (Context), method_id=1 (dataInputs)
+    // data = (method_id << 8) | type_code = (1 << 8) | 101 = 357
+    tree.nodes[0] = .{ .tag = .method_call, .data = (1 << 8) | 101 };
+    // Use unit as placeholder obj since computeDataInputs ignores it
+    // (it uses self.ctx directly, not the popped value)
+    tree.nodes[1] = .{ .tag = .unit };
+    tree.node_count = 2;
+
+    // Set up context with data inputs
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const test_data_inputs = [_]context.BoxView{ context.testBox(), context.testBox() };
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.data_inputs = &test_data_inputs;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    const result = try eval.evaluate();
+
+    // POSTCONDITION: Result is box collection referencing data_inputs
+    try std.testing.expect(result == .box_coll);
+    try std.testing.expectEqual(Value.BoxCollRef{ .source = .data_inputs }, result.box_coll);
 }
