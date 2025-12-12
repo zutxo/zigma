@@ -22,6 +22,7 @@ const types = @import("../core/types.zig");
 const hash = @import("../crypto/hash.zig");
 const crypto_ops = @import("ops/crypto.zig");
 const sigma_tree = @import("../sigma/sigma_tree.zig");
+const avl_tree = @import("../crypto/avl_tree.zig");
 
 const Context = context.Context;
 const ExprTree = expr.ExprTree;
@@ -238,6 +239,9 @@ const FixedCost = struct {
     // Sigma proposition connective costs (from opcodes.zig)
     pub const sigma_and: u32 = 20;
     pub const sigma_or: u32 = 20;
+    // AVL tree operation costs (from opcodes.zig)
+    pub const create_avl_tree: u32 = 100;
+    pub const tree_lookup: u32 = 800; // High cost due to proof verification
 };
 
 // ============================================================================
@@ -736,6 +740,40 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = obj_idx, .phase = .evaluate });
             },
 
+            // AVL tree operations
+            .create_avl_tree => {
+                // CreateAvlTree: 3 or 4 children (flags, digest, key_length, opt value_length)
+                // node.data = 1 if value_length present, 0 if not
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+
+                // Find child indices
+                const flags_idx = node_idx + 1;
+                const digest_idx = self.findSubtreeEnd(flags_idx);
+                const key_len_idx = self.findSubtreeEnd(digest_idx);
+
+                if (node.data == 1) {
+                    // Has value_length: 4 children
+                    const val_len_idx = self.findSubtreeEnd(key_len_idx);
+                    try self.pushWork(.{ .node_idx = val_len_idx, .phase = .evaluate });
+                }
+                try self.pushWork(.{ .node_idx = key_len_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = digest_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = flags_idx, .phase = .evaluate });
+            },
+
+            .tree_lookup => {
+                // TreeLookup: 3 children (tree, key, proof)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+
+                const tree_idx = node_idx + 1;
+                const key_idx = self.findSubtreeEnd(tree_idx);
+                const proof_idx = self.findSubtreeEnd(key_idx);
+
+                try self.pushWork(.{ .node_idx = proof_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = key_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = tree_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 return error.UnsupportedExpression;
             },
@@ -886,6 +924,10 @@ pub const Evaluator = struct {
 
             // Method call (collection methods)
             .method_call => try self.computeMethodCall(node_idx),
+
+            // AVL tree operations
+            .create_avl_tree => try self.computeCreateAvlTree(node.data),
+            .tree_lookup => try self.computeTreeLookup(),
 
             else => {
                 // Other node types don't need compute phase
@@ -2235,6 +2277,24 @@ pub const Evaluator = struct {
         const ends_with: u8 = 32;
     };
 
+    /// AvlTree type code from Rust types/savltree.rs
+    const AvlTreeTypeCode: u8 = 100; // TYPE_CODE for AvlTree (0x64)
+
+    /// AvlTree method IDs from Rust types/savltree.rs
+    const AvlTreeMethodId = struct {
+        const digest: u8 = 8; // tree.digest → Coll[Byte]
+        const enabled_operations: u8 = 9; // tree.enabledOperations → Byte
+        const key_length: u8 = 10; // tree.keyLength → Int
+        const value_length_opt: u8 = 11; // tree.valueLengthOpt → Option[Int]
+        const insert: u8 = 12; // tree.insert(entries, proof) → Option[AvlTree]
+        const update: u8 = 13; // tree.update(entries, proof) → Option[AvlTree]
+        const remove: u8 = 14; // tree.remove(keys, proof) → Option[AvlTree]
+        const contains: u8 = 15; // tree.contains(key, proof) → Boolean
+        const insert_or_update: u8 = 16; // tree.insertOrUpdate(entries, proof) → Option[AvlTree]
+        const update_digest: u8 = 17; // tree.updateDigest(digest) → AvlTree
+        const update_operations: u8 = 18; // tree.updateOperations(ops) → AvlTree
+    };
+
     /// Compute method call: dispatch based on type_code and method_id
     fn computeMethodCall(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
@@ -2259,6 +2319,25 @@ pub const Evaluator = struct {
                 CollMethodId.zip => try self.computeZip(node_idx),
                 CollMethodId.indices => try self.computeIndices(),
                 CollMethodId.reverse => try self.computeReverse(),
+                else => return error.UnsupportedExpression,
+            }
+        } else if (type_code == AvlTreeTypeCode) {
+            // AvlTree methods
+            switch (method_id) {
+                AvlTreeMethodId.digest => try self.computeAvlTreeDigest(),
+                AvlTreeMethodId.enabled_operations => try self.computeAvlTreeEnabledOps(),
+                AvlTreeMethodId.key_length => try self.computeAvlTreeKeyLength(),
+                AvlTreeMethodId.value_length_opt => try self.computeAvlTreeValueLengthOpt(),
+                AvlTreeMethodId.contains => try self.computeAvlTreeContains(),
+                AvlTreeMethodId.update_digest => try self.computeAvlTreeUpdateDigest(),
+                AvlTreeMethodId.update_operations => try self.computeAvlTreeUpdateOperations(),
+                // Complex methods (insert/update/remove) require Coll[(Coll[Byte], Coll[Byte])]
+                // which needs full tuple collection support - stub for now
+                AvlTreeMethodId.insert,
+                AvlTreeMethodId.update,
+                AvlTreeMethodId.remove,
+                AvlTreeMethodId.insert_or_update,
+                => return error.UnsupportedExpression,
                 else => return error.UnsupportedExpression,
             }
         } else {
@@ -2431,6 +2510,378 @@ pub const Evaluator = struct {
 
         // Push result as SigmaProp
         try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+    }
+
+    // ========================================================================
+    // AVL Tree Operations
+    // ========================================================================
+
+    /// Compute CreateAvlTree: construct AvlTreeData from components
+    /// Stack (top to bottom): [value_length_opt], key_length, digest, flags
+    fn computeCreateAvlTree(self: *Evaluator, has_value_length: u16) EvalError!void {
+        // PRECONDITIONS
+        const expected_args: u16 = if (has_value_length == 1) 4 else 3;
+        assert(self.value_sp >= expected_args);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.create_avl_tree);
+
+        // Pop arguments in reverse order (value_length_opt, key_length, digest, flags)
+        const value_length_opt: ?u32 = if (has_value_length == 1) blk: {
+            const val = try self.popValue();
+            // value_length is Int (signed 32-bit)
+            const vl = switch (val) {
+                .int => |i| if (i >= 0) @as(u32, @intCast(i)) else return error.InvalidData,
+                else => return error.TypeMismatch,
+            };
+            break :blk vl;
+        } else null;
+
+        const key_length_val = try self.popValue();
+        const key_length: u32 = switch (key_length_val) {
+            .int => |i| if (i >= 1 and i <= avl_tree.max_key_length)
+                @as(u32, @intCast(i))
+            else
+                return error.InvalidData,
+            else => return error.TypeMismatch,
+        };
+
+        const digest_val = try self.popValue();
+        if (digest_val != .coll_byte) return error.TypeMismatch;
+        const digest_bytes = digest_val.coll_byte;
+        if (digest_bytes.len != avl_tree.digest_size) return error.InvalidData;
+
+        const flags_val = try self.popValue();
+        const flags_byte: u8 = switch (flags_val) {
+            .byte => |b| @bitCast(b),
+            .int => |i| if (i >= 0 and i <= 255) @intCast(i) else return error.InvalidData,
+            else => return error.TypeMismatch,
+        };
+
+        // Construct AvlTreeData
+        var digest: [avl_tree.digest_size]u8 = undefined;
+        @memcpy(&digest, digest_bytes);
+        const tree_flags = avl_tree.AvlTreeFlags.fromByte(flags_byte);
+
+        const tree_data = avl_tree.AvlTreeData.init(digest, tree_flags, key_length, value_length_opt) catch {
+            return error.InvalidData;
+        };
+
+        // Push result
+        try self.pushValue(.{ .avl_tree = tree_data });
+
+        // POSTCONDITION: Stack reduced by (expected_args - 1)
+        assert(self.value_sp == initial_sp - expected_args + 1);
+    }
+
+    /// Compute TreeLookup: look up key in AVL tree with proof verification
+    /// Stack (top to bottom): proof, key, tree
+    /// Returns: Option[Coll[Byte]]
+    fn computeTreeLookup(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.tree_lookup);
+
+        // Pop arguments in reverse order (proof, key, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        const key_val = try self.popValue();
+        if (key_val != .coll_byte) return error.TypeMismatch;
+        const key = key_val.coll_byte;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // Validate key length matches tree's expected key length
+        if (key.len != tree_data.key_length) {
+            return error.InvalidData;
+        }
+
+        // For now, use arena as the verifier's arena
+        // This is safe since we're in a single evaluation context
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        // Create BatchAVLVerifier
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            return error.InvalidData;
+        };
+
+        // Perform lookup
+        const result = verifier.lookup(key) catch {
+            // Verification error - return None
+            try self.pushOptionNone(TypePool.COLL_BYTE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        switch (result) {
+            .found => |value| {
+                // Copy value to our arena
+                const value_copy = self.arena.allocSlice(u8, value.len) catch return error.OutOfMemory;
+                @memcpy(value_copy, value);
+                try self.pushOptionSomeCollByte(value_copy);
+            },
+            .not_found, .verification_failed => {
+                try self.pushOptionNone(TypePool.COLL_BYTE);
+            },
+        }
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    // ========================================================================
+    // AvlTree Method Operations
+    // ========================================================================
+
+    /// Compute tree.digest → Coll[Byte] (33 bytes)
+    fn computeAvlTreeDigest(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+
+        // Copy digest to arena
+        const result = self.arena.allocSlice(u8, avl_tree.digest_size) catch return error.OutOfMemory;
+        @memcpy(result, &tree_data.digest);
+
+        try self.pushValue(.{ .coll_byte = result });
+
+        // POSTCONDITION: Stack unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.enabledOperations → Byte
+    fn computeAvlTreeEnabledOps(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+        const flags_byte = tree_data.tree_flags.toByte();
+
+        try self.pushValue(.{ .byte = @bitCast(flags_byte) });
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.keyLength → Int
+    fn computeAvlTreeKeyLength(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+
+        try self.pushValue(.{ .int = @intCast(tree_data.key_length) });
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.valueLengthOpt → Option[Int]
+    fn computeAvlTreeValueLengthOpt(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+
+        if (tree_data.value_length_opt) |vl| {
+            // Some(vl) - store int in pool
+            const idx = self.pools.values.alloc() catch return error.OutOfMemory;
+            const pooled = value_pool.PooledValue{
+                .type_idx = TypePool.INT,
+                .data = .{ .primitive = @as(i64, @intCast(vl)) },
+            };
+            self.pools.values.set(idx, pooled);
+            try self.pushValue(.{ .option = .{
+                .inner_type = TypePool.INT,
+                .value_idx = idx,
+            } });
+        } else {
+            try self.pushOptionNone(TypePool.INT);
+        }
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.contains(key, proof) → Boolean
+    fn computeAvlTreeContains(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, key, proof)
+        assert(self.value_sp >= 3);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, key, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        const key_val = try self.popValue();
+        if (key_val != .coll_byte) return error.TypeMismatch;
+        const key = key_val.coll_byte;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // Validate key length
+        if (key.len != tree_data.key_length) {
+            return error.InvalidData;
+        }
+
+        // Use BatchAVLVerifier to check if key exists
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            try self.pushValue(.{ .boolean = false });
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        const result = verifier.lookup(key) catch {
+            try self.pushValue(.{ .boolean = false });
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        const found = switch (result) {
+            .found => true,
+            .not_found, .verification_failed => false,
+        };
+
+        try self.pushValue(.{ .boolean = found });
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.updateDigest(newDigest) → AvlTree
+    fn computeAvlTreeUpdateDigest(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 2 values on stack (tree, digest)
+        assert(self.value_sp >= 2);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (digest, tree)
+        const digest_val = try self.popValue();
+        if (digest_val != .coll_byte) return error.TypeMismatch;
+        const new_digest_bytes = digest_val.coll_byte;
+        if (new_digest_bytes.len != avl_tree.digest_size) return error.InvalidData;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // Create new digest
+        var new_digest: [avl_tree.digest_size]u8 = undefined;
+        @memcpy(&new_digest, new_digest_bytes);
+
+        // Create new tree with updated digest
+        const new_tree = tree_data.withDigest(new_digest);
+
+        try self.pushValue(.{ .avl_tree = new_tree });
+
+        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Compute tree.updateOperations(newOps) → AvlTree
+    fn computeAvlTreeUpdateOperations(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 2 values on stack (tree, ops)
+        assert(self.value_sp >= 2);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (ops, tree)
+        const ops_val = try self.popValue();
+        const ops_byte: u8 = switch (ops_val) {
+            .byte => |b| @bitCast(b),
+            .int => |i| if (i >= 0 and i <= 255) @intCast(i) else return error.InvalidData,
+            else => return error.TypeMismatch,
+        };
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // Create new tree with updated flags
+        const new_flags = avl_tree.AvlTreeFlags.fromByte(ops_byte);
+        const new_tree = tree_data.withFlags(new_flags);
+
+        try self.pushValue(.{ .avl_tree = new_tree });
+
+        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Push None option onto value stack
+    fn pushOptionNone(self: *Evaluator, inner_type: types.TypeIndex) EvalError!void {
+        try self.pushValue(.{
+            .option = .{
+                .inner_type = inner_type,
+                .value_idx = null_value_idx, // Sentinel for None
+            },
+        });
+    }
+
+    /// Push Some(Coll[Byte]) option onto value stack
+    /// Specialized for TreeLookup which returns Option[Coll[Byte]]
+    fn pushOptionSomeCollByte(self: *Evaluator, bytes: []const u8) EvalError!void {
+        // Allocate slot in pool
+        const idx = self.pools.values.alloc() catch return error.OutOfMemory;
+
+        // Store coll_byte in pool
+        const pooled = value_pool.PooledValue{
+            .type_idx = TypePool.COLL_BYTE,
+            .data = .{ .byte_slice = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } },
+        };
+        self.pools.values.set(idx, pooled);
+
+        // Push option referencing the pooled value
+        try self.pushValue(.{ .option = .{
+            .inner_type = TypePool.COLL_BYTE,
+            .value_idx = idx,
+        } });
     }
 
     /// Extract SigmaBoolean from a Value (must be sigma_prop or boolean)
@@ -2761,11 +3212,14 @@ pub const Evaluator = struct {
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map => 2,
 
             // Ternary operations (3 children)
-            .if_then_else, .triple_construct, .fold => 3,
+            .if_then_else, .triple_construct, .fold, .tree_lookup => 3,
 
             // N-ary with data-driven child count
             .block_value => node.data + 1, // items + result
             .tuple_construct, .concrete_collection, .sigma_and, .sigma_or => node.data,
+
+            // create_avl_tree: 3 or 4 children (data = 1 if value_length present)
+            .create_avl_tree => if (node.data == 1) 4 else 3,
 
             // method_call: 1 or 2 (obj + optional arg based on method_id)
             .method_call => blk: {

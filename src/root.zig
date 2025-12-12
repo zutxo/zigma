@@ -69,6 +69,9 @@ pub const schnorr = @import("sigma/schnorr.zig");
 /// Sigma protocol verifier (AND/OR/THRESHOLD)
 pub const verifier = @import("sigma/verifier.zig");
 
+/// AVL+ tree data structure and proof verification
+pub const avl_tree = @import("crypto/avl_tree.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -95,6 +98,7 @@ comptime {
     _ = challenge;
     _ = schnorr;
     _ = verifier;
+    _ = avl_tree;
 }
 
 /// Protocol version constants

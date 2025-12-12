@@ -12,6 +12,7 @@ const types = @import("../core/types.zig");
 const memory = @import("../interpreter/memory.zig");
 const value_pool = @import("../interpreter/value_pool.zig");
 const secp256k1 = @import("../crypto/secp256k1.zig");
+const avl = @import("../crypto/avl_tree.zig");
 
 const TypePool = types.TypePool;
 const TypeIndex = types.TypeIndex;
@@ -89,6 +90,9 @@ pub const Value = union(enum) {
 
     /// Collection of boxes (reference to context array)
     box_coll: BoxCollRef,
+
+    /// AVL+ tree metadata (authenticated dictionary)
+    avl_tree: avl.AvlTreeData,
 
     /// 256-bit signed integer stored as big-endian bytes
     pub const BigInt = struct {
@@ -284,9 +288,10 @@ pub fn deserialize(
         .triple => |tr| deserializeTuple3(tr.a, tr.b, tr.c, pool, reader, arena, values),
         .quadruple => |q| deserializeTuple4(q.a, q.b, q.c, q.d, pool, reader, arena, values),
         .tuple => |tuple_n| deserializeTupleN(tuple_n.slice(), pool, reader, arena, values),
+        .avl_tree => deserializeAvlTree(reader),
         .func => error.NotSupported,
-        // Object types cannot be deserialized as data
-        .any, .box, .avl_tree, .context, .header, .pre_header, .global => error.NotSupported,
+        // Object types cannot be deserialized as data (only accessed via context)
+        .any, .box, .context, .header, .pre_header, .global => error.NotSupported,
     };
 }
 
@@ -409,6 +414,49 @@ fn deserializeSigmaProp(reader: *vlq.Reader, arena: anytype) DeserializeError!Va
     }
 }
 
+fn deserializeAvlTree(reader: *vlq.Reader) DeserializeError!Value {
+    // Format:
+    // - digest: 33 bytes (32-byte Blake2b hash + 1-byte height)
+    // - tree_flags: 1 byte
+    // - key_length: u32 (VLQ encoded)
+    // - value_length_opt: Option[u32] (0x00 = None, 0x01 + VLQ u32 = Some)
+
+    // PRECONDITION: reader has at least 33 bytes for digest
+    const digest_bytes = reader.readBytes(avl.digest_size) catch |e| return mapVlqError(e);
+    var digest: [avl.digest_size]u8 = undefined;
+    @memcpy(&digest, digest_bytes);
+
+    // Read tree flags (1 byte)
+    const flags_byte = reader.readByte() catch |e| return mapVlqError(e);
+    const tree_flags = avl.AvlTreeFlags.fromByte(flags_byte);
+
+    // Read key length (u32 as VLQ)
+    const key_length = reader.readU32() catch |e| return mapVlqError(e);
+
+    // Read optional value length
+    const opt_flag = reader.readByte() catch |e| return mapVlqError(e);
+    const value_length_opt: ?u32 = if (opt_flag == 0) null else blk: {
+        const vl = reader.readU32() catch |e| return mapVlqError(e);
+        break :blk vl;
+    };
+
+    // Validate and construct AvlTreeData
+    const tree_data = avl.AvlTreeData.init(
+        digest,
+        tree_flags,
+        key_length,
+        value_length_opt,
+    ) catch {
+        return error.InvalidData;
+    };
+
+    // POSTCONDITION: Tree data is valid
+    assert(tree_data.key_length > 0);
+    assert(tree_data.key_length <= avl.max_key_length);
+
+    return .{ .avl_tree = tree_data };
+}
+
 /// Store a Value in the ValuePool and return its index.
 /// This is the key function enabling arbitrary nesting of Options, Tuples, and Collections.
 fn storeValueInPool(
@@ -482,7 +530,7 @@ fn storeValueInPool(
             .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } },
         },
         // Types not yet supported in pool storage
-        .tuple, .header, .sigma_prop, .unsigned_big_int, .box_coll => {
+        .tuple, .header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {
             return error.NotSupported;
         },
     };
@@ -739,6 +787,7 @@ pub fn serialize(
         .unsigned_big_int => serializeUnsignedBigInt(value, buf),
         .group_element => serializeGroupElement(value, buf),
         .coll => |_| serializeColl(t, pool, value, buf),
+        .avl_tree => serializeAvlTree(value, buf),
         else => error.NotSupported,
     };
 }
@@ -802,6 +851,41 @@ fn serializeColl(t: SType, pool: *const TypePool, value: Value, buf: []u8) Seria
     if (buf.len < len_size + data.len) return error.BufferTooSmall;
     @memcpy(buf[len_size .. len_size + data.len], data);
     return len_size + data.len;
+}
+
+fn serializeAvlTree(value: Value, buf: []u8) SerializeError!usize {
+    const tree = value.avl_tree;
+
+    // Minimum size: digest(33) + flags(1) + key_length(1-5) + opt_flag(1)
+    const min_size = avl.digest_size + 1 + 1 + 1;
+    if (buf.len < min_size) return error.BufferTooSmall;
+
+    var pos: usize = 0;
+
+    // Write digest (33 bytes)
+    @memcpy(buf[pos..][0..avl.digest_size], &tree.digest);
+    pos += avl.digest_size;
+
+    // Write flags (1 byte)
+    buf[pos] = tree.tree_flags.toByte();
+    pos += 1;
+
+    // Write key_length (VLQ u32)
+    const key_len_size = vlq.encodeU64(@as(u64, tree.key_length), buf[pos..]);
+    pos += key_len_size;
+
+    // Write value_length_opt (Option[u32])
+    if (tree.value_length_opt) |vl| {
+        buf[pos] = 0x01; // Some
+        pos += 1;
+        const val_len_size = vlq.encodeU64(@as(u64, vl), buf[pos..]);
+        pos += val_len_size;
+    } else {
+        buf[pos] = 0x00; // None
+        pos += 1;
+    }
+
+    return pos;
 }
 
 // ============================================================================
@@ -1195,4 +1279,149 @@ test "data_serializer: deserialize option None" {
 
     try std.testing.expect(result == .option);
     try std.testing.expect(result.option.isNone());
+}
+
+// ============================================================================
+// AVL Tree Serialization Tests
+// ============================================================================
+
+test "data_serializer: deserialize avl_tree with no value length" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    // Build serialized AvlTreeData:
+    // - digest: 33 bytes (all 0x42 for test, height=5 in last byte)
+    // - tree_flags: 0x07 (all operations allowed)
+    // - key_length: 32 (VLQ: 0x20)
+    // - value_length_opt: None (0x00)
+    var data: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Digest (32 bytes hash + 1 byte height)
+    @memset(data[pos..][0..32], 0x42);
+    pos += 32;
+    data[pos] = 5; // height
+    pos += 1;
+
+    // Tree flags
+    data[pos] = 0x07; // insert | update | remove allowed
+    pos += 1;
+
+    // Key length (VLQ)
+    const key_len_size = vlq.encodeU64(32, data[pos..]);
+    pos += key_len_size;
+
+    // Value length option: None
+    data[pos] = 0x00;
+    pos += 1;
+
+    var reader = vlq.Reader.init(data[0..pos]);
+    const result = try deserialize(TypePool.AVL_TREE, &pool, &reader, &arena, null);
+
+    try std.testing.expect(result == .avl_tree);
+    try std.testing.expectEqual(@as(u8, 5), result.avl_tree.height());
+    try std.testing.expectEqual(@as(u32, 32), result.avl_tree.key_length);
+    try std.testing.expectEqual(@as(?u32, null), result.avl_tree.value_length_opt);
+    try std.testing.expect(result.avl_tree.isInsertAllowed());
+    try std.testing.expect(result.avl_tree.isUpdateAllowed());
+    try std.testing.expect(result.avl_tree.isRemoveAllowed());
+}
+
+test "data_serializer: deserialize avl_tree with value length" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    var data: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Digest
+    @memset(data[pos..][0..32], 0xAB);
+    pos += 32;
+    data[pos] = 10; // height
+    pos += 1;
+
+    // Tree flags: read-only
+    data[pos] = 0x00;
+    pos += 1;
+
+    // Key length
+    const key_len_size = vlq.encodeU64(8, data[pos..]);
+    pos += key_len_size;
+
+    // Value length option: Some(64)
+    data[pos] = 0x01;
+    pos += 1;
+    const val_len_size = vlq.encodeU64(64, data[pos..]);
+    pos += val_len_size;
+
+    var reader = vlq.Reader.init(data[0..pos]);
+    const result = try deserialize(TypePool.AVL_TREE, &pool, &reader, &arena, null);
+
+    try std.testing.expect(result == .avl_tree);
+    try std.testing.expectEqual(@as(u8, 10), result.avl_tree.height());
+    try std.testing.expectEqual(@as(u32, 8), result.avl_tree.key_length);
+    try std.testing.expectEqual(@as(?u32, 64), result.avl_tree.value_length_opt);
+    try std.testing.expect(!result.avl_tree.isInsertAllowed());
+}
+
+test "data_serializer: roundtrip avl_tree" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+    var buf: [128]u8 = undefined;
+
+    // Create an AvlTreeData
+    var digest: [avl.digest_size]u8 = undefined;
+    @memset(&digest, 0xDE);
+    digest[32] = 7; // height
+
+    const tree_data = avl.AvlTreeData.init(
+        digest,
+        avl.AvlTreeFlags.init(true, false, true), // insert + remove
+        16, // key_length
+        128, // value_length
+    ) catch unreachable;
+
+    const value = Value{ .avl_tree = tree_data };
+
+    // Serialize
+    const len = try serialize(TypePool.AVL_TREE, &pool, value, &buf);
+
+    // Deserialize
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result = try deserialize(TypePool.AVL_TREE, &pool, &reader, &arena, null);
+
+    // Verify roundtrip
+    try std.testing.expect(result == .avl_tree);
+    try std.testing.expectEqual(tree_data.height(), result.avl_tree.height());
+    try std.testing.expectEqual(tree_data.key_length, result.avl_tree.key_length);
+    try std.testing.expectEqual(tree_data.value_length_opt, result.avl_tree.value_length_opt);
+    try std.testing.expectEqual(tree_data.tree_flags.toByte(), result.avl_tree.tree_flags.toByte());
+    try std.testing.expectEqualSlices(u8, &tree_data.digest, &result.avl_tree.digest);
+}
+
+test "data_serializer: avl_tree rejects invalid key_length" {
+    var pool = TypePool.init();
+    var arena = BumpAllocator(256).init();
+
+    var data: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Digest
+    @memset(data[pos..][0..33], 0x00);
+    pos += 33;
+
+    // Tree flags
+    data[pos] = 0x00;
+    pos += 1;
+
+    // Key length: 0 (invalid)
+    const key_len_size = vlq.encodeU64(0, data[pos..]);
+    pos += key_len_size;
+
+    // Value length option: None
+    data[pos] = 0x00;
+    pos += 1;
+
+    var reader = vlq.Reader.init(data[0..pos]);
+    try std.testing.expectError(error.InvalidData, deserialize(TypePool.AVL_TREE, &pool, &reader, &arena, null));
 }

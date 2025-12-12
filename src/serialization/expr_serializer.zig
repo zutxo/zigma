@@ -160,6 +160,12 @@ pub const ExprTag = enum(u8) {
     /// data: low 8 bits = type_code, high 8 bits = method_id
     method_call,
 
+    // AVL tree operations (opcodes 0xB6-0xB7 / 182-183)
+    /// Create AVL tree (opcode 0xB6/182) - flags, digest, key_len, opt_value_len → AvlTree
+    create_avl_tree,
+    /// Tree lookup (opcode 0xB7/183) - tree, key, proof → Option[Coll[Byte]]
+    tree_lookup,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -492,6 +498,9 @@ fn deserializeWithDepth(
             opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
             // Method call (collection methods like zip, indices, etc.)
             opcodes.MethodCall => try deserializeMethodCall(tree, reader, arena, depth),
+            // AVL tree operations
+            opcodes.AvlTree => try deserializeCreateAvlTree(tree, reader, arena, depth),
+            opcodes.AvlTreeGet => try deserializeTreeLookup(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -817,6 +826,85 @@ fn deserializeMethodCall(
 
     // TODO: Handle explicit type args for generic methods if needed
     // For now, assume no explicit type args (method_raw.explicit_type_args.len == 0)
+}
+
+/// Deserialize CreateAvlTree operation (opcode 0xB6/182)
+/// Format: flags_expr + digest_expr + key_length_expr + Option[value_length_expr]
+/// Returns: AvlTree
+fn deserializeCreateAvlTree(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Add the create_avl_tree node first (pre-order)
+    const node_idx = try tree.addNode(.{
+        .tag = .create_avl_tree,
+        .result_type = TypePool.AVL_TREE,
+    });
+
+    // POSTCONDITION: Node was added
+    assert(node_idx < tree.node_count);
+
+    // Parse flags expression (Byte)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse digest expression (Coll[Byte])
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse key_length expression (Int)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse optional value_length expression (Option[Int])
+    // Format: 0x00 = None, 0x01 + expr = Some
+    const opt_flag = reader.readByte() catch |e| return mapVlqError(e);
+    if (opt_flag != 0) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+
+    // Update node data to indicate if value_length is present
+    // data = 1 if value_length present, 0 if not
+    tree.nodes[node_idx].data = if (opt_flag != 0) 1 else 0;
+}
+
+/// Deserialize TreeLookup operation (opcode 0xB7/183)
+/// Format: tree_expr + key_expr + proof_expr
+/// Returns: Option[Coll[Byte]]
+fn deserializeTreeLookup(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Get Option[Coll[Byte]] type for result
+    const coll_byte_idx = TypePool.COLL_BYTE;
+    const opt_coll_byte_idx = tree.type_pool.getOption(coll_byte_idx) catch TypePool.ANY;
+
+    // Add the tree_lookup node first (pre-order)
+    const node_idx = try tree.addNode(.{
+        .tag = .tree_lookup,
+        .result_type = opt_coll_byte_idx,
+    });
+
+    // POSTCONDITION: Node was added
+    assert(node_idx < tree.node_count);
+
+    // Parse tree expression (AvlTree)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse key expression (Coll[Byte])
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse proof expression (Coll[Byte])
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
 fn deserializeOptionGetOrElse(
