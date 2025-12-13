@@ -386,6 +386,58 @@ const FixedCost = struct {
     pub const extract_register: u32 = JIT_COSTS[@intFromEnum(CostOp.extract_register)];
 };
 
+/// PerItemCost - chunk-based cost model matching Scala's CostKind.PerItemCost.
+/// Formula: nChunks = (nItems - 1) / chunkSize + 1; total = baseCost + perChunkCost * nChunks
+/// Source: sigma/ast/CostKind.scala
+pub const PerItemCost = struct {
+    base_cost: u16,
+    per_chunk_cost: u16,
+    chunk_size: u16,
+
+    /// Calculate total cost for given number of items.
+    /// PRECONDITION: chunk_size > 0
+    pub fn cost(self: PerItemCost, n_items: u32) u32 {
+        assert(self.chunk_size > 0);
+
+        // Empty collection still has base cost
+        if (n_items == 0) return self.base_cost;
+
+        // nChunks = (nItems - 1) / chunkSize + 1
+        const n_chunks: u32 = (n_items - 1) / self.chunk_size + 1;
+
+        // total = baseCost + perChunkCost * nChunks
+        return @as(u32, self.base_cost) + @as(u32, self.per_chunk_cost) * n_chunks;
+    }
+};
+
+/// Per-operation PerItemCost configurations (JIT/v2).
+/// Source: sigmastate LanguageSpecificationV5.scala test vectors
+const CollectionCost = struct {
+    // Map, Filter: PerItemCost(20, 1, 10)
+    pub const map = PerItemCost{ .base_cost = 20, .per_chunk_cost = 1, .chunk_size = 10 };
+    pub const filter = PerItemCost{ .base_cost = 20, .per_chunk_cost = 1, .chunk_size = 10 };
+
+    // FlatMap: PerItemCost(60, 10, 8)
+    pub const flat_map = PerItemCost{ .base_cost = 60, .per_chunk_cost = 10, .chunk_size = 8 };
+
+    // Exists, ForAll, Fold: PerItemCost(3, 1, 10)
+    pub const exists = PerItemCost{ .base_cost = 3, .per_chunk_cost = 1, .chunk_size = 10 };
+    pub const for_all = PerItemCost{ .base_cost = 3, .per_chunk_cost = 1, .chunk_size = 10 };
+    pub const fold = PerItemCost{ .base_cost = 3, .per_chunk_cost = 1, .chunk_size = 10 };
+};
+
+// Compile-time tests for PerItemCost
+comptime {
+    // Test case from Scala: 1 item, chunkSize 10 -> 1 chunk
+    assert(CollectionCost.exists.cost(1) == 3 + 1 * 1); // 4
+    // Test case: 10 items, chunkSize 10 -> 1 chunk
+    assert(CollectionCost.exists.cost(10) == 3 + 1 * 1); // 4
+    // Test case: 11 items, chunkSize 10 -> 2 chunks
+    assert(CollectionCost.exists.cost(11) == 3 + 1 * 2); // 5
+    // Test case: 0 items -> base cost only
+    assert(CollectionCost.exists.cost(0) == 3);
+}
+
 // ============================================================================
 // Evaluator
 // ============================================================================
@@ -2506,9 +2558,6 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        // Version-aware base cost for collection operation
-        try self.addCostOp(.collection_base);
-
         const coll = try self.popValue();
 
         // Get collection length - only coll_byte supported currently
@@ -2517,6 +2566,9 @@ pub const Evaluator = struct {
             .coll => |c| c.len,
             else => return error.TypeMismatch,
         };
+
+        // Chunk-based cost for exists: PerItemCost(3, 1, 10)
+        try self.addCost(CollectionCost.exists.cost(@truncate(len)));
 
         // Empty collection: exists returns false
         if (len == 0) {
@@ -2554,9 +2606,6 @@ pub const Evaluator = struct {
                 assert(self.value_sp == initial_sp);
                 return;
             }
-
-            // Version-aware per-item cost
-            try self.addCostOp(.collection_per_item);
         }
 
         // No element satisfied predicate
@@ -2572,8 +2621,6 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCostOp(.collection_base);
-
         const coll = try self.popValue();
 
         // Get collection length - only coll_byte supported currently
@@ -2582,6 +2629,9 @@ pub const Evaluator = struct {
             .coll => |c| c.len,
             else => return error.TypeMismatch,
         };
+
+        // Chunk-based cost for forall: PerItemCost(3, 1, 10)
+        try self.addCost(CollectionCost.for_all.cost(@truncate(len)));
 
         // Empty collection: forall returns true
         if (len == 0) {
@@ -2619,8 +2669,6 @@ pub const Evaluator = struct {
                 assert(self.value_sp == initial_sp);
                 return;
             }
-
-            try self.addCostOp(.collection_per_item);
         }
 
         // All elements satisfied predicate
@@ -2637,14 +2685,15 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCostOp(.collection_base);
-
         const coll = try self.popValue();
 
         // Currently only support coll_byte
         if (coll != .coll_byte) return error.UnsupportedExpression;
 
         const input = coll.coll_byte;
+
+        // Chunk-based cost for map: PerItemCost(20, 1, 10)
+        try self.addCost(CollectionCost.map.cost(@truncate(input.len)));
 
         // Empty collection: return empty
         if (input.len == 0) {
@@ -2679,8 +2728,6 @@ pub const Evaluator = struct {
                 .long => |v| @truncate(@as(u64, @bitCast(v))),
                 else => return error.TypeMismatch,
             };
-
-            try self.addCostOp(.collection_per_item);
         }
 
         try self.pushValue(.{ .coll_byte = result });
@@ -2696,14 +2743,15 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCostOp(.collection_base);
-
         const coll = try self.popValue();
 
         // Currently only support coll_byte
         if (coll != .coll_byte) return error.UnsupportedExpression;
 
         const input = coll.coll_byte;
+
+        // Chunk-based cost for filter: PerItemCost(20, 1, 10)
+        try self.addCost(CollectionCost.filter.cost(@truncate(input.len)));
 
         if (input.len == 0) {
             const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
@@ -2730,7 +2778,6 @@ pub const Evaluator = struct {
             const predicate_result = try self.evaluateSubtree(body_idx);
             if (predicate_result != .boolean) return error.TypeMismatch;
             if (predicate_result.boolean) count += 1;
-            try self.addCostOp(.collection_per_item);
         }
 
         // Allocate result and fill
@@ -2757,8 +2804,6 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCostOp(.collection_base);
-
         // Pop in reverse order: zero was pushed last
         const zero = try self.popValue();
         const coll = try self.popValue();
@@ -2772,6 +2817,9 @@ pub const Evaluator = struct {
             .coll => |c| c.len,
             else => return error.TypeMismatch,
         };
+
+        // Chunk-based cost for fold: PerItemCost(3, 1, 10)
+        try self.addCost(CollectionCost.fold.cost(@truncate(len)));
 
         // Empty collection: return zero
         if (len == 0) {
@@ -2804,7 +2852,6 @@ pub const Evaluator = struct {
             self.var_bindings[elem_var_id] = elem;
 
             acc = try self.evaluateSubtree(body_idx);
-            try self.addCostOp(.collection_per_item);
         }
 
         try self.pushValue(acc);
@@ -2820,8 +2867,6 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count); // Node index in bounds
         assert(self.tree.node_count > 0); // Tree not empty
 
-        try self.addCostOp(.collection_base);
-
         const coll = try self.popValue();
 
         // Currently only support coll_byte
@@ -2829,8 +2874,9 @@ pub const Evaluator = struct {
 
         const input = coll.coll_byte;
 
-        // Empty collection: return empty
+        // Empty collection: return empty (base cost only)
         if (input.len == 0) {
+            try self.addCost(CollectionCost.flat_map.cost(0));
             const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
             try self.pushValue(.{ .coll_byte = empty });
             return;
@@ -2869,9 +2915,11 @@ pub const Evaluator = struct {
             temp_results[temp_count] = mapped.coll_byte;
             result_len += mapped.coll_byte.len;
             temp_count += 1;
-
-            try self.addCostOp(.collection_per_item);
         }
+
+        // Chunk-based cost for flatMap: PerItemCost(60, 10, 8)
+        // Note: Scala uses output size for cost; we use output length here
+        try self.addCost(CollectionCost.flat_map.cost(@truncate(result_len)));
 
         // Allocate and copy results
         const result = self.arena.allocSlice(u8, result_len) catch return error.OutOfMemory;
