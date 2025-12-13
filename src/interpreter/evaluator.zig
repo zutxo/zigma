@@ -1509,14 +1509,7 @@ pub const Evaluator = struct {
         // Convert to big-endian bytes (network byte order)
         const result_slice = self.arena.allocSlice(u8, 8) catch return error.OutOfMemory;
         const value: u64 = @bitCast(input.long);
-        result_slice[0] = @truncate(value >> 56);
-        result_slice[1] = @truncate(value >> 48);
-        result_slice[2] = @truncate(value >> 40);
-        result_slice[3] = @truncate(value >> 32);
-        result_slice[4] = @truncate(value >> 24);
-        result_slice[5] = @truncate(value >> 16);
-        result_slice[6] = @truncate(value >> 8);
-        result_slice[7] = @truncate(value);
+        std.mem.writeInt(u64, result_slice[0..8], value, .big);
 
         // POSTCONDITION: Result is exactly 8 bytes
         assert(result_slice.len == 8);
@@ -1544,14 +1537,7 @@ pub const Evaluator = struct {
         assert(bytes.len == 8);
 
         // Convert from big-endian bytes (network byte order)
-        const value: u64 = (@as(u64, bytes[0]) << 56) |
-            (@as(u64, bytes[1]) << 48) |
-            (@as(u64, bytes[2]) << 40) |
-            (@as(u64, bytes[3]) << 32) |
-            (@as(u64, bytes[4]) << 24) |
-            (@as(u64, bytes[5]) << 16) |
-            (@as(u64, bytes[6]) << 8) |
-            @as(u64, bytes[7]);
+        const value = std.mem.readInt(u64, bytes[0..8], .big);
 
         try self.pushValue(.{ .long = @bitCast(value) });
 
@@ -1887,12 +1873,8 @@ pub const Evaluator = struct {
                 return self.deserializeAndCacheRegister(source, box_idx, reg, expected_type);
             },
             .loaded => |value_idx| {
-                // Cache hit - convert PooledValue to Value wrapped in Option
-                const pooled = self.pools.values.get(value_idx) orelse return error.InvalidState;
-                const inner_val = try pooledValueToValue(pooled);
-                // Store inner value and return Option.Some
-                const stored_idx = try self.storeValueInPool(inner_val, expected_type);
-                return .{ .option = .{ .inner_type = expected_type, .value_idx = stored_idx } };
+                // Cache hit - value already in pool, reuse index directly
+                return .{ .option = .{ .inner_type = expected_type, .value_idx = value_idx } };
             },
             .absent => {
                 // Register not present - return Option.None
