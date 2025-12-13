@@ -3035,18 +3035,18 @@ pub const Evaluator = struct {
     const CollTypeCode: u8 = 12; // TYPE_CODE for Coll
 
     /// Collection method IDs from Rust types/scoll.rs
-    const CollMethodId = struct {
-        const indices: u8 = 14; // coll.indices → Coll[Int]
-        const flatmap: u8 = 15; // coll.flatMap(f) → Coll[B]
-        const patch: u8 = 19; // coll.patch(from, patch, replaced) → Coll[A]
-        const updated: u8 = 20; // coll.updated(idx, value) → Coll[A]
-        const update_many: u8 = 21; // coll.updateMany(idxs, values) → Coll[A]
-        const index_of: u8 = 26; // coll.indexOf(elem, from) → Int
-        const zip: u8 = 29; // coll.zip(other) → Coll[(A, B)]
-        const reverse: u8 = 30; // coll.reverse → Coll[A]
-        const starts_with: u8 = 31; // coll.startsWith(other) → Boolean
-        const ends_with: u8 = 32; // coll.endsWith(other) → Boolean
-        const get: u8 = 33; // coll.get(idx) → Option[A]
+    pub const CollMethodId = struct {
+        pub const indices: u8 = 14; // coll.indices → Coll[Int]
+        pub const flatmap: u8 = 15; // coll.flatMap(f) → Coll[B]
+        pub const patch: u8 = 19; // coll.patch(from, patch, replaced) → Coll[A]
+        pub const updated: u8 = 20; // coll.updated(idx, value) → Coll[A]
+        pub const update_many: u8 = 21; // coll.updateMany(idxs, values) → Coll[A]
+        pub const index_of: u8 = 26; // coll.indexOf(elem, from) → Int
+        pub const zip: u8 = 29; // coll.zip(other) → Coll[(A, B)]
+        pub const reverse: u8 = 30; // coll.reverse → Coll[A]
+        pub const starts_with: u8 = 31; // coll.startsWith(other) → Boolean
+        pub const ends_with: u8 = 32; // coll.endsWith(other) → Boolean
+        pub const get: u8 = 33; // coll.get(idx) → Option[A]
 
         // Compile-time collision detection (ZIGMA_STYLE)
         comptime {
@@ -3143,13 +3143,13 @@ pub const Evaluator = struct {
                 CollMethodId.reverse => try self.computeReverse(),
                 CollMethodId.starts_with => try self.computeStartsWith(),
                 CollMethodId.ends_with => try self.computeEndsWith(),
-                // Complex methods that need more support
+                CollMethodId.index_of => try self.computeIndexOf(),
+                CollMethodId.get => try self.computeCollGet(),
+                // Complex methods that need function/tuple support
                 CollMethodId.flatmap,
                 CollMethodId.patch,
                 CollMethodId.updated,
                 CollMethodId.update_many,
-                CollMethodId.index_of,
-                CollMethodId.get,
                 => return self.handleUnsupported(),
                 else => return self.handleUnsupported(),
             }
@@ -3355,6 +3355,116 @@ pub const Evaluator = struct {
         // POSTCONDITIONS
         assert(self.value_sp == initial_sp - 1); // Stack reduced by 1
         assert(self.value_sp >= 1); // At least result on stack
+    }
+
+    /// Compute indexOf: Coll[T].indexOf(elem, from) → Int
+    /// Returns index of first occurrence of elem starting at from, or -1 if not found
+    fn computeIndexOf(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (coll, elem, from)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (from, elem, coll)
+        const from_val = try self.popValue();
+        const elem_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        // Get 'from' index (clamped to 0 minimum per Scala impl)
+        const from_idx: usize = switch (from_val) {
+            .int => |i| if (i < 0) 0 else @intCast(i),
+            .long => |i| if (i < 0) 0 else @intCast(i),
+            else => return error.TypeMismatch,
+        };
+
+        // INVARIANT: from_idx is non-negative
+        assert(from_idx <= std.math.maxInt(u32));
+
+        const result: i32 = switch (coll_val) {
+            .coll_byte => |coll| blk: {
+                // elem must be a byte (or convertible integer)
+                const target: u8 = switch (elem_val) {
+                    .int => |i| if (i < 0 or i > 255) break :blk -1 else @intCast(i),
+                    .byte => |b| @bitCast(b), // i8 -> u8
+                    else => return error.TypeMismatch,
+                };
+
+                // INVARIANT: coll.len is valid
+                assert(coll.len <= std.math.maxInt(u32));
+
+                // Search starting from 'from' index
+                if (from_idx >= coll.len) break :blk -1;
+
+                for (coll[from_idx..], from_idx..) |byte, idx| {
+                    if (byte == target) {
+                        // INVARIANT: idx fits in i32
+                        assert(idx <= std.math.maxInt(i32));
+                        break :blk @intCast(idx);
+                    }
+                }
+                break :blk -1;
+            },
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(.{ .int = result });
+
+        // POSTCONDITIONS
+        assert(self.value_sp == initial_sp - 2); // Popped 3, pushed 1
+        assert(result >= -1); // Result is valid index or -1
+    }
+
+    /// Compute get: Coll[T].get(idx) → Option[T]
+    /// Returns Some(element) if idx is valid, None otherwise
+    fn computeCollGet(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 2 values on stack (coll, idx)
+        assert(self.value_sp >= 2);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (idx, coll)
+        const idx_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        // Get index (Int is i32, but we need i64 for comparison with len)
+        const idx: i64 = switch (idx_val) {
+            .int => |i| @as(i64, i),
+            .long => |i| i,
+            else => return error.TypeMismatch,
+        };
+
+        switch (coll_val) {
+            .coll_byte => |coll| {
+                // INVARIANT: coll.len is valid
+                assert(coll.len <= std.math.maxInt(u32));
+
+                // Check bounds
+                if (idx < 0 or idx >= @as(i64, @intCast(coll.len))) {
+                    // Out of bounds - return None
+                    try self.pushOptionNone(TypePool.BYTE);
+                } else {
+                    // Valid index - return Some(byte)
+                    const byte_val = coll[@intCast(@as(u64, @bitCast(idx)))];
+
+                    // Store byte in value pool and return Option
+                    const pool_idx = self.pools.values.alloc() catch return error.OutOfMemory;
+                    const pooled = value_pool.PooledValue{
+                        .type_idx = TypePool.BYTE,
+                        .data = .{ .primitive = @as(i64, byte_val) },
+                    };
+                    self.pools.values.set(pool_idx, pooled);
+
+                    try self.pushValue(.{ .option = .{
+                        .inner_type = TypePool.BYTE,
+                        .value_idx = pool_idx,
+                    } });
+                }
+            },
+            else => return error.TypeMismatch,
+        }
+
+        // POSTCONDITIONS
+        assert(self.value_sp == initial_sp - 1); // Popped 2, pushed 1
     }
 
     // ========================================================================
@@ -6241,4 +6351,197 @@ test "evaluator: non-soft-fork unsupported opcode errors" {
     // Evaluate - should error with UnsupportedExpression
     const result = eval.evaluate();
     try std.testing.expectError(error.UnsupportedExpression, result);
+}
+
+// ============================================================================
+// Property Tests for Collection Methods
+// ============================================================================
+
+test "evaluator: property - startsWith with empty prefix always true" {
+    // Property: Any collection starts with the empty collection
+    // forall a: Coll[T]. a.startsWith([]) == true
+    var tree = ExprTree.init();
+
+    // Build: [1,2,3].startsWith([]) → true
+    const coll_data = [_]u8{ 1, 2, 3 };
+    tree.constants[0] = .{ .coll_byte = &coll_data };
+    tree.constants[1] = .{ .coll_byte = &.{} }; // empty collection
+    tree.constant_count = 2;
+
+    // Preorder: method_call, object, arg
+    // data = (method_id << 8) | type_code = (31 << 8) | 12 = 0x1F0C
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.starts_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object: collection
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 1 }; // arg: empty prefix
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+test "evaluator: property - endsWith with empty suffix always true" {
+    // Property: Any collection ends with the empty collection
+    // forall a: Coll[T]. a.endsWith([]) == true
+    var tree = ExprTree.init();
+
+    const coll_data = [_]u8{ 5, 10, 15 };
+    tree.constants[0] = .{ .coll_byte = &coll_data };
+    tree.constants[1] = .{ .coll_byte = &.{} }; // empty collection
+    tree.constant_count = 2;
+
+    // Preorder: method_call, object, arg
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.ends_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object: collection
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 1 }; // arg: empty suffix
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+test "evaluator: property - startsWith reflexive" {
+    // Property: Every collection starts with itself
+    // forall a: Coll[T]. a.startsWith(a) == true
+    var tree = ExprTree.init();
+
+    const coll_data = [_]u8{ 0xAA, 0xBB, 0xCC };
+    tree.constants[0] = .{ .coll_byte = &coll_data };
+    tree.constant_count = 1;
+
+    // Preorder: method_call, object, arg (same constant)
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.starts_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 }; // arg: same constant
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+test "evaluator: property - endsWith reflexive" {
+    // Property: Every collection ends with itself
+    // forall a: Coll[T]. a.endsWith(a) == true
+    var tree = ExprTree.init();
+
+    const coll_data = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    tree.constants[0] = .{ .coll_byte = &coll_data };
+    tree.constant_count = 1;
+
+    // Preorder: method_call, object, arg (same constant)
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.ends_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 }; // arg: same constant
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+test "evaluator: property - startsWith prefix longer than collection is false" {
+    // Property: Collection cannot start with something longer than itself
+    // forall a, b: Coll[T]. a.size < b.size → a.startsWith(b) == false
+    var tree = ExprTree.init();
+
+    const short_coll = [_]u8{ 1, 2 };
+    const long_prefix = [_]u8{ 1, 2, 3, 4 };
+    tree.constants[0] = .{ .coll_byte = &short_coll };
+    tree.constants[1] = .{ .coll_byte = &long_prefix };
+    tree.constant_count = 2;
+
+    // Preorder: method_call, object, arg
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.starts_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object: short collection
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 1 }; // arg: long prefix
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = false }, result);
+}
+
+test "evaluator: property - endsWith suffix longer than collection is false" {
+    // Property: Collection cannot end with something longer than itself
+    // forall a, b: Coll[T]. a.size < b.size → a.endsWith(b) == false
+    var tree = ExprTree.init();
+
+    const short_coll = [_]u8{0xFF};
+    const long_suffix = [_]u8{ 0xAA, 0xBB, 0xFF };
+    tree.constants[0] = .{ .coll_byte = &short_coll };
+    tree.constants[1] = .{ .coll_byte = &long_suffix };
+    tree.constant_count = 2;
+
+    // Preorder: method_call, object, arg
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.ends_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object: short collection
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 1 }; // arg: long suffix
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = false }, result);
+}
+
+test "evaluator: property - empty startsWith empty is true" {
+    // Property: Empty collection starts with empty collection
+    // [].startsWith([]) == true
+    var tree = ExprTree.init();
+
+    tree.constants[0] = .{ .coll_byte = &.{} };
+    tree.constant_count = 1;
+
+    // Preorder: method_call, object, arg (both empty)
+    const CollTypeCode: u8 = 12;
+    tree.nodes[0] = .{ .tag = .method_call, .data = (@as(u16, Evaluator.CollMethodId.starts_with) << 8) | CollTypeCode };
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 }; // object: empty
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 }; // arg: empty
+    tree.node_count = 3;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
 }
