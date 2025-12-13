@@ -3038,17 +3038,22 @@ pub const Evaluator = struct {
 
     /// AvlTree method IDs from Rust types/savltree.rs
     const AvlTreeMethodId = struct {
-        const digest: u8 = 8; // tree.digest → Coll[Byte]
-        const enabled_operations: u8 = 9; // tree.enabledOperations → Byte
-        const key_length: u8 = 10; // tree.keyLength → Int
-        const value_length_opt: u8 = 11; // tree.valueLengthOpt → Option[Int]
+        const digest: u8 = 1; // tree.digest → Coll[Byte]
+        const enabled_operations: u8 = 2; // tree.enabledOperations → Byte
+        const key_length: u8 = 3; // tree.keyLength → Int
+        const value_length_opt: u8 = 4; // tree.valueLengthOpt → Option[Int]
+        const is_insert_allowed: u8 = 5; // tree.isInsertAllowed → Boolean
+        const is_update_allowed: u8 = 6; // tree.isUpdateAllowed → Boolean
+        const is_remove_allowed: u8 = 7; // tree.isRemoveAllowed → Boolean
+        const update_operations: u8 = 8; // tree.updateOperations(ops) → AvlTree
+        const contains: u8 = 9; // tree.contains(key, proof) → Boolean
+        const get: u8 = 10; // tree.get(key, proof) → Option[Coll[Byte]]
+        const get_many: u8 = 11; // tree.getMany(keys, proof) → Coll[Option[Coll[Byte]]]
         const insert: u8 = 12; // tree.insert(entries, proof) → Option[AvlTree]
         const update: u8 = 13; // tree.update(entries, proof) → Option[AvlTree]
         const remove: u8 = 14; // tree.remove(keys, proof) → Option[AvlTree]
-        const contains: u8 = 15; // tree.contains(key, proof) → Boolean
+        const update_digest: u8 = 15; // tree.updateDigest(digest) → AvlTree
         const insert_or_update: u8 = 16; // tree.insertOrUpdate(entries, proof) → Option[AvlTree]
-        const update_digest: u8 = 17; // tree.updateDigest(digest) → AvlTree
-        const update_operations: u8 = 18; // tree.updateOperations(ops) → AvlTree
     };
 
     /// Compute method call: dispatch based on type_code and method_id
@@ -3080,11 +3085,19 @@ pub const Evaluator = struct {
         } else if (type_code == AvlTreeTypeCode) {
             // AvlTree methods
             switch (method_id) {
+                // Property accessors
                 AvlTreeMethodId.digest => try self.computeAvlTreeDigest(),
                 AvlTreeMethodId.enabled_operations => try self.computeAvlTreeEnabledOps(),
                 AvlTreeMethodId.key_length => try self.computeAvlTreeKeyLength(),
                 AvlTreeMethodId.value_length_opt => try self.computeAvlTreeValueLengthOpt(),
+                AvlTreeMethodId.is_insert_allowed => try self.computeAvlTreeIsInsertAllowed(),
+                AvlTreeMethodId.is_update_allowed => try self.computeAvlTreeIsUpdateAllowed(),
+                AvlTreeMethodId.is_remove_allowed => try self.computeAvlTreeIsRemoveAllowed(),
+                // Lookup operations
                 AvlTreeMethodId.contains => try self.computeAvlTreeContains(),
+                AvlTreeMethodId.get => try self.computeAvlTreeGet(),
+                AvlTreeMethodId.get_many => try self.computeAvlTreeGetMany(),
+                // Tree modification
                 AvlTreeMethodId.update_digest => try self.computeAvlTreeUpdateDigest(),
                 AvlTreeMethodId.update_operations => try self.computeAvlTreeUpdateOperations(),
                 // Complex methods (insert/update/remove) require Coll[(Coll[Byte], Coll[Byte])]
@@ -3530,6 +3543,57 @@ pub const Evaluator = struct {
         assert(self.value_sp == initial_sp);
     }
 
+    /// Compute tree.isInsertAllowed → Boolean
+    fn computeAvlTreeIsInsertAllowed(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+        try self.pushValue(.{ .boolean = tree_data.isInsertAllowed() });
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.isUpdateAllowed → Boolean
+    fn computeAvlTreeIsUpdateAllowed(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+        try self.pushValue(.{ .boolean = tree_data.isUpdateAllowed() });
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute tree.isRemoveAllowed → Boolean
+    fn computeAvlTreeIsRemoveAllowed(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const initial_sp = self.value_sp;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+
+        const tree_data = tree_val.avl_tree;
+        try self.pushValue(.{ .boolean = tree_data.isRemoveAllowed() });
+
+        // POSTCONDITION: Stack unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
     /// Compute tree.contains(key, proof) → Boolean
     fn computeAvlTreeContains(self: *Evaluator) EvalError!void {
         // PRECONDITIONS: 3 values on stack (tree, key, proof)
@@ -3586,6 +3650,90 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
         assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.get(key, proof) → Option[Coll[Byte]]
+    fn computeAvlTreeGet(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, key, proof)
+        assert(self.value_sp >= 3);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, key, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        const key_val = try self.popValue();
+        if (key_val != .coll_byte) return error.TypeMismatch;
+        const key = key_val.coll_byte;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // Validate key length
+        if (key.len != tree_data.key_length) {
+            return error.InvalidData;
+        }
+
+        // Use BatchAVLVerifier to lookup key
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            // Verification failed - return None
+            try self.pushOptionNone(TypePool.COLL_BYTE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        const result = verifier.lookup(key) catch {
+            try self.pushOptionNone(TypePool.COLL_BYTE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        switch (result) {
+            .found => |value| {
+                // Copy value to our arena and return Some(value)
+                const value_copy = self.arena.allocSlice(u8, value.len) catch return error.OutOfMemory;
+                @memcpy(value_copy, value);
+
+                const idx = self.pools.values.alloc() catch return error.OutOfMemory;
+                const pooled = value_pool.PooledValue{
+                    .type_idx = TypePool.COLL_BYTE,
+                    .data = .{ .byte_slice = .{ .ptr = value_copy.ptr, .len = @intCast(value_copy.len) } },
+                };
+                self.pools.values.set(idx, pooled);
+                try self.pushValue(.{ .option = .{
+                    .inner_type = TypePool.COLL_BYTE,
+                    .value_idx = idx,
+                } });
+            },
+            .not_found, .verification_failed => {
+                try self.pushOptionNone(TypePool.COLL_BYTE);
+            },
+        }
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.getMany(keys, proof) → Coll[Option[Coll[Byte]]]
+    /// TODO: Full implementation requires Coll[Coll[Byte]] support
+    fn computeAvlTreeGetMany(self: *Evaluator) EvalError!void {
+        // getMany requires iterating through a collection of keys
+        // and building a collection of Option[Coll[Byte]] results.
+        // This needs full nested collection support which is complex.
+        // Use soft-fork handling for now.
+        return self.handleUnsupported();
     }
 
     /// Compute tree.updateDigest(newDigest) → AvlTree
