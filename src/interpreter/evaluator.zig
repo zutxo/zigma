@@ -438,6 +438,31 @@ comptime {
     assert(CollectionCost.exists.cost(0) == 3);
 }
 
+/// Per-operation PerItemCost configurations for AVL tree operations (JIT/v2).
+/// Source: sigmastate LanguageSpecificationV5.scala test vectors
+/// LookupAvlTree: PerItemCost(JitCost(40), JitCost(10), 1)
+const AvlTreeCost = struct {
+    // Lookup operations: base 40, per chunk 10, chunk size 1 (per proof element)
+    pub const lookup = PerItemCost{ .base_cost = 40, .per_chunk_cost = 10, .chunk_size = 1 };
+
+    // Property access methods (digest, keyLength, etc.): fixed cost 15
+    pub const property: u32 = 15;
+
+    // updateDigest: fixed cost 40
+    pub const update_digest: u32 = 40;
+
+    // updateOperations: fixed cost 45
+    pub const update_operations: u32 = 45;
+};
+
+// Compile-time tests for AvlTreeCost
+comptime {
+    // LookupAvlTree with 3 proof elements: base 40 + 10*3 chunks = 70
+    assert(AvlTreeCost.lookup.cost(3) == 40 + 10 * 3);
+    // LookupAvlTree with 0 elements: base cost only
+    assert(AvlTreeCost.lookup.cost(0) == 40);
+}
+
 // ============================================================================
 // Evaluator
 // ============================================================================
@@ -3532,6 +3557,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: property access (version-independent, same in JIT and AOT)
+        try self.addCost(AvlTreeCost.property);
+
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
@@ -3554,6 +3582,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
+
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
@@ -3573,6 +3604,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
+
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
@@ -3590,6 +3624,9 @@ pub const Evaluator = struct {
         assert(self.value_sp >= 1);
 
         const initial_sp = self.value_sp;
+
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
 
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
@@ -3623,6 +3660,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
+
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
@@ -3640,6 +3680,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
+
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
@@ -3656,6 +3699,9 @@ pub const Evaluator = struct {
         assert(self.value_sp >= 1);
 
         const initial_sp = self.value_sp;
+
+        // Cost: property access
+        try self.addCost(AvlTreeCost.property);
 
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
@@ -3678,6 +3724,11 @@ pub const Evaluator = struct {
         const proof_val = try self.popValue();
         if (proof_val != .coll_byte) return error.TypeMismatch;
         const proof = proof_val.coll_byte;
+
+        // Cost: per-item based on proof size (LookupAvlTree)
+        // PerItemCost(40, 10, 1) means base 40 + 10 per proof element
+        const proof_elements: u32 = @intCast(proof.len);
+        try self.addCost(AvlTreeCost.lookup.cost(proof_elements));
 
         const key_val = try self.popValue();
         if (key_val != .coll_byte) return error.TypeMismatch;
@@ -3736,6 +3787,11 @@ pub const Evaluator = struct {
         const proof_val = try self.popValue();
         if (proof_val != .coll_byte) return error.TypeMismatch;
         const proof = proof_val.coll_byte;
+
+        // Cost: per-item based on proof size (LookupAvlTree)
+        // PerItemCost(40, 10, 1) means base 40 + 10 per proof element
+        const proof_elements: u32 = @intCast(proof.len);
+        try self.addCost(AvlTreeCost.lookup.cost(proof_elements));
 
         const key_val = try self.popValue();
         if (key_val != .coll_byte) return error.TypeMismatch;
@@ -3816,6 +3872,9 @@ pub const Evaluator = struct {
 
         const initial_sp = self.value_sp;
 
+        // Cost: updateDigest fixed cost
+        try self.addCost(AvlTreeCost.update_digest);
+
         // Pop in reverse order (digest, tree)
         const digest_val = try self.popValue();
         if (digest_val != .coll_byte) return error.TypeMismatch;
@@ -3845,6 +3904,9 @@ pub const Evaluator = struct {
         assert(self.value_sp >= 2);
 
         const initial_sp = self.value_sp;
+
+        // Cost: updateOperations fixed cost
+        try self.addCost(AvlTreeCost.update_operations);
 
         // Pop in reverse order (ops, tree)
         const ops_val = try self.popValue();
