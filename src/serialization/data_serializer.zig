@@ -94,6 +94,10 @@ pub const Value = union(enum) {
     /// AVL+ tree metadata (authenticated dictionary)
     avl_tree: avl.AvlTreeData,
 
+    /// 32-byte hash result (Blake2b256 or SHA256), stored inline to avoid arena allocation.
+    /// Conceptually equivalent to coll_byte but doesn't require heap/arena memory.
+    hash32: [32]u8,
+
     /// Placeholder for soft-fork unknown opcodes.
     /// When a script uses an opcode not supported by this node but the script
     /// version is higher than the activated version, we return this instead of
@@ -535,6 +539,10 @@ fn storeValueInPool(
         .box => |b| .{
             .type_idx = type_idx,
             .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } },
+        },
+        .hash32 => |h| .{
+            .type_idx = type_idx,
+            .data = .{ .hash32 = h },
         },
         // Types not yet supported in pool storage
         .tuple, .header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {

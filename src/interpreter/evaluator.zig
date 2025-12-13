@@ -1423,21 +1423,14 @@ pub const Evaluator = struct {
         };
         try self.addCost(base_cost + @as(u32, @truncate(input_data.len)) * FixedCost.hash_per_byte);
 
-        // Compute hash
+        // Compute hash and store inline (no arena allocation needed)
         const hash_result: [32]u8 = switch (algo) {
             .blake2b256 => hash.blake2b256(input_data),
             .sha256 => hash.sha256(input_data),
         };
 
-        // Allocate space in arena for the result
-        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
-        @memcpy(result_slice, &hash_result);
-
-        // POSTCONDITION: Result is exactly 32 bytes
-        assert(result_slice.len == 32);
-
-        // Push result as Coll[Byte]
-        try self.pushValue(.{ .coll_byte = result_slice });
+        // Push result as hash32 (inline storage, avoids arena allocation)
+        try self.pushValue(.{ .hash32 = hash_result });
     }
 
     /// Compute OptionGet - extract value from Some, error on None
@@ -4991,8 +4984,7 @@ test "evaluator: calc_blake2b256" {
     var eval = Evaluator.init(&tree, &ctx);
     const result = try eval.evaluate();
 
-    try std.testing.expect(result == .coll_byte);
-    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+    try std.testing.expect(result == .hash32);
 
     // Verify against known Blake2b-256("abc") hash
     const expected = [_]u8{
@@ -5001,7 +4993,7 @@ test "evaluator: calc_blake2b256" {
         0x94, 0x96, 0x4e, 0x3b, 0xb1, 0xcb, 0x3e, 0x42,
         0x72, 0x62, 0xc8, 0xc0, 0x68, 0xd5, 0x23, 0x19,
     };
-    try std.testing.expectEqualSlices(u8, &expected, result.coll_byte);
+    try std.testing.expectEqualSlices(u8, &expected, &result.hash32);
 }
 
 test "evaluator: calc_sha256" {
@@ -5019,8 +5011,7 @@ test "evaluator: calc_sha256" {
     var eval = Evaluator.init(&tree, &ctx);
     const result = try eval.evaluate();
 
-    try std.testing.expect(result == .coll_byte);
-    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+    try std.testing.expect(result == .hash32);
 
     // Verify against known SHA-256("abc") hash (NIST test vector)
     const expected = [_]u8{
@@ -5029,7 +5020,7 @@ test "evaluator: calc_sha256" {
         0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
         0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
     };
-    try std.testing.expectEqualSlices(u8, &expected, result.coll_byte);
+    try std.testing.expectEqualSlices(u8, &expected, &result.hash32);
 }
 
 test "evaluator: calc_blake2b256 empty input" {
@@ -5046,8 +5037,7 @@ test "evaluator: calc_blake2b256 empty input" {
     var eval = Evaluator.init(&tree, &ctx);
     const result = try eval.evaluate();
 
-    try std.testing.expect(result == .coll_byte);
-    try std.testing.expectEqual(@as(usize, 32), result.coll_byte.len);
+    try std.testing.expect(result == .hash32);
 }
 
 test "evaluator: hash type mismatch" {
