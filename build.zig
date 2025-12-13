@@ -38,6 +38,21 @@ pub fn build(b: *std.Build) void {
     // Include conformance tests in main test step
     test_step.dependOn(&run_conformance_tests.step);
 
+    // Mainnet conformance tests (full ErgoTree evaluation)
+    const mainnet_tests = b.addTest(.{
+        .root_source_file = b.path("tests/conformance/mainnet.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mainnet_tests.root_module.addImport("zigma", lib.root_module);
+    const run_mainnet_tests = b.addRunArtifact(mainnet_tests);
+    const mainnet_step = b.step("mainnet", "Run mainnet conformance tests");
+    mainnet_step.dependOn(&run_mainnet_tests.step);
+
+    // Include mainnet tests in conformance and main test step
+    conformance_step.dependOn(&run_mainnet_tests.step);
+    test_step.dependOn(&run_mainnet_tests.step);
+
     // Documentation
     const lib_docs = lib.getEmittedDocs();
     const install_docs = b.addInstallDirectory(.{
