@@ -14,7 +14,8 @@
 //! - AvlTreeData: COMPLETE - stores tree metadata (digest, flags, key/value lengths)
 //! - AvlTreeFlags: COMPLETE - bit-packed operation permissions
 //! - BatchAVLVerifier.lookup: COMPLETE - full Merkle verification
-//! - BatchAVLVerifier.insert/update/remove: PARTIAL - verify old tree, trust new digest
+//! - BatchAVLVerifier.update: COMPLETE - full verification with path recomputation
+//! - BatchAVLVerifier.insert/remove: PARTIAL - verify old tree, trust new digest
 //!
 //! Lookup verification algorithm:
 //! 1. Parse proof in post-order, reconstructing tree on stack
@@ -22,11 +23,19 @@
 //! 3. Verify computed root hash matches expected digest
 //! 4. Return found value if key matched during traversal
 //!
-//! Modification verification (insert/update/remove) currently verifies the old tree
-//! structure is correct, then trusts the new digest from the proof. Full verification
-//! would require simulating AVL rotations (~500 lines in Rust/Scala). The simplified
-//! approach catches malformed proofs and incorrect starting digests; consensus rules
-//! verify against actual blockchain state.
+//! Update verification algorithm:
+//! 1. Parse proof in post-order, tracking path to target key
+//! 2. At each internal node, record balance, direction, and sibling label
+//! 3. Verify computed root matches expected digest
+//! 4. Compute new leaf label with updated value
+//! 5. Walk path backwards, recomputing each internal node's label
+//! 6. Verify computed new root matches proof's claimed new digest
+//!
+//! Insert/remove verification currently verifies the old tree structure is correct,
+//! then trusts the new digest from the proof. Full verification would require
+//! simulating AVL rotations (~500 lines in Rust/Scala). The simplified approach
+//! catches malformed proofs and incorrect starting digests; consensus rules verify
+//! against actual blockchain state.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -387,6 +396,21 @@ pub const BatchAVLVerifier = struct {
     /// Found leaf value (if any) during traversal
     found_value: ?[]const u8,
 
+    /// Path from root to target leaf (for update recomputation)
+    path_stack: [256]PathElement,
+    path_depth: u8,
+
+    /// Found leaf data during update traversal
+    found_leaf_key: ?[]const u8,
+    found_leaf_next_key: ?[]const u8,
+
+    /// Path element for tracking navigation during update verification
+    pub const PathElement = struct {
+        balance: i8,
+        go_left: bool,
+        sibling_label: [hash_size]u8,
+    };
+
     pub const VerifyError = error{
         InvalidProof,
         ProofExhausted,
@@ -441,6 +465,10 @@ pub const BatchAVLVerifier = struct {
             .node_stack = undefined,
             .stack_top = 0,
             .found_value = null,
+            .path_stack = undefined,
+            .path_depth = 0,
+            .found_leaf_key = null,
+            .found_leaf_next_key = null,
         };
 
         // Find where tree encoding ends and direction bits start
@@ -520,14 +548,24 @@ pub const BatchAVLVerifier = struct {
         self.starting_digest = new_digest;
     }
 
-    /// Perform an update operation
+    /// Perform an update operation with full cryptographic verification.
+    ///
+    /// This verifies the update by:
+    /// 1. Reconstructing the old tree and verifying root matches starting digest
+    /// 2. Navigating to the target key using direction bits
+    /// 3. Computing new leaf label with updated value
+    /// 4. Recomputing all path hashes from leaf to root
+    /// 5. Verifying computed new root matches proof's claimed new digest
+    ///
+    /// Unlike insert/remove, update doesn't require AVL rotations since
+    /// tree structure is unchanged - only values and hashes are modified.
     pub fn update(self: *BatchAVLVerifier, key: []const u8, value: []const u8) VerifyError!void {
         if (key.len != self.key_length) return error.InvalidKeyLength;
         if (self.value_length_opt) |vl| {
             if (value.len != vl) return error.InvalidValueLength;
         }
 
-        const new_digest = self.verifyModification(key, value, .update) catch {
+        const new_digest = self.verifyUpdateFull(key, value) catch {
             return error.InvalidProof;
         };
 
@@ -879,10 +917,191 @@ pub const BatchAVLVerifier = struct {
         return self.node_stack[0];
     }
 
+    // ========================================================================
+    // Full Update Verification
+    // ========================================================================
+
+    /// Verify update operation by recomputing the new root hash.
+    ///
+    /// Algorithm:
+    /// 1. Parse proof in post-order, tracking path to target key using direction bits
+    /// 2. At each internal node, record balance, direction, and sibling label
+    /// 3. When target leaf is found, verify key matches
+    /// 4. Compute new leaf label with updated value
+    /// 5. Walk path backwards, recomputing each internal node's label
+    /// 6. Return computed new root for verification against proof's new digest
+    ///
+    /// Update doesn't require rebalancing since tree structure is unchanged.
+    fn verifyUpdateFull(
+        self: *BatchAVLVerifier,
+        key: []const u8,
+        new_value: []const u8,
+    ) VerifyError![digest_size]u8 {
+        // PRECONDITION: Key must match expected length
+        assert(key.len == self.key_length);
+
+        // Reset state
+        self.tree_pos = 0;
+        self.stack_top = 0;
+        self.path_depth = 0;
+        self.found_leaf_key = null;
+        self.found_leaf_next_key = null;
+        self.resetDirections();
+
+        // Step 1: Parse proof and verify old root, tracking path
+        const old_root = try self.reconstructTreeWithPath(key);
+
+        // Verify computed root matches expected digest
+        if (!timing.constantTimeEqlFixed(hash_size, &old_root, self.starting_digest[0..hash_size])) {
+            return error.InvalidProof;
+        }
+
+        // Step 2: Verify key was found (update requires existing key)
+        const leaf_key = self.found_leaf_key orelse return error.InvalidProof;
+        const next_key = self.found_leaf_next_key orelse return error.InvalidProof;
+
+        // Verify key matches (constant-time)
+        if (!timing.constantTimeEql(leaf_key, key)) {
+            return error.InvalidProof; // Key not found, cannot update
+        }
+
+        // Step 3: Compute new leaf label with updated value
+        const new_leaf = AvlNode{
+            .leaf = .{
+                .key = leaf_key,
+                .value = new_value,
+                .next_leaf_key = next_key,
+            },
+        };
+        var current_label = new_leaf.computeLabel(self.key_length);
+
+        // Step 4: Walk path backwards, recomputing internal node labels
+        // Path was recorded from leaf to root, so we process in reverse order
+        var i: u8 = self.path_depth;
+        while (i > 0) {
+            i -= 1;
+            const elem = self.path_stack[i];
+
+            // Compute internal node with updated child label
+            const internal = AvlNode{
+                .internal = .{
+                    .balance = elem.balance,
+                    .left_label = if (elem.go_left) current_label else elem.sibling_label,
+                    .right_label = if (elem.go_left) elem.sibling_label else current_label,
+                },
+            };
+            current_label = internal.computeLabel(self.key_length);
+        }
+
+        // Step 5: Extract expected new digest from proof and compare
+        if (self.proof.len < digest_size) {
+            return error.InvalidProof;
+        }
+        const digest_start = self.proof.len - digest_size;
+        var expected_new_digest: [digest_size]u8 = undefined;
+        @memcpy(&expected_new_digest, self.proof[digest_start..][0..digest_size]);
+
+        // Verify computed new root matches proof's claimed new digest
+        if (!timing.constantTimeEqlFixed(hash_size, &current_label, expected_new_digest[0..hash_size])) {
+            return error.InvalidProof;
+        }
+
+        // Return the verified new digest
+        return expected_new_digest;
+    }
+
+    /// Reconstruct tree from proof while tracking path to target key.
+    /// Uses direction bits to identify which branch leads to target.
+    fn reconstructTreeWithPath(self: *BatchAVLVerifier, target_key: []const u8) VerifyError![hash_size]u8 {
+        var iterations: usize = 0;
+
+        while (self.tree_pos < self.directions_start) {
+            iterations += 1;
+            if (iterations > max_verification_iterations) {
+                return error.IterationLimitExceeded;
+            }
+
+            const marker = self.proof[self.tree_pos];
+            self.tree_pos += 1;
+
+            if (marker == ProofMarker.end_of_tree) {
+                break;
+            } else if (marker == ProofMarker.label) {
+                // Label-only node (pruned subtree)
+                if (self.tree_pos + hash_size > self.proof.len) {
+                    return error.ProofExhausted;
+                }
+                try self.pushLabel(self.proof[self.tree_pos..][0..hash_size]);
+                self.tree_pos += hash_size;
+            } else if (marker == ProofMarker.leaf) {
+                // Leaf node
+                const leaf_data = try self.parseLeaf();
+
+                // Check if this is the target key
+                if (timing.constantTimeEql(leaf_data.key, target_key)) {
+                    self.found_leaf_key = leaf_data.key;
+                    self.found_leaf_next_key = leaf_data.next_leaf_key;
+                }
+
+                const node = AvlNode{
+                    .leaf = .{
+                        .key = leaf_data.key,
+                        .value = leaf_data.value,
+                        .next_leaf_key = leaf_data.next_leaf_key,
+                    },
+                };
+                const label = node.computeLabel(self.key_length);
+                try self.pushLabel(&label);
+            } else {
+                // Internal node
+                const balance = signedFromByte(marker);
+                if (balance < -1 or balance > 1) {
+                    return error.InvalidNodeType;
+                }
+
+                // Pop children (right first for post-order)
+                const right_label = try self.popLabel();
+                const left_label = try self.popLabel();
+
+                // Read direction bit: which child is on path to target?
+                const go_left = self.nextDirectionIsLeft() catch false;
+
+                // Record path element for later recomputation
+                if (self.path_depth < 255) {
+                    self.path_stack[self.path_depth] = .{
+                        .balance = balance,
+                        .go_left = go_left,
+                        .sibling_label = if (go_left) right_label else left_label,
+                    };
+                    self.path_depth += 1;
+                } else {
+                    return error.StackOverflow;
+                }
+
+                // Compute and push internal node label
+                const node = AvlNode{
+                    .internal = .{
+                        .balance = balance,
+                        .left_label = left_label,
+                        .right_label = right_label,
+                    },
+                };
+                const label = node.computeLabel(self.key_length);
+                try self.pushLabel(&label);
+            }
+        }
+
+        if (self.stack_top != 1) {
+            return error.InvalidProof;
+        }
+
+        return self.node_stack[0];
+    }
+
     // Compile-time assertions (ZIGMA_STYLE)
     comptime {
-        // BatchAVLVerifier size check (stack is large)
-        assert(@sizeOf(BatchAVLVerifier) <= 9000); // 256 * 32 + overhead
+        // BatchAVLVerifier size check (stack is large, plus path stack)
+        assert(@sizeOf(BatchAVLVerifier) <= 20000); // 256 * 32 * 2 + overhead
     }
 };
 
@@ -1653,6 +1872,251 @@ test "avl_tree: property - lookup consistency across reinit" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "avl_tree: BatchAVLVerifier update with path recomputation" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Two leaves: key 0x10 and key 0x20
+    const key1 = [_]u8{0x10};
+    const value1_old = [_]u8{ 0xAA, 0xBB };
+    const key2 = [_]u8{0x20};
+    const value2 = [_]u8{ 0xCC, 0xDD };
+    const end_key = [_]u8{0xFF};
+    const value1_new = [_]u8{ 0x11, 0x22 }; // Updated value for key1
+
+    // Build proof: leaf1, leaf2, internal_node(balance=0), end, direction_bit, new_digest
+    var proof_buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    // Left leaf (key1) - the one we'll update
+    proof_buf[pos] = ProofMarker.leaf;
+    pos += 1;
+    proof_buf[pos] = key1[0];
+    pos += 1;
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 2; // value length
+    pos += 2;
+    @memcpy(proof_buf[pos..][0..2], &value1_old);
+    pos += 2;
+    proof_buf[pos] = key2[0]; // next_leaf_key = key2
+    pos += 1;
+
+    // Right leaf (key2)
+    proof_buf[pos] = ProofMarker.leaf;
+    pos += 1;
+    proof_buf[pos] = key2[0];
+    pos += 1;
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 2;
+    pos += 2;
+    @memcpy(proof_buf[pos..][0..2], &value2);
+    pos += 2;
+    proof_buf[pos] = end_key[0];
+    pos += 1;
+
+    // Internal node with balance=0
+    proof_buf[pos] = 0x00;
+    pos += 1;
+
+    // End of tree
+    proof_buf[pos] = ProofMarker.end_of_tree;
+    pos += 1;
+
+    // Direction bit: 1 = go left (to reach key1)
+    proof_buf[pos] = 0x01;
+    pos += 1;
+
+    // Compute OLD root hash (with old value)
+    const left_leaf_old = AvlNode{
+        .leaf = .{
+            .key = &key1,
+            .value = &value1_old,
+            .next_leaf_key = &key2,
+        },
+    };
+    const left_label_old = left_leaf_old.computeLabel(key_length);
+
+    const right_leaf = AvlNode{
+        .leaf = .{
+            .key = &key2,
+            .value = &value2,
+            .next_leaf_key = &end_key,
+        },
+    };
+    const right_label = right_leaf.computeLabel(key_length);
+
+    const internal_old = AvlNode{
+        .internal = .{
+            .balance = 0,
+            .left_label = left_label_old,
+            .right_label = right_label,
+        },
+    };
+    const old_root_hash = internal_old.computeLabel(key_length);
+
+    // Compute NEW root hash (with new value)
+    const left_leaf_new = AvlNode{
+        .leaf = .{
+            .key = &key1,
+            .value = &value1_new,
+            .next_leaf_key = &key2,
+        },
+    };
+    const left_label_new = left_leaf_new.computeLabel(key_length);
+
+    const internal_new = AvlNode{
+        .internal = .{
+            .balance = 0,
+            .left_label = left_label_new,
+            .right_label = right_label,
+        },
+    };
+    const new_root_hash = internal_new.computeLabel(key_length);
+
+    // Add new digest to proof
+    @memcpy(proof_buf[pos..][0..hash_size], &new_root_hash);
+    proof_buf[pos + hash_size] = 1; // height = 1
+    pos += digest_size;
+
+    const proof = proof_buf[0..pos];
+
+    // Create starting digest (old root)
+    var digest: [digest_size]u8 = undefined;
+    @memcpy(digest[0..hash_size], &old_root_hash);
+    digest[hash_size] = 1; // height = 1
+
+    var verifier = try BatchAVLVerifier.init(digest, proof, key_length, null, &arena);
+
+    // Update key1 with new value - should succeed
+    try verifier.update(&key1, &value1_new);
+
+    // Verify digest was updated to new root
+    const final_digest = verifier.digest();
+    try std.testing.expect(final_digest != null);
+    try std.testing.expectEqualSlices(u8, new_root_hash[0..hash_size], final_digest.?[0..hash_size]);
+}
+
+test "avl_tree: BatchAVLVerifier update rejects invalid new digest" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Single leaf tree
+    const key = [_]u8{0x42};
+    const value_old = [_]u8{ 0xAA, 0xBB };
+    const value_new = [_]u8{ 0xCC, 0xDD };
+    const next_key = [_]u8{0xFF};
+
+    var proof_buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    // Single leaf
+    proof_buf[pos] = ProofMarker.leaf;
+    pos += 1;
+    proof_buf[pos] = key[0];
+    pos += 1;
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 2;
+    pos += 2;
+    @memcpy(proof_buf[pos..][0..2], &value_old);
+    pos += 2;
+    proof_buf[pos] = next_key[0];
+    pos += 1;
+
+    // End of tree
+    proof_buf[pos] = ProofMarker.end_of_tree;
+    pos += 1;
+
+    // Add WRONG new digest (all zeros)
+    @memset(proof_buf[pos..][0..digest_size], 0x00);
+    pos += digest_size;
+
+    const proof = proof_buf[0..pos];
+
+    // Compute correct old root hash
+    const leaf = AvlNode{
+        .leaf = .{
+            .key = &key,
+            .value = &value_old,
+            .next_leaf_key = &next_key,
+        },
+    };
+    const old_root_hash = leaf.computeLabel(key_length);
+
+    var digest: [digest_size]u8 = undefined;
+    @memcpy(digest[0..hash_size], &old_root_hash);
+    digest[hash_size] = 0; // height = 0 (single leaf)
+
+    var verifier = try BatchAVLVerifier.init(digest, proof, key_length, null, &arena);
+
+    // Update should fail because new digest is wrong
+    try std.testing.expectError(error.InvalidProof, verifier.update(&key, &value_new));
+}
+
+test "avl_tree: BatchAVLVerifier update rejects non-existent key" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Single leaf with key 0x42
+    const key = [_]u8{0x42};
+    const value = [_]u8{ 0xAA, 0xBB };
+    const next_key = [_]u8{0xFF};
+    const wrong_key = [_]u8{0x99}; // Key that doesn't exist
+
+    var proof_buf: [256]u8 = undefined;
+    var pos: usize = 0;
+
+    // Single leaf
+    proof_buf[pos] = ProofMarker.leaf;
+    pos += 1;
+    proof_buf[pos] = key[0];
+    pos += 1;
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 2;
+    pos += 2;
+    @memcpy(proof_buf[pos..][0..2], &value);
+    pos += 2;
+    proof_buf[pos] = next_key[0];
+    pos += 1;
+
+    // End of tree
+    proof_buf[pos] = ProofMarker.end_of_tree;
+    pos += 1;
+
+    // Add some digest (doesn't matter, should fail before checking)
+    @memset(proof_buf[pos..][0..digest_size], 0x00);
+    pos += digest_size;
+
+    const proof = proof_buf[0..pos];
+
+    // Compute correct old root hash
+    const leaf = AvlNode{
+        .leaf = .{
+            .key = &key,
+            .value = &value,
+            .next_leaf_key = &next_key,
+        },
+    };
+    const old_root_hash = leaf.computeLabel(key_length);
+
+    var digest: [digest_size]u8 = undefined;
+    @memcpy(digest[0..hash_size], &old_root_hash);
+    digest[hash_size] = 0;
+
+    var verifier = try BatchAVLVerifier.init(digest, proof, key_length, null, &arena);
+
+    // Update with wrong key should fail
+    try std.testing.expectError(error.InvalidProof, verifier.update(&wrong_key, &value));
 }
 
 // Note: Balance value validation (rejecting values outside {-1, 0, 1})
