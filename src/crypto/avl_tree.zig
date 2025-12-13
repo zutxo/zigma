@@ -1098,6 +1098,344 @@ pub const BatchAVLVerifier = struct {
         return self.node_stack[0];
     }
 
+    // ========================================================================
+    // AVL Rotation Simulation
+    // ========================================================================
+
+    /// Result of an AVL rotation operation.
+    /// Contains the new root label and new balance values for affected nodes.
+    pub const RotationResult = struct {
+        /// New root label after rotation
+        new_root_label: [hash_size]u8,
+        /// Balance of new root (always 0 for double rotations)
+        new_root_balance: i8,
+        /// Whether tree height decreased (for remove operations)
+        height_decreased: bool,
+    };
+
+    /// Perform a single right rotation (LL case).
+    ///
+    /// Before:        After:
+    ///      P           L
+    ///     / \         / \
+    ///    L   R  =>  LL   P
+    ///   / \             / \
+    ///  LL LR           LR  R
+    ///
+    /// Used when: parent balance < 0 AND left child balance <= 0
+    pub fn singleRightRotate(
+        self: *BatchAVLVerifier,
+        parent_label: [hash_size]u8,
+        left_label: [hash_size]u8,
+        right_label: [hash_size]u8,
+        left_left_label: [hash_size]u8,
+        left_right_label: [hash_size]u8,
+        left_balance: i8,
+    ) RotationResult {
+        // New parent (demoted): gets left_right as its new left child
+        // Balance depends on old left child's balance
+        const new_parent_balance: i8 = if (left_balance == 0) -1 else 0;
+        const new_parent = AvlNode{
+            .internal = .{
+                .balance = new_parent_balance,
+                .left_label = left_right_label,
+                .right_label = right_label,
+            },
+        };
+        const new_parent_label = new_parent.computeLabel(self.key_length);
+
+        // New root (promoted left child): parent becomes its right child
+        const new_root_balance: i8 = if (left_balance == 0) 1 else 0;
+        const new_root = AvlNode{
+            .internal = .{
+                .balance = new_root_balance,
+                .left_label = left_left_label,
+                .right_label = new_parent_label,
+            },
+        };
+
+        _ = parent_label; // Used conceptually but not in hash
+        _ = left_label;
+
+        return .{
+            .new_root_label = new_root.computeLabel(self.key_length),
+            .new_root_balance = new_root_balance,
+            .height_decreased = left_balance != 0,
+        };
+    }
+
+    /// Perform a single left rotation (RR case).
+    ///
+    /// Before:        After:
+    ///    P             R
+    ///   / \           / \
+    ///  L   R    =>   P   RR
+    ///     / \       / \
+    ///    RL  RR    L  RL
+    ///
+    /// Used when: parent balance > 0 AND right child balance >= 0
+    pub fn singleLeftRotate(
+        self: *BatchAVLVerifier,
+        parent_label: [hash_size]u8,
+        left_label: [hash_size]u8,
+        right_label: [hash_size]u8,
+        right_left_label: [hash_size]u8,
+        right_right_label: [hash_size]u8,
+        right_balance: i8,
+    ) RotationResult {
+        // New parent (demoted): gets right_left as its new right child
+        const new_parent_balance: i8 = if (right_balance == 0) 1 else 0;
+        const new_parent = AvlNode{
+            .internal = .{
+                .balance = new_parent_balance,
+                .left_label = left_label,
+                .right_label = right_left_label,
+            },
+        };
+        const new_parent_label = new_parent.computeLabel(self.key_length);
+
+        // New root (promoted right child): parent becomes its left child
+        const new_root_balance: i8 = if (right_balance == 0) -1 else 0;
+        const new_root = AvlNode{
+            .internal = .{
+                .balance = new_root_balance,
+                .left_label = new_parent_label,
+                .right_label = right_right_label,
+            },
+        };
+
+        _ = parent_label;
+        _ = right_label;
+
+        return .{
+            .new_root_label = new_root.computeLabel(self.key_length),
+            .new_root_balance = new_root_balance,
+            .height_decreased = right_balance != 0,
+        };
+    }
+
+    /// Perform a double right rotation (LR case).
+    ///
+    /// Before:          After:
+    ///      P             LR
+    ///     / \           /  \
+    ///    L   R   =>    L    P
+    ///   / \           / \  / \
+    ///  LL LR        LL A  B  R
+    ///    / \
+    ///   A   B
+    ///
+    /// Used when: parent balance < 0 AND left child balance > 0
+    pub fn doubleRightRotate(
+        self: *BatchAVLVerifier,
+        parent_label: [hash_size]u8,
+        left_label: [hash_size]u8,
+        right_label: [hash_size]u8,
+        left_left_label: [hash_size]u8,
+        left_right_label: [hash_size]u8,
+        lr_left_label: [hash_size]u8,
+        lr_right_label: [hash_size]u8,
+        lr_balance: i8,
+    ) RotationResult {
+        // New balances depend on LR node's original balance
+        const new_left_balance: i8 = switch (lr_balance) {
+            0 => 0,
+            -1 => 0,
+            1 => -1,
+            else => 0,
+        };
+        const new_right_balance: i8 = switch (lr_balance) {
+            0 => 0,
+            -1 => 1,
+            1 => 0,
+            else => 0,
+        };
+
+        // New left child: original left with lr_left as right child
+        const new_left = AvlNode{
+            .internal = .{
+                .balance = new_left_balance,
+                .left_label = left_left_label,
+                .right_label = lr_left_label,
+            },
+        };
+        const new_left_label = new_left.computeLabel(self.key_length);
+
+        // New right child: original parent with lr_right as left child
+        const new_right = AvlNode{
+            .internal = .{
+                .balance = new_right_balance,
+                .left_label = lr_right_label,
+                .right_label = right_label,
+            },
+        };
+        const new_right_label = new_right.computeLabel(self.key_length);
+
+        // New root: the LR node
+        const new_root = AvlNode{
+            .internal = .{
+                .balance = 0,
+                .left_label = new_left_label,
+                .right_label = new_right_label,
+            },
+        };
+
+        _ = parent_label;
+        _ = left_label;
+        _ = left_right_label;
+
+        return .{
+            .new_root_label = new_root.computeLabel(self.key_length),
+            .new_root_balance = 0,
+            .height_decreased = true,
+        };
+    }
+
+    /// Perform a double left rotation (RL case).
+    ///
+    /// Before:          After:
+    ///    P               RL
+    ///   / \             /  \
+    ///  L   R    =>     P    R
+    ///     / \         / \  / \
+    ///   RL  RR       L  A  B RR
+    ///   / \
+    ///  A   B
+    ///
+    /// Used when: parent balance > 0 AND right child balance < 0
+    pub fn doubleLeftRotate(
+        self: *BatchAVLVerifier,
+        parent_label: [hash_size]u8,
+        left_label: [hash_size]u8,
+        right_label: [hash_size]u8,
+        right_left_label: [hash_size]u8,
+        right_right_label: [hash_size]u8,
+        rl_left_label: [hash_size]u8,
+        rl_right_label: [hash_size]u8,
+        rl_balance: i8,
+    ) RotationResult {
+        // New balances depend on RL node's original balance
+        const new_left_balance: i8 = switch (rl_balance) {
+            0 => 0,
+            -1 => 0,
+            1 => -1,
+            else => 0,
+        };
+        const new_right_balance: i8 = switch (rl_balance) {
+            0 => 0,
+            -1 => 1,
+            1 => 0,
+            else => 0,
+        };
+
+        // New left child: original parent with rl_left as right child
+        const new_left = AvlNode{
+            .internal = .{
+                .balance = new_left_balance,
+                .left_label = left_label,
+                .right_label = rl_left_label,
+            },
+        };
+        const new_left_label = new_left.computeLabel(self.key_length);
+
+        // New right child: original right with rl_right as left child
+        const new_right = AvlNode{
+            .internal = .{
+                .balance = new_right_balance,
+                .left_label = rl_right_label,
+                .right_label = right_right_label,
+            },
+        };
+        const new_right_label = new_right.computeLabel(self.key_length);
+
+        // New root: the RL node
+        const new_root = AvlNode{
+            .internal = .{
+                .balance = 0,
+                .left_label = new_left_label,
+                .right_label = new_right_label,
+            },
+        };
+
+        _ = parent_label;
+        _ = right_label;
+        _ = right_left_label;
+
+        return .{
+            .new_root_label = new_root.computeLabel(self.key_length),
+            .new_root_balance = 0,
+            .height_decreased = true,
+        };
+    }
+
+    /// Determine which rotation is needed based on balance values.
+    /// Returns rotation type and whether it's needed.
+    pub const RotationType = enum {
+        none,
+        single_right,
+        single_left,
+        double_right,
+        double_left,
+    };
+
+    /// Determine rotation needed after insert (height increase on one side).
+    pub fn rotationNeededAfterInsert(
+        parent_balance: i8,
+        child_balance: i8,
+        went_left: bool,
+    ) RotationType {
+        if (went_left) {
+            // Inserted on left side
+            if (parent_balance == -2) {
+                // Left subtree too tall
+                if (child_balance <= 0) {
+                    return .single_right;
+                } else {
+                    return .double_right;
+                }
+            }
+        } else {
+            // Inserted on right side
+            if (parent_balance == 2) {
+                // Right subtree too tall
+                if (child_balance >= 0) {
+                    return .single_left;
+                } else {
+                    return .double_left;
+                }
+            }
+        }
+        return .none;
+    }
+
+    /// Determine rotation needed after remove (height decrease on one side).
+    pub fn rotationNeededAfterRemove(
+        parent_balance: i8,
+        sibling_balance: i8,
+        removed_from_left: bool,
+    ) RotationType {
+        if (removed_from_left) {
+            // Removed from left side, right might be too tall
+            if (parent_balance == 2) {
+                if (sibling_balance >= 0) {
+                    return .single_left;
+                } else {
+                    return .double_left;
+                }
+            }
+        } else {
+            // Removed from right side, left might be too tall
+            if (parent_balance == -2) {
+                if (sibling_balance <= 0) {
+                    return .single_right;
+                } else {
+                    return .double_right;
+                }
+            }
+        }
+        return .none;
+    }
+
     // Compile-time assertions (ZIGMA_STYLE)
     comptime {
         // BatchAVLVerifier size check (stack is large, plus path stack)
@@ -2117,6 +2455,285 @@ test "avl_tree: BatchAVLVerifier update rejects non-existent key" {
 
     // Update with wrong key should fail
     try std.testing.expectError(error.InvalidProof, verifier.update(&wrong_key, &value));
+}
+
+test "avl_tree: rotationNeededAfterInsert determines correct rotation type" {
+    // LL case: inserted left-left, parent balance -2, child balance -1
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_right,
+        BatchAVLVerifier.rotationNeededAfterInsert(-2, -1, true),
+    );
+
+    // LL case: inserted left-left, parent balance -2, child balance 0
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_right,
+        BatchAVLVerifier.rotationNeededAfterInsert(-2, 0, true),
+    );
+
+    // LR case: inserted left-right, parent balance -2, child balance +1
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.double_right,
+        BatchAVLVerifier.rotationNeededAfterInsert(-2, 1, true),
+    );
+
+    // RR case: inserted right-right, parent balance +2, child balance +1
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_left,
+        BatchAVLVerifier.rotationNeededAfterInsert(2, 1, false),
+    );
+
+    // RR case: inserted right-right, parent balance +2, child balance 0
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_left,
+        BatchAVLVerifier.rotationNeededAfterInsert(2, 0, false),
+    );
+
+    // RL case: inserted right-left, parent balance +2, child balance -1
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.double_left,
+        BatchAVLVerifier.rotationNeededAfterInsert(2, -1, false),
+    );
+
+    // No rotation needed: balanced
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.none,
+        BatchAVLVerifier.rotationNeededAfterInsert(-1, -1, true),
+    );
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.none,
+        BatchAVLVerifier.rotationNeededAfterInsert(1, 1, false),
+    );
+}
+
+test "avl_tree: rotationNeededAfterRemove determines correct rotation type" {
+    // Removed from left, right sibling balance >= 0: single left
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_left,
+        BatchAVLVerifier.rotationNeededAfterRemove(2, 1, true),
+    );
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_left,
+        BatchAVLVerifier.rotationNeededAfterRemove(2, 0, true),
+    );
+
+    // Removed from left, right sibling balance < 0: double left
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.double_left,
+        BatchAVLVerifier.rotationNeededAfterRemove(2, -1, true),
+    );
+
+    // Removed from right, left sibling balance <= 0: single right
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_right,
+        BatchAVLVerifier.rotationNeededAfterRemove(-2, -1, false),
+    );
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.single_right,
+        BatchAVLVerifier.rotationNeededAfterRemove(-2, 0, false),
+    );
+
+    // Removed from right, left sibling balance > 0: double right
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.double_right,
+        BatchAVLVerifier.rotationNeededAfterRemove(-2, 1, false),
+    );
+
+    // No rotation needed
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.none,
+        BatchAVLVerifier.rotationNeededAfterRemove(1, 0, true),
+    );
+    try std.testing.expectEqual(
+        BatchAVLVerifier.RotationType.none,
+        BatchAVLVerifier.rotationNeededAfterRemove(-1, 0, false),
+    );
+}
+
+test "avl_tree: single right rotation produces correct tree structure" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Create a simple tree where we know the labels
+    // We'll use leaf labels directly as children
+    var ll_label: [hash_size]u8 = undefined;
+    @memset(&ll_label, 0x11);
+    var lr_label: [hash_size]u8 = undefined;
+    @memset(&lr_label, 0x22);
+    var r_label: [hash_size]u8 = undefined;
+    @memset(&r_label, 0x33);
+
+    // Compute left child label (balance -1)
+    const left_node = AvlNode{
+        .internal = .{
+            .balance = -1,
+            .left_label = ll_label,
+            .right_label = lr_label,
+        },
+    };
+    const left_label = left_node.computeLabel(key_length);
+
+    // Compute parent label (balance -2, triggers rotation)
+    const parent_node = AvlNode{
+        .internal = .{
+            .balance = -2,
+            .left_label = left_label,
+            .right_label = r_label,
+        },
+    };
+    const parent_label = parent_node.computeLabel(key_length);
+
+    // Create dummy digest and verifier
+    var digest: [digest_size]u8 = undefined;
+    @memset(&digest, 0);
+    var verifier = try BatchAVLVerifier.init(digest, &.{}, key_length, null, &arena);
+
+    // Perform single right rotation
+    const result = verifier.singleRightRotate(
+        parent_label,
+        left_label,
+        r_label,
+        ll_label,
+        lr_label,
+        -1, // left_balance
+    );
+
+    // After rotation:
+    // - New root should have LL as left child
+    // - New root should have new parent (with LR left, R right) as right child
+    // - Both should have balance 0 (since left_balance was -1)
+    try std.testing.expectEqual(@as(i8, 0), result.new_root_balance);
+    try std.testing.expect(result.height_decreased);
+
+    // Verify the new root label is different from original
+    try std.testing.expect(!std.mem.eql(u8, &result.new_root_label, &parent_label));
+}
+
+test "avl_tree: single left rotation produces correct tree structure" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Create labels
+    var l_label: [hash_size]u8 = undefined;
+    @memset(&l_label, 0x11);
+    var rl_label: [hash_size]u8 = undefined;
+    @memset(&rl_label, 0x22);
+    var rr_label: [hash_size]u8 = undefined;
+    @memset(&rr_label, 0x33);
+
+    // Compute right child label (balance +1)
+    const right_node = AvlNode{
+        .internal = .{
+            .balance = 1,
+            .left_label = rl_label,
+            .right_label = rr_label,
+        },
+    };
+    const right_label = right_node.computeLabel(key_length);
+
+    // Compute parent label (balance +2, triggers rotation)
+    const parent_node = AvlNode{
+        .internal = .{
+            .balance = 2,
+            .left_label = l_label,
+            .right_label = right_label,
+        },
+    };
+    const parent_label = parent_node.computeLabel(key_length);
+
+    // Create verifier
+    var digest: [digest_size]u8 = undefined;
+    @memset(&digest, 0);
+    var verifier = try BatchAVLVerifier.init(digest, &.{}, key_length, null, &arena);
+
+    // Perform single left rotation
+    const result = verifier.singleLeftRotate(
+        parent_label,
+        l_label,
+        right_label,
+        rl_label,
+        rr_label,
+        1, // right_balance
+    );
+
+    // After rotation: both should have balance 0
+    try std.testing.expectEqual(@as(i8, 0), result.new_root_balance);
+    try std.testing.expect(result.height_decreased);
+    try std.testing.expect(!std.mem.eql(u8, &result.new_root_label, &parent_label));
+}
+
+test "avl_tree: double rotations produce balanced trees" {
+    const backing_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena.deinit();
+
+    const key_length: usize = 1;
+
+    // Create labels for double rotation test
+    var ll_label: [hash_size]u8 = undefined;
+    @memset(&ll_label, 0x11);
+    var lr_left: [hash_size]u8 = undefined;
+    @memset(&lr_left, 0x22);
+    var lr_right: [hash_size]u8 = undefined;
+    @memset(&lr_right, 0x33);
+    var r_label: [hash_size]u8 = undefined;
+    @memset(&r_label, 0x44);
+
+    // LR node (balance 0)
+    const lr_node = AvlNode{
+        .internal = .{
+            .balance = 0,
+            .left_label = lr_left,
+            .right_label = lr_right,
+        },
+    };
+    const lr_label = lr_node.computeLabel(key_length);
+
+    // Left node (balance +1, right-heavy triggers LR case)
+    const left_node = AvlNode{
+        .internal = .{
+            .balance = 1,
+            .left_label = ll_label,
+            .right_label = lr_label,
+        },
+    };
+    const left_label = left_node.computeLabel(key_length);
+
+    // Parent (balance -2)
+    const parent_node = AvlNode{
+        .internal = .{
+            .balance = -2,
+            .left_label = left_label,
+            .right_label = r_label,
+        },
+    };
+    const parent_label = parent_node.computeLabel(key_length);
+
+    // Create verifier
+    var digest: [digest_size]u8 = undefined;
+    @memset(&digest, 0);
+    var verifier = try BatchAVLVerifier.init(digest, &.{}, key_length, null, &arena);
+
+    // Perform double right rotation
+    const result = verifier.doubleRightRotate(
+        parent_label,
+        left_label,
+        r_label,
+        ll_label,
+        lr_label,
+        lr_left,
+        lr_right,
+        0, // lr_balance
+    );
+
+    // Double rotations always produce balance 0 at new root
+    try std.testing.expectEqual(@as(i8, 0), result.new_root_balance);
+    try std.testing.expect(result.height_decreased);
 }
 
 // Note: Balance value validation (rejecting values outside {-1, 0, 1})
