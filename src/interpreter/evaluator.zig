@@ -194,6 +194,9 @@ pub const EvalError = error{
     InvalidState,
     /// Collection exceeds protocol size limit
     CollectionTooLarge,
+    /// Soft-fork accepted: unknown feature in newer script version
+    /// The caller should treat this as "script passes" (TrivialProp.True)
+    SoftForkAccepted,
 };
 
 // ============================================================================
@@ -662,8 +665,21 @@ pub const Evaluator = struct {
             const work = self.popWork();
 
             switch (work.phase) {
-                .evaluate => try self.evaluateNode(work.node_idx),
-                .compute => try self.computeNode(work.node_idx),
+                .evaluate => self.evaluateNode(work.node_idx) catch |err| {
+                    if (err == error.SoftForkAccepted) {
+                        // Soft-fork rule: script with unknown features passes
+                        // Reference: Interpreter.scala WhenSoftForkReductionResult
+                        return .{ .boolean = true };
+                    }
+                    return err;
+                },
+                .compute => self.computeNode(work.node_idx) catch |err| {
+                    if (err == error.SoftForkAccepted) {
+                        // Soft-fork rule: script with unknown features passes
+                        return .{ .boolean = true };
+                    }
+                    return err;
+                },
             }
         }
 
@@ -1126,17 +1142,10 @@ pub const Evaluator = struct {
             },
 
             .unsupported => {
-                // Soft-fork rule: if script version > activated version,
-                // unknown opcodes should return placeholder value instead of error.
-                // This allows old nodes to accept blocks with new script features.
-                if (self.version_ctx.allowsSoftForkPlaceholder()) {
-                    try self.addCost(FixedCost.constant);
-                    try self.pushValue(.{ .soft_fork_placeholder = {} });
-                } else {
-                    // Script version <= activated version means we should
-                    // understand all opcodes - this is an error.
-                    return error.UnsupportedExpression;
-                }
+                // Unknown opcode encountered during deserialization.
+                // Use soft-fork aware handling: returns SoftForkAccepted if
+                // script version > activated version, UnsupportedExpression otherwise.
+                return self.handleUnsupported();
             },
         }
     }
@@ -2869,7 +2878,7 @@ pub const Evaluator = struct {
                 CollMethodId.zip => try self.computeZip(node_idx),
                 CollMethodId.indices => try self.computeIndices(),
                 CollMethodId.reverse => try self.computeReverse(),
-                else => return error.UnsupportedExpression,
+                else => return self.handleUnsupported(),
             }
         } else if (type_code == AvlTreeTypeCode) {
             // AvlTree methods
@@ -2887,18 +2896,18 @@ pub const Evaluator = struct {
                 AvlTreeMethodId.update,
                 AvlTreeMethodId.remove,
                 AvlTreeMethodId.insert_or_update,
-                => return error.UnsupportedExpression,
-                else => return error.UnsupportedExpression,
+                => return self.handleUnsupported(),
+                else => return self.handleUnsupported(),
             }
         } else if (type_code == ContextTypeCode) {
             // Context methods
             switch (method_id) {
                 ContextMethodId.data_inputs => try self.computeDataInputs(),
-                else => return error.UnsupportedExpression,
+                else => return self.handleUnsupported(),
             }
         } else {
-            // Unsupported type
-            return error.UnsupportedExpression;
+            // Unsupported type - use soft-fork aware handling
+            return self.handleUnsupported();
         }
     }
 
@@ -3872,6 +3881,30 @@ pub const Evaluator = struct {
         assert(cost <= 100_000); // Max single op cost sanity check
 
         try self.addCost(cost);
+    }
+
+    /// Handle unsupported expression in soft-fork aware manner.
+    /// If ergoTreeVersion > activatedVersion (soft-fork mode), returns
+    /// SoftForkAccepted which signals "script passes". Otherwise returns
+    /// UnsupportedExpression error.
+    ///
+    /// This implements Ergo protocol's soft-fork rule: old nodes must accept
+    /// blocks with scripts using future opcodes/methods they don't understand.
+    ///
+    /// Reference: sigmastate-interpreter Interpreter.scala trySoftForkable()
+    fn handleUnsupported(self: *const Evaluator) EvalError {
+        // PRECONDITION: We've encountered something we don't support
+        // PRECONDITION: Version context is valid
+        assert(self.version_ctx.activated_version <= VersionContext.MAX_SUPPORTED_VERSION);
+
+        if (self.version_ctx.allowsSoftForkPlaceholder()) {
+            // Soft-fork mode: script version is newer than activated version.
+            // Return SoftForkAccepted to signal "script passes".
+            return error.SoftForkAccepted;
+        } else {
+            // Normal mode: we should understand everything, this is an error.
+            return error.UnsupportedExpression;
+        }
     }
 
     /// Get child count for a node (used by iterative findSubtreeEnd)
@@ -5574,4 +5607,65 @@ test "evaluator: StateSnapshot captures evaluator state" {
     try std.testing.expect(snap_after.cost_used > 0); // Cost was consumed
     try std.testing.expect(snap_after.cost_remaining < snap_before.cost_remaining);
     try std.testing.expect(snap_after.verifyChecksum());
+}
+
+test "evaluator: soft-fork unsupported opcode returns true" {
+    // Test soft-fork rule: when ergoTreeVersion > activatedVersion,
+    // unknown opcodes should cause script to pass (return true).
+    //
+    // Reference: Interpreter.scala trySoftForkable, WhenSoftForkReductionResult
+
+    var tree = ExprTree.init();
+    // .unsupported tag represents an unknown opcode from deserialization
+    tree.nodes[0] = .{ .tag = .unsupported, .data = 0xFF };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    // Set up soft-fork condition: ergoTreeVersion (3) > activatedVersion (2)
+    eval.version_ctx = VersionContext{
+        .activated_version = 2, // Protocol v2
+        .ergo_tree_version = 3, // Script uses v3 features
+    };
+
+    // ASSERTION: allowsSoftForkPlaceholder returns true in this setup
+    try std.testing.expect(eval.version_ctx.allowsSoftForkPlaceholder());
+
+    // Evaluate - should return true (not error)
+    const result = try eval.evaluate();
+
+    // ASSERTION: Script passes with boolean true
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+test "evaluator: non-soft-fork unsupported opcode errors" {
+    // Test that when NOT in soft-fork mode, unknown opcodes error.
+    // This is the normal case: ergoTreeVersion <= activatedVersion.
+
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .unsupported, .data = 0xFF };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    // Normal mode: ergoTreeVersion (2) <= activatedVersion (2)
+    eval.version_ctx = VersionContext{
+        .activated_version = 2,
+        .ergo_tree_version = 2,
+    };
+
+    // ASSERTION: NOT in soft-fork mode
+    try std.testing.expect(!eval.version_ctx.allowsSoftForkPlaceholder());
+
+    // Evaluate - should error with UnsupportedExpression
+    const result = eval.evaluate();
+    try std.testing.expectError(error.UnsupportedExpression, result);
 }
