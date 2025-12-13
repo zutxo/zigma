@@ -119,6 +119,15 @@ comptime {
 /// Maximum tuple elements for inline storage
 pub const max_tuple_elements: usize = 10;
 
+/// Maximum function domain types (v6+)
+pub const max_func_domain: usize = 8;
+
+/// Maximum type params in function type (v6+)
+pub const max_func_tpe_params: usize = 4;
+
+/// Maximum type variable name length (v6+)
+pub const max_type_var_name: usize = 16;
+
 /// Tuple with N elements (5-10), inline storage for SType.tuple
 pub const TupleN = struct {
     elements: [max_tuple_elements]TypeIndex,
@@ -138,6 +147,54 @@ pub const TupleN = struct {
 
     pub fn slice(self: *const TupleN) []const TypeIndex {
         return self.elements[0..self.len];
+    }
+};
+
+/// Function type with inline storage for domain types (v6+)
+pub const FuncType = struct {
+    domain: [max_func_domain]TypeIndex,
+    domain_len: u8,
+    range: TypeIndex,
+    /// Type parameters (indices to type_var entries in pool)
+    tpe_params: [max_func_tpe_params]TypeIndex,
+    tpe_params_len: u8,
+
+    // Compile-time assertions (ZIGMA_STYLE)
+    comptime {
+        assert(max_func_domain >= 1);
+        assert(max_func_domain <= 255);
+        assert(max_func_tpe_params <= 255);
+        assert(@sizeOf(FuncType) <= 48); // Reasonable size
+    }
+
+    pub fn domainSlice(self: *const FuncType) []const TypeIndex {
+        return self.domain[0..self.domain_len];
+    }
+
+    pub fn tpeParamsSlice(self: *const FuncType) []const TypeIndex {
+        return self.tpe_params[0..self.tpe_params_len];
+    }
+};
+
+/// Type variable with inline name storage (v6+)
+pub const TypeVarType = struct {
+    name: [max_type_var_name]u8,
+    name_len: u8,
+
+    // Compile-time assertions (ZIGMA_STYLE)
+    comptime {
+        assert(max_type_var_name >= 1);
+        assert(max_type_var_name <= 255);
+        assert(@sizeOf(TypeVarType) <= 24);
+    }
+
+    pub fn nameSlice(self: *const TypeVarType) []const u8 {
+        return self.name[0..self.name_len];
+    }
+
+    pub fn eql(self: *const TypeVarType, other: *const TypeVarType) bool {
+        if (self.name_len != other.name_len) return false;
+        return std.mem.eql(u8, self.nameSlice(), other.nameSlice());
     }
 };
 
@@ -166,11 +223,11 @@ pub const SType = union(enum) {
     /// Tuple with 5+ elements (inline storage, max 10)
     tuple: TupleN,
 
-    // Function type (v6+)
-    func: struct {
-        domain: []const TypeIndex,
-        range: TypeIndex,
-    },
+    /// Function type (v6+)
+    func: FuncType,
+
+    /// Type variable (v6+, used in polymorphic functions)
+    type_var: TypeVarType,
 
     // Object types (non-embeddable)
     any,
@@ -202,8 +259,8 @@ pub const SType = union(enum) {
             .header => ObjectCode.header,
             .pre_header => ObjectCode.pre_header,
             .global => ObjectCode.global,
-            // Composite types need context from TypePool to determine code
-            .coll, .option, .pair, .triple, .quadruple, .tuple, .func => 0,
+            // Composite types and type_var need special serialization (not just type code)
+            .coll, .option, .pair, .triple, .quadruple, .tuple, .func, .type_var => 0,
         };
     }
 
@@ -523,6 +580,7 @@ pub const TypePool = struct {
             .quadruple => return TypeConstrCode.quadruple,
             .tuple => return TypeConstrCode.tuple5plus,
             .func => return ObjectCode.func,
+            .type_var => return ObjectCode.type_var,
             else => unreachable,
         }
     }
@@ -571,6 +629,8 @@ pub const TypeCodeInfo = union(enum) {
     tuple5plus,
     /// Function type (v6+)
     func,
+    /// Type variable (v6+)
+    type_var,
 
     pub fn parse(code: TypeCode) TypeCodeInfo {
         // Primitives (1-9)
@@ -578,7 +638,10 @@ pub const TypeCodeInfo = union(enum) {
             return .{ .primitive = primitiveFromCode(code) };
         }
 
-        // Object types (97-106)
+        // Type variable (103) - v6+
+        if (code == ObjectCode.type_var) return .type_var;
+
+        // Object types (97-106, excluding type_var)
         if (code >= ObjectCode.any and code <= ObjectCode.global) {
             return .{ .object = objectFromCode(code) };
         }

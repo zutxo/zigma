@@ -42,6 +42,12 @@ pub const DeserializeError = error{
     NestingTooDeep,
     /// Tuple has invalid length
     InvalidTupleLength,
+    /// Function domain too long (v6+)
+    FuncDomainTooLong,
+    /// Function has too many type params (v6+)
+    FuncTpeParamsTooLong,
+    /// Type variable name too long (v6+)
+    TypeVarNameTooLong,
 };
 
 /// Deserialize a type from bytes into the TypePool.
@@ -181,9 +187,71 @@ fn deserializeWithDepth(
         },
 
         // Function type (v6+)
-        .func => {
-            // TODO: Implement function type parsing for v6+
-            return error.InvalidTypeCode;
+        .func => blk: {
+            // Read domain length
+            const domain_len = reader.readByte() catch |err| switch (err) {
+                error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
+                error.Overflow => return error.Overflow,
+            };
+            if (domain_len > types.max_func_domain) return error.FuncDomainTooLong;
+
+            // Read domain types
+            var func_type = types.FuncType{
+                .domain = undefined,
+                .domain_len = domain_len,
+                .range = undefined,
+                .tpe_params = undefined,
+                .tpe_params_len = 0,
+            };
+            var i: u8 = 0;
+            while (i < domain_len) : (i += 1) {
+                func_type.domain[i] = try deserializeWithDepth(pool, reader, depth + 1);
+            }
+
+            // Read range type
+            func_type.range = try deserializeWithDepth(pool, reader, depth + 1);
+
+            // Read type params length
+            const tpe_params_len = reader.readByte() catch |err| switch (err) {
+                error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
+                error.Overflow => return error.Overflow,
+            };
+            if (tpe_params_len > types.max_func_tpe_params) return error.FuncTpeParamsTooLong;
+            func_type.tpe_params_len = tpe_params_len;
+
+            // Read type params (each is a type_var)
+            i = 0;
+            while (i < tpe_params_len) : (i += 1) {
+                func_type.tpe_params[i] = try deserializeWithDepth(pool, reader, depth + 1);
+            }
+
+            break :blk pool.add(.{ .func = func_type }) catch return error.PoolFull;
+        },
+
+        // Type variable (v6+)
+        .type_var => blk: {
+            // Read name length
+            const name_len = reader.readByte() catch |err| switch (err) {
+                error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
+                error.Overflow => return error.Overflow,
+            };
+            if (name_len > types.max_type_var_name) return error.TypeVarNameTooLong;
+            if (name_len == 0) return error.InvalidTypeCode; // Name cannot be empty
+
+            // Read name bytes
+            var type_var = types.TypeVarType{
+                .name = undefined,
+                .name_len = name_len,
+            };
+            var j: u8 = 0;
+            while (j < name_len) : (j += 1) {
+                type_var.name[j] = reader.readByte() catch |err| switch (err) {
+                    error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
+                    error.Overflow => return error.Overflow,
+                };
+            }
+
+            break :blk pool.add(.{ .type_var = type_var }) catch return error.PoolFull;
         },
     };
 }
@@ -353,9 +421,40 @@ fn serializeWithDepth(
             }
             return written;
         },
-        .func => |_| {
-            // TODO: Implement function type serialization for v6+
-            return error.BufferTooSmall;
+        .func => |f| {
+            // Function type: code + domain_len + domains + range + tpe_params_len + tpe_params
+            if (buf.len < 3) return error.BufferTooSmall;
+            buf[0] = types.ObjectCode.func;
+            buf[1] = f.domain_len;
+            var written: usize = 2;
+
+            // Serialize domain types
+            for (f.domainSlice()) |domain_idx| {
+                written += try serializeWithDepth(pool, domain_idx, buf[written..], depth + 1);
+            }
+
+            // Serialize range type
+            written += try serializeWithDepth(pool, f.range, buf[written..], depth + 1);
+
+            // Serialize type params
+            if (buf.len <= written) return error.BufferTooSmall;
+            buf[written] = f.tpe_params_len;
+            written += 1;
+
+            for (f.tpeParamsSlice()) |tpe_idx| {
+                written += try serializeWithDepth(pool, tpe_idx, buf[written..], depth + 1);
+            }
+
+            return written;
+        },
+        .type_var => |tv| {
+            // Type variable: code + name_len + name_bytes
+            const needed = 2 + tv.name_len;
+            if (buf.len < needed) return error.BufferTooSmall;
+            buf[0] = types.ObjectCode.type_var;
+            buf[1] = tv.name_len;
+            @memcpy(buf[2 .. 2 + tv.name_len], tv.nameSlice());
+            return needed;
         },
         else => unreachable, // All composite types handled
     }
@@ -728,4 +827,168 @@ test "type_serializer: spec vectors - all object bytes" {
         const result = try deserialize(&pool, &reader);
         try std.testing.expectEqual(tc.expected, result);
     }
+}
+
+// ============================================================================
+// v6+ Function Type Tests
+// ============================================================================
+
+test "type_serializer: deserialize type_var" {
+    var pool = TypePool.init();
+
+    // TypeVar "T" = 0x67 (103) + 0x01 (len) + 'T'
+    var r1 = vlq.Reader.init(&[_]u8{ 0x67, 0x01, 'T' });
+    const tv_idx = try deserialize(&pool, &r1);
+    const tv_type = pool.get(tv_idx);
+    try std.testing.expect(tv_type == .type_var);
+    try std.testing.expectEqual(@as(u8, 1), tv_type.type_var.name_len);
+    try std.testing.expectEqualSlices(u8, "T", tv_type.type_var.nameSlice());
+}
+
+test "type_serializer: roundtrip type_var" {
+    var pool = TypePool.init();
+    var buf: [32]u8 = undefined;
+
+    // Create a type_var "IV"
+    var tv = types.TypeVarType{
+        .name = undefined,
+        .name_len = 2,
+    };
+    tv.name[0] = 'I';
+    tv.name[1] = 'V';
+    const tv_idx = try pool.add(.{ .type_var = tv });
+
+    // Serialize
+    const len = try serialize(&pool, tv_idx, &buf);
+    try std.testing.expectEqual(@as(usize, 4), len); // code + len + "IV"
+    try std.testing.expectEqual(@as(u8, 0x67), buf[0]); // type_var code
+    try std.testing.expectEqual(@as(u8, 2), buf[1]); // name length
+    try std.testing.expectEqualSlices(u8, "IV", buf[2..4]);
+
+    // Deserialize and verify
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result_idx = try deserialize(&pool, &reader);
+    const result_type = pool.get(result_idx);
+    try std.testing.expect(result_type == .type_var);
+    try std.testing.expectEqualSlices(u8, "IV", result_type.type_var.nameSlice());
+}
+
+test "type_serializer: deserialize func (Int => Long)" {
+    var pool = TypePool.init();
+
+    // SFunc(Int => Long) = 0x70 (112) + 0x01 (domain len) + 0x04 (Int) + 0x05 (Long) + 0x00 (no tpe params)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x70, 0x01, 0x04, 0x05, 0x00 });
+    const func_idx = try deserialize(&pool, &r1);
+    const func_type = pool.get(func_idx);
+    try std.testing.expect(func_type == .func);
+    try std.testing.expectEqual(@as(u8, 1), func_type.func.domain_len);
+    try std.testing.expectEqual(TypePool.INT, func_type.func.domain[0]);
+    try std.testing.expectEqual(TypePool.LONG, func_type.func.range);
+    try std.testing.expectEqual(@as(u8, 0), func_type.func.tpe_params_len);
+}
+
+test "type_serializer: roundtrip func ((Int, Long) => Boolean)" {
+    var pool = TypePool.init();
+    var buf: [32]u8 = undefined;
+
+    // Create SFunc((Int, Long) => Boolean)
+    var func_type = types.FuncType{
+        .domain = undefined,
+        .domain_len = 2,
+        .range = TypePool.BOOLEAN,
+        .tpe_params = undefined,
+        .tpe_params_len = 0,
+    };
+    func_type.domain[0] = TypePool.INT;
+    func_type.domain[1] = TypePool.LONG;
+    const func_idx = try pool.add(.{ .func = func_type });
+
+    // Serialize
+    const len = try serialize(&pool, func_idx, &buf);
+    try std.testing.expectEqual(@as(usize, 6), len); // code + dom_len + Int + Long + Boolean + tpe_len
+    try std.testing.expectEqual(@as(u8, 0x70), buf[0]); // func code (112)
+    try std.testing.expectEqual(@as(u8, 2), buf[1]); // domain length
+    try std.testing.expectEqual(@as(u8, 0x04), buf[2]); // Int
+    try std.testing.expectEqual(@as(u8, 0x05), buf[3]); // Long
+    try std.testing.expectEqual(@as(u8, 0x01), buf[4]); // Boolean (range)
+    try std.testing.expectEqual(@as(u8, 0x00), buf[5]); // no type params
+
+    // Deserialize and verify
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result_idx = try deserialize(&pool, &reader);
+    const result_type = pool.get(result_idx);
+    try std.testing.expect(result_type == .func);
+    try std.testing.expectEqual(@as(u8, 2), result_type.func.domain_len);
+    try std.testing.expectEqual(TypePool.INT, result_type.func.domain[0]);
+    try std.testing.expectEqual(TypePool.LONG, result_type.func.domain[1]);
+    try std.testing.expectEqual(TypePool.BOOLEAN, result_type.func.range);
+}
+
+test "type_serializer: roundtrip func with type params" {
+    var pool = TypePool.init();
+    var buf: [64]u8 = undefined;
+
+    // Create type var "T"
+    var tv = types.TypeVarType{
+        .name = undefined,
+        .name_len = 1,
+    };
+    tv.name[0] = 'T';
+    const tv_idx = try pool.add(.{ .type_var = tv });
+
+    // Create SFunc(T => Coll[T]) with type param T
+    // For simplicity, use Int for domain/range in this test
+    var func_type = types.FuncType{
+        .domain = undefined,
+        .domain_len = 1,
+        .range = TypePool.COLL_INT,
+        .tpe_params = undefined,
+        .tpe_params_len = 1,
+    };
+    func_type.domain[0] = TypePool.INT;
+    func_type.tpe_params[0] = tv_idx;
+    const func_idx = try pool.add(.{ .func = func_type });
+
+    // Serialize
+    const len = try serialize(&pool, func_idx, &buf);
+    // code(1) + dom_len(1) + Int(1) + Coll[Int](1) + tpe_len(1) + TypeVar(3) = 8 bytes
+    try std.testing.expectEqual(@as(usize, 8), len);
+
+    // Deserialize and verify
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result_idx = try deserialize(&pool, &reader);
+    const result_type = pool.get(result_idx);
+    try std.testing.expect(result_type == .func);
+    try std.testing.expectEqual(@as(u8, 1), result_type.func.domain_len);
+    try std.testing.expectEqual(@as(u8, 1), result_type.func.tpe_params_len);
+
+    // Verify the type param is a type_var
+    const tpe_param_idx = result_type.func.tpe_params[0];
+    const tpe_param = pool.get(tpe_param_idx);
+    try std.testing.expect(tpe_param == .type_var);
+    try std.testing.expectEqualSlices(u8, "T", tpe_param.type_var.nameSlice());
+}
+
+test "type_serializer: func domain too long" {
+    var pool = TypePool.init();
+
+    // Domain length 9 (exceeds max 8)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x70, 0x09 });
+    try std.testing.expectError(error.FuncDomainTooLong, deserialize(&pool, &r1));
+}
+
+test "type_serializer: type_var name too long" {
+    var pool = TypePool.init();
+
+    // Name length 17 (exceeds max 16)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x67, 0x11 });
+    try std.testing.expectError(error.TypeVarNameTooLong, deserialize(&pool, &r1));
+}
+
+test "type_serializer: type_var empty name" {
+    var pool = TypePool.init();
+
+    // Name length 0 (invalid)
+    var r1 = vlq.Reader.init(&[_]u8{ 0x67, 0x00 });
+    try std.testing.expectError(error.InvalidTypeCode, deserialize(&pool, &r1));
 }
