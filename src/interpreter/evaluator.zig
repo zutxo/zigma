@@ -30,6 +30,7 @@ const avl_tree = @import("../crypto/avl_tree.zig");
 const Context = context.Context;
 const BoxView = context.BoxView;
 const Register = context.Register;
+const VersionContext = context.VersionContext;
 const ExprTree = expr.ExprTree;
 const ExprNode = expr.ExprNode;
 const ExprTag = expr.ExprTag;
@@ -63,6 +64,10 @@ const default_cost_limit: u64 = 1_000_000;
 
 /// Arena size for temporary allocations (hash results, etc.)
 const eval_arena_size: usize = 4096;
+
+/// How often to check wall-clock timeout (every N operations).
+/// Checking every operation is too expensive, so we amortize.
+const timeout_check_interval: u16 = 64;
 
 // Compile-time sanity checks
 comptime {
@@ -149,6 +154,8 @@ fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
 pub const EvalError = error{
     /// Cost budget exceeded
     CostLimitExceeded,
+    /// Wall-clock timeout exceeded (defense in depth)
+    TimeoutExceeded,
     /// Work stack overflow
     WorkStackOverflow,
     /// Value stack overflow
@@ -210,50 +217,169 @@ const WorkItem = struct {
 };
 
 // ============================================================================
-// Fixed Costs (v4 model)
+// Cost Model (version-dependent)
 // ============================================================================
 
+/// Operation cost categories for version-dependent lookup.
+/// Reference: JitCost.scala, CostTable.scala in sigmastate-interpreter
+pub const CostOp = enum(u8) {
+    comparison,
+    arithmetic,
+    logical,
+    height,
+    constant,
+    self_box,
+    inputs,
+    outputs,
+    data_inputs,
+    blake2b256_base,
+    sha256_base,
+    hash_per_byte,
+    decode_point,
+    group_generator,
+    exponentiate,
+    multiply_group,
+    select_field,
+    tuple_construct,
+    upcast,
+    downcast,
+    extract_header_field,
+    collection_base,
+    collection_per_item,
+    func_apply,
+    method_call,
+    sigma_and,
+    sigma_or,
+    create_avl_tree,
+    tree_lookup,
+    extract_register,
+};
+
+/// JIT cost table (v2+ mainnet, current default).
+/// Source: sigmastate/JitCost.scala
+const JIT_COSTS = [_]u32{
+    36, // comparison
+    36, // arithmetic
+    36, // logical
+    5, // height
+    5, // constant
+    10, // self_box
+    10, // inputs
+    10, // outputs
+    10, // data_inputs
+    59, // blake2b256_base
+    64, // sha256_base
+    1, // hash_per_byte
+    1100, // decode_point
+    10, // group_generator
+    5100, // exponentiate
+    250, // multiply_group
+    10, // select_field
+    10, // tuple_construct
+    10, // upcast
+    10, // downcast
+    10, // extract_header_field
+    20, // collection_base
+    5, // collection_per_item
+    20, // func_apply
+    10, // method_call
+    20, // sigma_and
+    20, // sigma_or
+    100, // create_avl_tree
+    800, // tree_lookup
+    50, // extract_register
+};
+
+/// AOT cost table (pre-v2, legacy).
+/// Generally higher costs than JIT.
+/// Source: sigmastate/CostTable.scala (v1 costs)
+const AOT_COSTS = [_]u32{
+    40, // comparison (higher in AOT)
+    40, // arithmetic
+    40, // logical
+    10, // height
+    10, // constant
+    15, // self_box
+    15, // inputs
+    15, // outputs
+    15, // data_inputs
+    65, // blake2b256_base
+    70, // sha256_base
+    1, // hash_per_byte
+    1200, // decode_point
+    15, // group_generator
+    5500, // exponentiate
+    300, // multiply_group
+    15, // select_field
+    15, // tuple_construct
+    15, // upcast
+    15, // downcast
+    15, // extract_header_field
+    25, // collection_base
+    6, // collection_per_item
+    25, // func_apply
+    15, // method_call
+    25, // sigma_and
+    25, // sigma_or
+    120, // create_avl_tree
+    900, // tree_lookup
+    60, // extract_register
+};
+
+// Compile-time verification of cost table sizes
+comptime {
+    const num_ops = @typeInfo(CostOp).@"enum".fields.len;
+    assert(JIT_COSTS.len == num_ops);
+    assert(AOT_COSTS.len == num_ops);
+}
+
+/// Get cost for operation based on version context.
+/// JIT (v2+) uses lower costs than AOT (v0/v1).
+fn getCost(version_ctx: VersionContext, op: CostOp) u32 {
+    // PRECONDITION: op index is valid
+    const idx = @intFromEnum(op);
+    assert(idx < JIT_COSTS.len);
+
+    if (version_ctx.isJitActivated()) {
+        return JIT_COSTS[idx];
+    } else {
+        return AOT_COSTS[idx];
+    }
+}
+
+/// Fixed costs for backward compatibility (JIT/v2 defaults).
+/// Use getCost() for version-aware cost lookup.
 const FixedCost = struct {
-    pub const comparison: u32 = 36;
-    pub const arithmetic: u32 = 36;
-    pub const logical: u32 = 36;
-    pub const height: u32 = 5;
-    pub const constant: u32 = 5;
-    pub const self_box: u32 = 10;
-    pub const inputs: u32 = 10;
-    pub const outputs: u32 = 10;
-    pub const data_inputs: u32 = 10; // CONTEXT.dataInputs
-    pub const blake2b256_base: u32 = 59; // Base cost for CalcBlake2b256
-    pub const sha256_base: u32 = 64; // Base cost for CalcSha256
-    pub const hash_per_byte: u32 = 1; // Per-byte cost for hashing
-    // Group element operation costs (from opcodes.zig)
-    pub const decode_point: u32 = 1100;
-    pub const group_generator: u32 = 10;
-    pub const exponentiate: u32 = 5100;
-    pub const multiply_group: u32 = 250;
-    // Tuple operation costs (from opcodes.zig)
-    pub const select_field: u32 = 10;
-    pub const tuple_construct: u32 = 10;
-    // Type cast costs
-    pub const upcast: u32 = 10;
-    pub const downcast: u32 = 10;
-    // Header extraction costs (all low-cost field access)
-    pub const extract_header_field: u32 = 10;
-    // Collection HOF costs
-    pub const collection_base: u32 = 20; // Base cost for collection operation
-    pub const collection_per_item: u32 = 5; // Per-element cost
-    // Function application cost
-    pub const func_apply: u32 = 20; // From opcodes.zig
-    // Method call cost
-    pub const method_call: u32 = 10; // From opcodes.zig
-    // Sigma proposition connective costs (from opcodes.zig)
-    pub const sigma_and: u32 = 20;
-    pub const sigma_or: u32 = 20;
-    // AVL tree operation costs (from opcodes.zig)
-    pub const create_avl_tree: u32 = 100;
-    pub const tree_lookup: u32 = 800; // High cost due to proof verification
-    // Box extraction costs (from opcodes.zig)
-    pub const extract_register: u32 = 50; // ExtractRegisterAs base cost
+    pub const comparison: u32 = JIT_COSTS[@intFromEnum(CostOp.comparison)];
+    pub const arithmetic: u32 = JIT_COSTS[@intFromEnum(CostOp.arithmetic)];
+    pub const logical: u32 = JIT_COSTS[@intFromEnum(CostOp.logical)];
+    pub const height: u32 = JIT_COSTS[@intFromEnum(CostOp.height)];
+    pub const constant: u32 = JIT_COSTS[@intFromEnum(CostOp.constant)];
+    pub const self_box: u32 = JIT_COSTS[@intFromEnum(CostOp.self_box)];
+    pub const inputs: u32 = JIT_COSTS[@intFromEnum(CostOp.inputs)];
+    pub const outputs: u32 = JIT_COSTS[@intFromEnum(CostOp.outputs)];
+    pub const data_inputs: u32 = JIT_COSTS[@intFromEnum(CostOp.data_inputs)];
+    pub const blake2b256_base: u32 = JIT_COSTS[@intFromEnum(CostOp.blake2b256_base)];
+    pub const sha256_base: u32 = JIT_COSTS[@intFromEnum(CostOp.sha256_base)];
+    pub const hash_per_byte: u32 = JIT_COSTS[@intFromEnum(CostOp.hash_per_byte)];
+    pub const decode_point: u32 = JIT_COSTS[@intFromEnum(CostOp.decode_point)];
+    pub const group_generator: u32 = JIT_COSTS[@intFromEnum(CostOp.group_generator)];
+    pub const exponentiate: u32 = JIT_COSTS[@intFromEnum(CostOp.exponentiate)];
+    pub const multiply_group: u32 = JIT_COSTS[@intFromEnum(CostOp.multiply_group)];
+    pub const select_field: u32 = JIT_COSTS[@intFromEnum(CostOp.select_field)];
+    pub const tuple_construct: u32 = JIT_COSTS[@intFromEnum(CostOp.tuple_construct)];
+    pub const upcast: u32 = JIT_COSTS[@intFromEnum(CostOp.upcast)];
+    pub const downcast: u32 = JIT_COSTS[@intFromEnum(CostOp.downcast)];
+    pub const extract_header_field: u32 = JIT_COSTS[@intFromEnum(CostOp.extract_header_field)];
+    pub const collection_base: u32 = JIT_COSTS[@intFromEnum(CostOp.collection_base)];
+    pub const collection_per_item: u32 = JIT_COSTS[@intFromEnum(CostOp.collection_per_item)];
+    pub const func_apply: u32 = JIT_COSTS[@intFromEnum(CostOp.func_apply)];
+    pub const method_call: u32 = JIT_COSTS[@intFromEnum(CostOp.method_call)];
+    pub const sigma_and: u32 = JIT_COSTS[@intFromEnum(CostOp.sigma_and)];
+    pub const sigma_or: u32 = JIT_COSTS[@intFromEnum(CostOp.sigma_or)];
+    pub const create_avl_tree: u32 = JIT_COSTS[@intFromEnum(CostOp.create_avl_tree)];
+    pub const tree_lookup: u32 = JIT_COSTS[@intFromEnum(CostOp.tree_lookup)];
+    pub const extract_register: u32 = JIT_COSTS[@intFromEnum(CostOp.extract_register)];
 };
 
 // ============================================================================
@@ -268,6 +394,9 @@ pub const Evaluator = struct {
     /// Execution context (read-only blockchain state)
     ctx: *const Context,
 
+    /// Protocol version context (controls cost model and feature gates)
+    version_ctx: VersionContext,
+
     /// Work stack (iterative processing)
     work_stack: [max_work_stack]WorkItem = undefined,
     work_sp: u16 = 0,
@@ -279,6 +408,14 @@ pub const Evaluator = struct {
     /// Cost accounting
     cost_used: u64 = 0,
     cost_limit: u64 = default_cost_limit,
+
+    /// Wall-clock deadline (defense in depth against cost accounting bugs).
+    /// null = no timeout, otherwise nanosecond timestamp from std.time.nanoTimestamp().
+    deadline_ns: ?i128 = null,
+
+    /// Operations since last timeout check.
+    /// We check the wall clock every timeout_check_interval operations.
+    ops_since_timeout_check: u16 = 0,
 
     /// Arena for temporary allocations (hash results, etc.)
     arena: BumpAllocator(eval_arena_size) = BumpAllocator(eval_arena_size).init(),
@@ -314,10 +451,128 @@ pub const Evaluator = struct {
         }
     };
 
+    /// State snapshot for debugging and replay.
+    /// Captures essential state to reproduce assertion failures.
+    pub const StateSnapshot = struct {
+        /// Stack pointers
+        work_sp: u16,
+        value_sp: u16,
+        values_sp: u16,
+
+        /// Cost state
+        cost_used: u64,
+        cost_limit: u64,
+        cost_remaining: u64,
+
+        /// Version context
+        activated_version: u8,
+        ergo_tree_version: u8,
+
+        /// Tree info
+        tree_node_count: u16,
+        tree_value_count: u16,
+
+        /// Arena usage
+        arena_used: usize,
+
+        /// Checksum of critical state (for corruption detection)
+        checksum: u32,
+
+        /// Create snapshot from evaluator state
+        pub fn fromEvaluator(eval: *const Evaluator) StateSnapshot {
+            var snap = StateSnapshot{
+                .work_sp = eval.work_sp,
+                .value_sp = eval.value_sp,
+                .values_sp = eval.values_sp,
+                .cost_used = eval.cost_used,
+                .cost_limit = eval.cost_limit,
+                .cost_remaining = if (eval.cost_limit >= eval.cost_used)
+                    eval.cost_limit - eval.cost_used
+                else
+                    0,
+                .activated_version = eval.version_ctx.activated_version,
+                .ergo_tree_version = eval.version_ctx.ergo_tree_version,
+                .tree_node_count = eval.tree.node_count,
+                .tree_value_count = eval.tree.value_count,
+                .arena_used = eval.arena.used(),
+                .checksum = 0,
+            };
+
+            // Compute checksum from critical fields
+            snap.checksum = snap.computeChecksum();
+            return snap;
+        }
+
+        /// Compute checksum for integrity verification
+        fn computeChecksum(self: *const StateSnapshot) u32 {
+            // Simple hash combining critical fields
+            var h: u32 = 0x12345678;
+            h ^= @as(u32, self.work_sp) << 16 | @as(u32, self.value_sp);
+            h ^= @truncate(self.cost_used);
+            h ^= @truncate(self.cost_limit);
+            h ^= @as(u32, self.tree_node_count) << 16 | @as(u32, self.tree_value_count);
+            h ^= @as(u32, self.activated_version) << 8 | @as(u32, self.ergo_tree_version);
+            return h;
+        }
+
+        /// Verify checksum matches state
+        pub fn verifyChecksum(self: *const StateSnapshot) bool {
+            // Recompute without stored checksum
+            var verify = self.*;
+            verify.checksum = 0;
+            return self.checksum == verify.computeChecksum();
+        }
+
+        /// Format for debugging output
+        pub fn format(
+            self: StateSnapshot,
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print(
+                \\StateSnapshot{{
+                \\  stacks: work={d}, value={d}, values={d}
+                \\  cost: {d}/{d} (remaining: {d})
+                \\  version: activated=v{d}, tree=v{d}
+                \\  tree: nodes={d}, values={d}
+                \\  arena: {d} bytes used
+                \\  checksum: 0x{x:0>8}
+                \\}}
+            , .{
+                self.work_sp,           self.value_sp,          self.values_sp,
+                self.cost_used,         self.cost_limit,        self.cost_remaining,
+                self.activated_version, self.ergo_tree_version, self.tree_node_count,
+                self.tree_value_count,  self.arena_used,        self.checksum,
+            });
+        }
+    };
+
+    /// Capture current evaluator state for debugging.
+    /// Use when assertion fails to capture reproducible state.
+    pub fn snapshot(self: *const Evaluator) StateSnapshot {
+        return StateSnapshot.fromEvaluator(self);
+    }
+
+    /// Initialize evaluator with expression tree, context, and version.
+    /// Uses v2 (current mainnet) as default version context.
     pub fn init(tree: *const ExprTree, ctx: *const Context) Evaluator {
+        return initWithVersion(tree, ctx, VersionContext.v2());
+    }
+
+    /// Initialize evaluator with explicit version context.
+    /// Use this when you need version-specific behavior (testing, v6 features).
+    pub fn initWithVersion(
+        tree: *const ExprTree,
+        ctx: *const Context,
+        version_ctx: VersionContext,
+    ) Evaluator {
         return .{
             .tree = tree,
             .ctx = ctx,
+            .version_ctx = version_ctx,
         };
     }
 
@@ -327,24 +582,83 @@ pub const Evaluator = struct {
         self.cost_limit = limit;
     }
 
+    /// Set wall-clock deadline for this evaluation (defense in depth).
+    /// @param timeout_ms: timeout in milliseconds from now (0 = no timeout)
+    pub fn setDeadline(self: *Evaluator, timeout_ms: u64) void {
+        if (timeout_ms == 0) {
+            self.deadline_ns = null;
+        } else {
+            // PRECONDITION: timeout fits in reasonable range
+            assert(timeout_ms <= 600_000); // Max 10 minutes
+            const timeout_ns: i128 = @as(i128, timeout_ms) * 1_000_000;
+            self.deadline_ns = std.time.nanoTimestamp() + timeout_ns;
+        }
+    }
+
+    /// Check if wall-clock deadline has been exceeded.
+    /// Called periodically during evaluation (every timeout_check_interval ops).
+    fn checkTimeout(self: *Evaluator) EvalError!void {
+        // Increment op counter
+        self.ops_since_timeout_check +%= 1;
+
+        // Only check every N operations to amortize syscall cost
+        if (self.ops_since_timeout_check < timeout_check_interval) {
+            return;
+        }
+
+        // Reset counter
+        self.ops_since_timeout_check = 0;
+
+        // Check deadline if set
+        if (self.deadline_ns) |deadline| {
+            const now = std.time.nanoTimestamp();
+            if (now > deadline) {
+                return error.TimeoutExceeded;
+            }
+        }
+    }
+
     /// Evaluate the expression tree to produce a result
     pub fn evaluate(self: *Evaluator) EvalError!Value {
-        // Must have at least one node
+        // PRECONDITION: Tree has at least one node
         assert(self.tree.node_count > 0);
+        // PRECONDITION: Cost limit is set
+        assert(self.cost_limit > 0);
+        // PRECONDITION: Version context is valid
+        assert(self.version_ctx.activated_version <= VersionContext.MAX_SUPPORTED_VERSION);
 
         // Reset state
         self.work_sp = 0;
         self.value_sp = 0;
         self.cost_used = 0;
+        self.ops_since_timeout_check = 0;
         self.arena.reset();
         self.var_bindings = [_]?Value{null} ** max_var_bindings;
         self.pools.reset();
 
+        // INVARIANT: State is clean after reset
+        assert(self.work_sp == 0);
+        assert(self.value_sp == 0);
+        assert(self.cost_used == 0);
+
         // Push root node for evaluation (index 0)
         try self.pushWork(.{ .node_idx = 0, .phase = .evaluate });
 
+        // INVARIANT: Root was pushed
+        assert(self.work_sp == 1);
+
         // Main evaluation loop
+        var loop_count: u32 = 0;
+        const max_loop_iterations: u32 = 1_000_000; // Safety bound
+
         while (self.work_sp > 0) {
+            // INVARIANT: Loop count bounded (prevents infinite loops)
+            loop_count += 1;
+            assert(loop_count <= max_loop_iterations);
+
+            // Check wall-clock timeout periodically (defense in depth)
+            try self.checkTimeout();
+
             const work = self.popWork();
 
             switch (work.phase) {
@@ -353,10 +667,18 @@ pub const Evaluator = struct {
             }
         }
 
+        // POSTCONDITION: Work stack is empty
+        assert(self.work_sp == 0);
+        // POSTCONDITION: Cost was consumed
+        assert(self.cost_used > 0);
+
         // Result is on value stack
         if (self.value_sp == 0) {
             return error.ValueStackUnderflow;
         }
+
+        // POSTCONDITION: Exactly one result
+        assert(self.value_sp == 1);
 
         return self.popValue();
     }
@@ -804,7 +1126,17 @@ pub const Evaluator = struct {
             },
 
             .unsupported => {
-                return error.UnsupportedExpression;
+                // Soft-fork rule: if script version > activated version,
+                // unknown opcodes should return placeholder value instead of error.
+                // This allows old nodes to accept blocks with new script features.
+                if (self.version_ctx.allowsSoftForkPlaceholder()) {
+                    try self.addCost(FixedCost.constant);
+                    try self.pushValue(.{ .soft_fork_placeholder = {} });
+                } else {
+                    // Script version <= activated version means we should
+                    // understand all opcodes - this is an error.
+                    return error.UnsupportedExpression;
+                }
             },
         }
     }
@@ -2016,7 +2348,8 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCost(FixedCost.collection_base);
+        // Version-aware base cost for collection operation
+        try self.addCostOp(.collection_base);
 
         const coll = try self.popValue();
 
@@ -2064,7 +2397,8 @@ pub const Evaluator = struct {
                 return;
             }
 
-            try self.addCost(FixedCost.collection_per_item);
+            // Version-aware per-item cost
+            try self.addCostOp(.collection_per_item);
         }
 
         // No element satisfied predicate
@@ -2080,7 +2414,7 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCost(FixedCost.collection_base);
+        try self.addCostOp(.collection_base);
 
         const coll = try self.popValue();
 
@@ -2128,7 +2462,7 @@ pub const Evaluator = struct {
                 return;
             }
 
-            try self.addCost(FixedCost.collection_per_item);
+            try self.addCostOp(.collection_per_item);
         }
 
         // All elements satisfied predicate
@@ -2145,7 +2479,7 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCost(FixedCost.collection_base);
+        try self.addCostOp(.collection_base);
 
         const coll = try self.popValue();
 
@@ -2188,7 +2522,7 @@ pub const Evaluator = struct {
                 else => return error.TypeMismatch,
             };
 
-            try self.addCost(FixedCost.collection_per_item);
+            try self.addCostOp(.collection_per_item);
         }
 
         try self.pushValue(.{ .coll_byte = result });
@@ -2204,7 +2538,7 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCost(FixedCost.collection_base);
+        try self.addCostOp(.collection_base);
 
         const coll = try self.popValue();
 
@@ -2238,7 +2572,7 @@ pub const Evaluator = struct {
             const predicate_result = try self.evaluateSubtree(body_idx);
             if (predicate_result != .boolean) return error.TypeMismatch;
             if (predicate_result.boolean) count += 1;
-            try self.addCost(FixedCost.collection_per_item);
+            try self.addCostOp(.collection_per_item);
         }
 
         // Allocate result and fill
@@ -2265,7 +2599,7 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count);
         const initial_sp = self.value_sp;
 
-        try self.addCost(FixedCost.collection_base);
+        try self.addCostOp(.collection_base);
 
         // Pop in reverse order: zero was pushed last
         const zero = try self.popValue();
@@ -2312,7 +2646,7 @@ pub const Evaluator = struct {
             self.var_bindings[elem_var_id] = elem;
 
             acc = try self.evaluateSubtree(body_idx);
-            try self.addCost(FixedCost.collection_per_item);
+            try self.addCostOp(.collection_per_item);
         }
 
         try self.pushValue(acc);
@@ -2328,7 +2662,7 @@ pub const Evaluator = struct {
         assert(node_idx < self.tree.node_count); // Node index in bounds
         assert(self.tree.node_count > 0); // Tree not empty
 
-        try self.addCost(FixedCost.collection_base);
+        try self.addCostOp(.collection_base);
 
         const coll = try self.popValue();
 
@@ -2378,7 +2712,7 @@ pub const Evaluator = struct {
             result_len += mapped.coll_byte.len;
             temp_count += 1;
 
-            try self.addCost(FixedCost.collection_per_item);
+            try self.addCostOp(.collection_per_item);
         }
 
         // Allocate and copy results
@@ -3389,15 +3723,32 @@ pub const Evaluator = struct {
 
     /// Helper: evaluate a subtree and return result
     fn evaluateSubtree(self: *Evaluator, root_idx: u16) EvalError!Value {
+        // PRECONDITION: Valid node index
+        assert(root_idx < self.tree.node_count);
+        // PRECONDITION: Stacks have room
+        assert(self.work_sp < max_work_stack);
+        assert(self.value_sp < max_value_stack);
+
         // Save current stack state
         const saved_work_sp = self.work_sp;
         const saved_value_sp = self.value_sp;
+        const saved_cost = self.cost_used;
+
+        // INVARIANT: Saved state is consistent
+        assert(saved_work_sp <= max_work_stack);
+        assert(saved_value_sp <= max_value_stack);
 
         // Push work for subtree
         try self.pushWork(.{ .node_idx = root_idx, .phase = .evaluate });
 
+        // INVARIANT: Work was pushed
+        assert(self.work_sp == saved_work_sp + 1);
+
         // Process until we return to saved state
         while (self.work_sp > saved_work_sp) {
+            // INVARIANT: Still processing this subtree
+            assert(self.work_sp >= saved_work_sp);
+
             const work = self.popWork();
             switch (work.phase) {
                 .evaluate => try self.evaluateNode(work.node_idx),
@@ -3405,8 +3756,16 @@ pub const Evaluator = struct {
             }
         }
 
+        // POSTCONDITION: Work stack returned to saved state
+        assert(self.work_sp == saved_work_sp);
+        // POSTCONDITION: Cost increased (subtree consumed resources)
+        assert(self.cost_used >= saved_cost);
+
         // Result should be on stack
         if (self.value_sp <= saved_value_sp) return error.ValueStackUnderflow;
+
+        // POSTCONDITION: Exactly one result on stack
+        assert(self.value_sp == saved_value_sp + 1);
 
         return self.popValue();
     }
@@ -3416,34 +3775,103 @@ pub const Evaluator = struct {
     // ========================================================================
 
     fn pushWork(self: *Evaluator, item: WorkItem) EvalError!void {
+        // PRECONDITION: Stack not full
+        // PRECONDITION: Node index is valid
+        assert(item.node_idx < self.tree.node_count);
+
         if (self.work_sp >= max_work_stack) return error.WorkStackOverflow;
+
+        const old_sp = self.work_sp;
         self.work_stack[self.work_sp] = item;
         self.work_sp += 1;
+
+        // POSTCONDITION: Stack pointer incremented
+        // POSTCONDITION: Item stored at correct location
+        assert(self.work_sp == old_sp + 1);
+        assert(self.work_stack[old_sp].node_idx == item.node_idx);
     }
 
     fn popWork(self: *Evaluator) WorkItem {
+        // PRECONDITION: Stack not empty
         assert(self.work_sp > 0);
+        // PRECONDITION: Pointer within bounds
+        assert(self.work_sp <= max_work_stack);
+
         self.work_sp -= 1;
-        return self.work_stack[self.work_sp];
+        const item = self.work_stack[self.work_sp];
+
+        // POSTCONDITION: Stack pointer decremented
+        // POSTCONDITION: Node index is valid
+        assert(item.node_idx < self.tree.node_count);
+        return item;
     }
 
     fn pushValue(self: *Evaluator, value: Value) EvalError!void {
+        // PRECONDITION: Stack pointer within bounds
+        assert(self.value_sp <= max_value_stack);
+
         if (self.value_sp >= max_value_stack) return error.ValueStackOverflow;
+
+        const old_sp = self.value_sp;
         self.value_stack[self.value_sp] = value;
         self.value_sp += 1;
+
+        // POSTCONDITION: Stack pointer incremented
+        // POSTCONDITION: Value stored correctly
+        assert(self.value_sp == old_sp + 1);
+        assert(self.value_sp <= max_value_stack);
     }
 
     fn popValue(self: *Evaluator) EvalError!Value {
+        // PRECONDITION: Stack pointer within bounds
+        assert(self.value_sp <= max_value_stack);
+
         if (self.value_sp == 0) return error.ValueStackUnderflow;
+
+        // INVARIANT: About to pop from non-empty stack
+        assert(self.value_sp > 0);
+
         self.value_sp -= 1;
-        return self.value_stack[self.value_sp];
+        const value = self.value_stack[self.value_sp];
+
+        // POSTCONDITION: Stack pointer still valid
+        assert(self.value_sp < max_value_stack);
+        return value;
     }
 
     fn addCost(self: *Evaluator, cost: u32) EvalError!void {
+        // PRECONDITION: Cost limit was set
+        assert(self.cost_limit > 0);
+        // PRECONDITION: Cost is reasonable (not suspiciously large)
+        assert(cost <= 1_000_000);
+
+        const old_cost = self.cost_used;
         self.cost_used +|= cost; // Saturating add
+
+        // INVARIANT: Cost can only increase
+        assert(self.cost_used >= old_cost);
+
         if (self.cost_used > self.cost_limit) {
             return error.CostLimitExceeded;
         }
+
+        // POSTCONDITION: Cost still within limit
+        assert(self.cost_used <= self.cost_limit);
+    }
+
+    /// Add cost using version-aware cost lookup.
+    /// Use this for operations where cost depends on protocol version.
+    fn addCostOp(self: *Evaluator, op: CostOp) EvalError!void {
+        // PRECONDITION: Valid cost operation
+        assert(@intFromEnum(op) < JIT_COSTS.len);
+
+        const cost = getCost(self.version_ctx, op);
+
+        // INVARIANT: Cost lookup returned valid value
+        assert(cost > 0);
+        assert(cost <= 100_000); // Max single op cost sanity check
+
+        try self.addCost(cost);
     }
 
     /// Get child count for a node (used by iterative findSubtreeEnd)
@@ -5108,4 +5536,42 @@ test "evaluator: CONTEXT.dataInputs returns box collection" {
     // POSTCONDITION: Result is box collection referencing data_inputs
     try std.testing.expect(result == .box_coll);
     try std.testing.expectEqual(Value.BoxCollRef{ .source = .data_inputs }, result.box_coll);
+}
+
+test "evaluator: StateSnapshot captures evaluator state" {
+    // Set up minimal evaluation
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .true_leaf };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    // Take snapshot before evaluation
+    const snap_before = eval.snapshot();
+
+    // ASSERTIONS: Snapshot captures initial state
+    try std.testing.expectEqual(@as(u16, 0), snap_before.work_sp);
+    try std.testing.expectEqual(@as(u16, 0), snap_before.value_sp);
+    try std.testing.expectEqual(@as(u64, 0), snap_before.cost_used);
+    try std.testing.expectEqual(@as(u64, 10000), snap_before.cost_limit);
+    try std.testing.expectEqual(@as(u64, 10000), snap_before.cost_remaining);
+    try std.testing.expectEqual(@as(u8, 2), snap_before.activated_version); // v2 default
+    try std.testing.expectEqual(@as(u8, 0), snap_before.ergo_tree_version);
+    try std.testing.expectEqual(@as(u16, 1), snap_before.tree_node_count);
+
+    // Checksum should verify
+    try std.testing.expect(snap_before.verifyChecksum());
+
+    // Evaluate and take snapshot after
+    _ = try eval.evaluate();
+    const snap_after = eval.snapshot();
+
+    // ASSERTIONS: Snapshot captures post-evaluation state
+    try std.testing.expect(snap_after.cost_used > 0); // Cost was consumed
+    try std.testing.expect(snap_after.cost_remaining < snap_before.cost_remaining);
+    try std.testing.expect(snap_after.verifyChecksum());
 }

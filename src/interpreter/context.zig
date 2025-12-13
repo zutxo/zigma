@@ -203,6 +203,114 @@ pub const PreHeaderView = struct {
 };
 
 // ============================================================================
+// VersionContext
+// ============================================================================
+
+/// Protocol version context for evaluation.
+/// Controls cost model selection and feature gating.
+///
+/// Ergo protocol versions:
+///   v0: Pre-4.0 (legacy AOT interpreter)
+///   v1: 4.0 hard fork (AOT with new cost model)
+///   v2: 5.0 soft fork (JIT interpreter, current mainnet)
+///   v3: 6.0 soft fork (EIP-50, new opcodes)
+///
+/// Reference: VersionContext.scala in sigmastate-interpreter
+pub const VersionContext = struct {
+    /// Network-activated protocol version (from block headers/consensus)
+    /// This determines which cost model to use.
+    activated_version: u8,
+
+    /// ErgoTree script version (bits 0-2 of header byte)
+    /// Scripts declare their target version.
+    ergo_tree_version: u8,
+
+    // -------------------------------------------------------------------------
+    // Version Constants (matches Scala VersionContext)
+    // -------------------------------------------------------------------------
+
+    /// JIT interpreter activation version
+    pub const JIT_ACTIVATION_VERSION: u8 = 2;
+
+    /// v6 features activation version (EIP-50)
+    pub const V6_ACTIVATION_VERSION: u8 = 3;
+
+    /// Maximum valid version we support
+    pub const MAX_SUPPORTED_VERSION: u8 = 3;
+
+    // -------------------------------------------------------------------------
+    // Constructors
+    // -------------------------------------------------------------------------
+
+    /// Create a VersionContext for v2 (current mainnet default)
+    pub fn v2() VersionContext {
+        return .{
+            .activated_version = 2,
+            .ergo_tree_version = 0,
+        };
+    }
+
+    /// Create a VersionContext for testing with explicit versions
+    pub fn init(activated: u8, tree_version: u8) VersionContext {
+        // PRECONDITION: versions within supported range
+        assert(activated <= MAX_SUPPORTED_VERSION);
+        assert(tree_version <= MAX_SUPPORTED_VERSION);
+        return .{
+            .activated_version = activated,
+            .ergo_tree_version = tree_version,
+        };
+    }
+
+    // -------------------------------------------------------------------------
+    // Version Checks
+    // -------------------------------------------------------------------------
+
+    /// Returns true if JIT interpreter is activated (v2+).
+    /// JIT uses different cost model than AOT.
+    pub fn isJitActivated(self: VersionContext) bool {
+        // POSTCONDITION: JIT is activated iff activated_version >= 2
+        return self.activated_version >= JIT_ACTIVATION_VERSION;
+    }
+
+    /// Returns true if v6 features are available (v3+).
+    /// Enables new opcodes from EIP-50.
+    pub fn isV6Activated(self: VersionContext) bool {
+        // POSTCONDITION: v6 features enabled iff both versions >= 3
+        return self.activated_version >= V6_ACTIVATION_VERSION and
+            self.ergo_tree_version >= V6_ACTIVATION_VERSION;
+    }
+
+    /// Returns true if this script version is supported.
+    /// Unknown versions should be handled via soft-fork rules.
+    pub fn isScriptVersionSupported(self: VersionContext) bool {
+        return self.ergo_tree_version <= MAX_SUPPORTED_VERSION;
+    }
+
+    /// Returns the effective script version (min of activated and declared).
+    /// Used for feature gating - can't use features not yet activated.
+    pub fn effectiveVersion(self: VersionContext) u8 {
+        // INVARIANT: effective version never exceeds either component
+        const eff = @min(self.activated_version, self.ergo_tree_version);
+        assert(eff <= self.activated_version);
+        assert(eff <= self.ergo_tree_version);
+        return eff;
+    }
+
+    /// Returns true if unknown opcodes should be accepted with placeholder values.
+    /// This is the soft-fork rule: if the script declares a version higher than
+    /// the activated protocol version, unknown opcodes are accepted to allow
+    /// old nodes to validate blocks with new script features.
+    ///
+    /// Reference: VersionContext.scala allowsUnknownOpCode
+    pub fn allowsSoftForkPlaceholder(self: VersionContext) bool {
+        // Soft-fork condition: script version > activated version
+        // This means the script uses features from a future soft-fork
+        // that hasn't activated yet on this node's understanding of consensus.
+        return self.ergo_tree_version > self.activated_version;
+    }
+};
+
+// ============================================================================
 // Context Validation Errors
 // ============================================================================
 
@@ -468,4 +576,91 @@ test "context: forHeight helper" {
     try std.testing.expectEqual(@as(u16, 0), ctx.self_index);
     try std.testing.expectEqual(@as(usize, 1), ctx.inputs.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.outputs.len);
+}
+
+// ============================================================================
+// VersionContext Tests
+// ============================================================================
+
+test "version_context: v2 constructor returns mainnet defaults" {
+    const vc = VersionContext.v2();
+    try std.testing.expectEqual(@as(u8, 2), vc.activated_version);
+    try std.testing.expectEqual(@as(u8, 0), vc.ergo_tree_version);
+}
+
+test "version_context: isJitActivated" {
+    // Pre-JIT versions
+    const v0 = VersionContext.init(0, 0);
+    const v1 = VersionContext.init(1, 0);
+    try std.testing.expect(!v0.isJitActivated());
+    try std.testing.expect(!v1.isJitActivated());
+
+    // JIT activated (v2+)
+    const v2 = VersionContext.init(2, 0);
+    const v3 = VersionContext.init(3, 0);
+    try std.testing.expect(v2.isJitActivated());
+    try std.testing.expect(v3.isJitActivated());
+}
+
+test "version_context: isV6Activated" {
+    // Not v6 - activated version too low
+    const vc1 = VersionContext.init(2, 3);
+    try std.testing.expect(!vc1.isV6Activated());
+
+    // Not v6 - tree version too low
+    const vc2 = VersionContext.init(3, 2);
+    try std.testing.expect(!vc2.isV6Activated());
+
+    // Both at v3 - v6 enabled
+    const vc3 = VersionContext.init(3, 3);
+    try std.testing.expect(vc3.isV6Activated());
+}
+
+test "version_context: isScriptVersionSupported" {
+    const v0 = VersionContext.init(2, 0);
+    const v1 = VersionContext.init(2, 1);
+    const v2 = VersionContext.init(2, 2);
+    const v3 = VersionContext.init(3, 3);
+
+    try std.testing.expect(v0.isScriptVersionSupported());
+    try std.testing.expect(v1.isScriptVersionSupported());
+    try std.testing.expect(v2.isScriptVersionSupported());
+    try std.testing.expect(v3.isScriptVersionSupported());
+}
+
+test "version_context: effectiveVersion" {
+    // Effective = min(activated, tree)
+    const vc1 = VersionContext.init(3, 2);
+    try std.testing.expectEqual(@as(u8, 2), vc1.effectiveVersion());
+
+    const vc2 = VersionContext.init(2, 3);
+    try std.testing.expectEqual(@as(u8, 2), vc2.effectiveVersion());
+
+    const vc3 = VersionContext.init(3, 3);
+    try std.testing.expectEqual(@as(u8, 3), vc3.effectiveVersion());
+
+    const vc4 = VersionContext.init(2, 0);
+    try std.testing.expectEqual(@as(u8, 0), vc4.effectiveVersion());
+}
+
+test "version_context: allowsSoftForkPlaceholder" {
+    // Script version > activated version - soft-fork allowed
+    const vc1 = VersionContext.init(2, 3);
+    try std.testing.expect(vc1.allowsSoftForkPlaceholder());
+
+    // Script version == activated version - no soft-fork
+    const vc2 = VersionContext.init(2, 2);
+    try std.testing.expect(!vc2.allowsSoftForkPlaceholder());
+
+    // Script version < activated version - no soft-fork
+    const vc3 = VersionContext.init(3, 2);
+    try std.testing.expect(!vc3.allowsSoftForkPlaceholder());
+
+    // Common case: old script on v2 mainnet
+    const vc4 = VersionContext.init(2, 0);
+    try std.testing.expect(!vc4.allowsSoftForkPlaceholder());
+
+    // Future script on v2 mainnet
+    const vc5 = VersionContext.init(2, 3);
+    try std.testing.expect(vc5.allowsSoftForkPlaceholder());
 }

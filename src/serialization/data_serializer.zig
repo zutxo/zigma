@@ -94,6 +94,13 @@ pub const Value = union(enum) {
     /// AVL+ tree metadata (authenticated dictionary)
     avl_tree: avl.AvlTreeData,
 
+    /// Placeholder for soft-fork unknown opcodes.
+    /// When a script uses an opcode not supported by this node but the script
+    /// version is higher than the activated version, we return this instead of
+    /// an error. This allows soft-fork upgrades where old nodes accept blocks
+    /// with new opcodes they don't understand.
+    soft_fork_placeholder: void,
+
     /// 256-bit signed integer stored as big-endian bytes
     pub const BigInt = struct {
         bytes: [max_bigint_bytes]u8,
@@ -531,6 +538,10 @@ fn storeValueInPool(
         },
         // Types not yet supported in pool storage
         .tuple, .header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {
+            return error.NotSupported;
+        },
+        // Soft-fork placeholder should not be stored in pool (internal-only)
+        .soft_fork_placeholder => {
             return error.NotSupported;
         },
     };
