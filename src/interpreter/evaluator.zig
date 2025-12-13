@@ -89,63 +89,51 @@ fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
 
     const type_idx = pooled.type_idx;
 
-    // Check primitive types by direct index
-    if (type_idx == TypePool.UNIT) return .unit;
-    if (type_idx == TypePool.BOOLEAN) return .{ .boolean = pooled.data.primitive != 0 };
-    if (type_idx == TypePool.BYTE) return .{ .byte = @intCast(pooled.data.primitive) };
-    if (type_idx == TypePool.SHORT) return .{ .short = @intCast(pooled.data.primitive) };
-    if (type_idx == TypePool.INT) return .{ .int = @intCast(pooled.data.primitive) };
-    if (type_idx == TypePool.LONG) return .{ .long = pooled.data.primitive };
-    if (type_idx == TypePool.BIG_INT) {
-        var bi: Value.BigInt = .{
-            .bytes = [_]u8{0} ** 32,
-            .len = pooled.data.big_int.len,
-        };
-        @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
-        return .{ .big_int = bi };
-    }
-    if (type_idx == TypePool.GROUP_ELEMENT) {
-        return .{ .group_element = pooled.data.group_element };
-    }
-    if (type_idx == TypePool.SIGMA_PROP) {
-        return .{ .sigma_prop = .{ .data = pooled.data.sigma_prop.slice() } };
-    }
-    if (type_idx == TypePool.BOX) {
-        // Box stored as source + index reference
-        return .{ .box = .{
+    return switch (type_idx) {
+        // Primitive types
+        TypePool.UNIT => .unit,
+        TypePool.BOOLEAN => .{ .boolean = pooled.data.primitive != 0 },
+        TypePool.BYTE => .{ .byte = @intCast(pooled.data.primitive) },
+        TypePool.SHORT => .{ .short = @intCast(pooled.data.primitive) },
+        TypePool.INT => .{ .int = @intCast(pooled.data.primitive) },
+        TypePool.LONG => .{ .long = pooled.data.primitive },
+
+        // Complex value types
+        TypePool.BIG_INT => blk: {
+            var bi: Value.BigInt = .{
+                .bytes = [_]u8{0} ** 32,
+                .len = pooled.data.big_int.len,
+            };
+            @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
+            break :blk .{ .big_int = bi };
+        },
+        TypePool.GROUP_ELEMENT => .{ .group_element = pooled.data.group_element },
+        TypePool.SIGMA_PROP => .{ .sigma_prop = .{ .data = pooled.data.sigma_prop.slice() } },
+        TypePool.BOX => .{ .box = .{
             .source = @enumFromInt(@intFromEnum(pooled.data.box.source)),
             .index = pooled.data.box.index,
-        } };
-    }
-    if (type_idx == TypePool.COLL_BYTE) {
-        return .{ .coll_byte = pooled.data.byte_slice.slice() };
-    }
+        } },
 
-    // Check Option types (indices >= OPTION_INT are Option variants)
-    // Options store inner_type + value_idx
-    if (type_idx >= TypePool.OPTION_INT) {
-        return .{ .option = .{
-            .inner_type = pooled.data.option.inner_type,
-            .value_idx = pooled.data.option.value_idx,
-        } };
-    }
-
-    // Check Collection types (indices 17-20 are collections)
-    if (type_idx >= TypePool.COLL_BYTE and type_idx <= TypePool.COLL_COLL_BYTE) {
-        if (type_idx == TypePool.COLL_BYTE) {
-            return .{ .coll_byte = pooled.data.byte_slice.slice() };
-        }
-        // Generic collection
-        return .{ .coll = .{
+        // Collection types
+        TypePool.COLL_BYTE => .{ .coll_byte = pooled.data.byte_slice.slice() },
+        TypePool.COLL_INT, TypePool.COLL_LONG, TypePool.COLL_COLL_BYTE => .{ .coll = .{
             .elem_type = pooled.data.collection.elem_type,
             .start = pooled.data.collection.start_idx,
             .len = pooled.data.collection.len,
-        } };
-    }
+        } },
 
-    // For any remaining complex types, examine data union tag
-    // This handles dynamically-typed tuples and other complex types
-    return error.UnsupportedExpression;
+        else => blk: {
+            // Option types (indices >= OPTION_INT are Option variants)
+            if (type_idx >= TypePool.OPTION_INT) {
+                break :blk .{ .option = .{
+                    .inner_type = pooled.data.option.inner_type,
+                    .value_idx = pooled.data.option.value_idx,
+                } };
+            }
+            // Unsupported/unknown type
+            break :blk error.UnsupportedExpression;
+        },
+    };
 }
 
 // ============================================================================
