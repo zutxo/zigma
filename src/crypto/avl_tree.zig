@@ -31,6 +31,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const hash = @import("hash.zig");
+const timing = @import("timing.zig");
 
 // ============================================================================
 // Constants
@@ -469,8 +470,8 @@ pub const BatchAVLVerifier = struct {
             };
         };
 
-        // Verify computed root matches expected digest
-        if (!std.mem.eql(u8, &root_label, self.starting_digest[0..hash_size])) {
+        // Verify computed root matches expected digest (constant-time to prevent timing attacks)
+        if (!timing.constantTimeEqlFixed(hash_size, &root_label, self.starting_digest[0..hash_size])) {
             return .verification_failed;
         }
 
@@ -606,8 +607,8 @@ pub const BatchAVLVerifier = struct {
                 // Leaf node: parse and compute label
                 const leaf_data = try self.parseLeaf();
 
-                // Check if this is the key we're looking for
-                if (std.mem.eql(u8, leaf_data.key, search_key)) {
+                // Check if this is the key we're looking for (constant-time to prevent timing attacks)
+                if (leaf_data.key.len == search_key.len and timing.constantTimeEql(leaf_data.key, search_key)) {
                     self.found_value = leaf_data.value;
                 }
 
@@ -747,8 +748,8 @@ pub const BatchAVLVerifier = struct {
             };
         };
 
-        // Verify computed root matches expected digest
-        if (!std.mem.eql(u8, &old_root, self.starting_digest[0..hash_size])) {
+        // Verify computed root matches expected digest (constant-time to prevent timing attacks)
+        if (!timing.constantTimeEqlFixed(hash_size, &old_root, self.starting_digest[0..hash_size])) {
             return error.InvalidProof;
         }
 
