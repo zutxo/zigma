@@ -143,8 +143,158 @@ pub fn modI64(a: i64, b: i64) ArithmeticError!i64 {
 }
 
 // ============================================================================
+// Bitwise Operations
+// ============================================================================
+
+/// Bitwise inversion (complement): ~a
+/// No overflow possible.
+pub fn bitInvert(comptime T: type, a: T) T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    return ~a;
+}
+
+/// Bitwise OR: a | b
+/// No overflow possible.
+pub fn bitOr(comptime T: type, a: T, b: T) T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    return a | b;
+}
+
+/// Bitwise AND: a & b
+/// No overflow possible.
+pub fn bitAnd(comptime T: type, a: T, b: T) T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    return a & b;
+}
+
+/// Bitwise XOR: a ^ b
+/// No overflow possible.
+pub fn bitXor(comptime T: type, a: T, b: T) T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    return a ^ b;
+}
+
+/// Bitwise shift error
+pub const ShiftError = error{
+    /// Shift amount is negative
+    NegativeShift,
+    /// Shift amount exceeds bit width
+    ShiftOverflow,
+};
+
+/// Arithmetic right shift: a >> n (sign extends)
+/// Matches Java/Scala >> operator.
+/// Shift amount must be non-negative and less than bit width.
+pub fn bitShiftRight(comptime T: type, a: T, n: i32) ShiftError!T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    const bits = @bitSizeOf(T);
+
+    if (n < 0) return error.NegativeShift;
+    if (n >= bits) return error.ShiftOverflow;
+
+    // Arithmetic shift (sign extends) - Zig >> on signed is arithmetic
+    const shift: std.math.Log2Int(T) = @intCast(n);
+    return a >> shift;
+}
+
+/// Left shift: a << n
+/// Matches Java/Scala << operator.
+/// Shift amount must be non-negative and less than bit width.
+pub fn bitShiftLeft(comptime T: type, a: T, n: i32) ShiftError!T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    const bits = @bitSizeOf(T);
+
+    if (n < 0) return error.NegativeShift;
+    if (n >= bits) return error.ShiftOverflow;
+
+    const shift: std.math.Log2Int(T) = @intCast(n);
+    return a << shift;
+}
+
+/// Logical (zeroed) right shift: a >>> n
+/// Matches Java/Scala >>> operator - fills with zeros, not sign bits.
+/// Shift amount must be non-negative and less than bit width.
+pub fn bitShiftRightZeroed(comptime T: type, a: T, n: i32) ShiftError!T {
+    comptime assert(T == i8 or T == i16 or T == i32 or T == i64);
+    const bits = @bitSizeOf(T);
+
+    if (n < 0) return error.NegativeShift;
+    if (n >= bits) return error.ShiftOverflow;
+
+    // Convert to unsigned, shift, convert back
+    const U = std.meta.Int(.unsigned, bits);
+    const unsigned_val: U = @bitCast(a);
+    const shift: std.math.Log2Int(U) = @intCast(n);
+    const shifted = unsigned_val >> shift;
+    return @bitCast(shifted);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+test "arithmetic: bitInvert" {
+    try std.testing.expectEqual(@as(i32, -1), bitInvert(i32, 0));
+    try std.testing.expectEqual(@as(i32, 0), bitInvert(i32, -1));
+    try std.testing.expectEqual(@as(i32, -43), bitInvert(i32, 42));
+    try std.testing.expectEqual(@as(i8, -1), bitInvert(i8, 0));
+}
+
+test "arithmetic: bitOr" {
+    try std.testing.expectEqual(@as(i32, 0b1111), bitOr(i32, 0b1100, 0b0011));
+    try std.testing.expectEqual(@as(i32, 7), bitOr(i32, 5, 3)); // 101 | 011 = 111
+    try std.testing.expectEqual(@as(i8, -1), bitOr(i8, 0x7F, -128)); // 0x7F | 0x80 = 0xFF = -1
+}
+
+test "arithmetic: bitAnd" {
+    try std.testing.expectEqual(@as(i32, 0b0100), bitAnd(i32, 0b1100, 0b0111));
+    try std.testing.expectEqual(@as(i32, 1), bitAnd(i32, 5, 3)); // 101 & 011 = 001
+}
+
+test "arithmetic: bitXor" {
+    try std.testing.expectEqual(@as(i32, 0b1011), bitXor(i32, 0b1100, 0b0111));
+    try std.testing.expectEqual(@as(i32, 6), bitXor(i32, 5, 3)); // 101 ^ 011 = 110
+}
+
+test "arithmetic: bitShiftRight arithmetic" {
+    // Positive numbers
+    try std.testing.expectEqual(@as(i32, 2), try bitShiftRight(i32, 8, 2));
+    try std.testing.expectEqual(@as(i32, 1), try bitShiftRight(i32, 8, 3));
+
+    // Negative numbers - sign extends
+    try std.testing.expectEqual(@as(i32, -2), try bitShiftRight(i32, -8, 2));
+    try std.testing.expectEqual(@as(i8, -1), try bitShiftRight(i8, -1, 7)); // Still -1 after shift
+
+    // Edge cases
+    try std.testing.expectError(error.NegativeShift, bitShiftRight(i32, 8, -1));
+    try std.testing.expectError(error.ShiftOverflow, bitShiftRight(i32, 8, 32));
+}
+
+test "arithmetic: bitShiftLeft" {
+    try std.testing.expectEqual(@as(i32, 32), try bitShiftLeft(i32, 8, 2));
+    try std.testing.expectEqual(@as(i32, 64), try bitShiftLeft(i32, 8, 3));
+
+    // Edge cases
+    try std.testing.expectError(error.NegativeShift, bitShiftLeft(i32, 8, -1));
+    try std.testing.expectError(error.ShiftOverflow, bitShiftLeft(i32, 8, 32));
+}
+
+test "arithmetic: bitShiftRightZeroed" {
+    // Positive - same as arithmetic shift
+    try std.testing.expectEqual(@as(i32, 2), try bitShiftRightZeroed(i32, 8, 2));
+
+    // Negative - fills with zeros, not sign
+    // -8 in binary (32-bit): 11111111111111111111111111111000
+    // >>> 2: 00111111111111111111111111111110 = 0x3FFFFFFE = 1073741822
+    try std.testing.expectEqual(@as(i32, 1073741822), try bitShiftRightZeroed(i32, -8, 2));
+
+    // -1 >>> 1 for i8: 0xFF >> 1 = 0x7F = 127
+    try std.testing.expectEqual(@as(i8, 127), try bitShiftRightZeroed(i8, -1, 1));
+
+    // Edge cases
+    try std.testing.expectError(error.NegativeShift, bitShiftRightZeroed(i32, 8, -1));
+    try std.testing.expectError(error.ShiftOverflow, bitShiftRightZeroed(i32, 8, 32));
+}
 
 test "arithmetic: add basic" {
     try std.testing.expectEqual(@as(i32, 3), try add(i32, 1, 2));

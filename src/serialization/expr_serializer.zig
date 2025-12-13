@@ -179,6 +179,10 @@ pub const ExprTag = enum(u8) {
     /// MinusModQ: (a - b) mod q (opcode 0xE9/233) - BigInt, BigInt → BigInt
     minus_mod_q,
 
+    // Bitwise unary operation (v3+)
+    /// Bitwise inversion/complement (opcode 0xF1/241) - T → T
+    bit_inversion,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -202,6 +206,13 @@ pub const BinOpKind = enum(u8) {
     and_op,
     or_op,
     xor_op,
+    // Bitwise (v3+)
+    bit_or,
+    bit_and,
+    bit_xor,
+    bit_shift_right, // arithmetic (sign-extending)
+    bit_shift_left,
+    bit_shift_right_zeroed, // logical (zero-extending)
 };
 
 /// Expression node (compact representation)
@@ -520,6 +531,14 @@ fn deserializeWithDepth(
             opcodes.ModQ => try deserializeUnaryOp(tree, reader, arena, .mod_q, depth),
             opcodes.PlusModQ => try deserializeBinaryModQOp(tree, reader, arena, .plus_mod_q, depth),
             opcodes.MinusModQ => try deserializeBinaryModQOp(tree, reader, arena, .minus_mod_q, depth),
+            // Bitwise operations (v3+)
+            opcodes.BitInversion => try deserializeUnaryOp(tree, reader, arena, .bit_inversion, depth),
+            opcodes.BitOr => try deserializeBinOp(tree, reader, arena, .bit_or, depth),
+            opcodes.BitAnd => try deserializeBinOp(tree, reader, arena, .bit_and, depth),
+            opcodes.BitXor => try deserializeBinOp(tree, reader, arena, .bit_xor, depth),
+            opcodes.BitShiftRight => try deserializeBinOp(tree, reader, arena, .bit_shift_right, depth),
+            opcodes.BitShiftLeft => try deserializeBinOp(tree, reader, arena, .bit_shift_left, depth),
+            opcodes.BitShiftRightZeroed => try deserializeBinOp(tree, reader, arena, .bit_shift_right_zeroed, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{

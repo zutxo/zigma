@@ -157,6 +157,8 @@ pub const EvalError = error{
     DivisionByZero,
     /// Arithmetic overflow
     ArithmeticOverflow,
+    /// Invalid shift amount (negative or exceeds type width)
+    InvalidShift,
     /// Invalid node index
     InvalidNodeIndex,
     /// Invalid constant index
@@ -990,6 +992,12 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            .bit_inversion => {
+                // Unary: T → T (bitwise complement)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .plus_mod_q, .minus_mod_q => {
                 // Binary: BigInt, BigInt → BigInt (mod secp256k1 group order)
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
@@ -1322,6 +1330,10 @@ pub const Evaluator = struct {
                 try self.computeModQ();
             },
 
+            .bit_inversion => {
+                try self.computeBitInversion();
+            },
+
             .plus_mod_q => {
                 try self.computePlusModQ();
             },
@@ -1611,6 +1623,22 @@ pub const Evaluator = struct {
         @memcpy(output.bytes[0..result_bytes.len], result_bytes);
 
         try self.pushValue(.{ .big_int = output });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute BitInversion - bitwise complement
+    fn computeBitInversion(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(30); // BitInversion cost from opcodes
+
+        const input = try self.popValue();
+        const result = try bitInvertInt(input);
+
+        try self.pushValue(result);
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -2288,6 +2316,32 @@ pub const Evaluator = struct {
             .xor_op => {
                 if (left != .boolean or right != .boolean) return error.TypeMismatch;
                 try self.pushValue(.{ .boolean = left.boolean != right.boolean });
+            },
+
+            // Bitwise operations (v3+)
+            .bit_or => {
+                const result = try bitOrInts(left, right);
+                try self.pushValue(result);
+            },
+            .bit_and => {
+                const result = try bitAndInts(left, right);
+                try self.pushValue(result);
+            },
+            .bit_xor => {
+                const result = try bitXorInts(left, right);
+                try self.pushValue(result);
+            },
+            .bit_shift_right => {
+                const result = try bitShiftRightInts(left, right);
+                try self.pushValue(result);
+            },
+            .bit_shift_left => {
+                const result = try bitShiftLeftInts(left, right);
+                try self.pushValue(result);
+            },
+            .bit_shift_right_zeroed => {
+                const result = try bitShiftRightZeroedInts(left, right);
+                try self.pushValue(result);
             },
         }
 
@@ -4566,7 +4620,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion => 1,
 
             // Binary operations (2 children)
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
@@ -4747,6 +4801,138 @@ fn modInts(left: Value, right: Value) EvalError!Value {
     const result = @rem(l, r);
 
     return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+// ============================================================================
+// Bitwise Operations (v3+)
+// ============================================================================
+
+/// Bitwise OR of two integer values
+fn bitOrInts(left: Value, right: Value) EvalError!Value {
+    const l = try extractInt(left);
+    const r = try extractInt(right);
+
+    const result = l | r;
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Bitwise AND of two integer values
+fn bitAndInts(left: Value, right: Value) EvalError!Value {
+    const l = try extractInt(left);
+    const r = try extractInt(right);
+
+    const result = l & r;
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Bitwise XOR of two integer values
+fn bitXorInts(left: Value, right: Value) EvalError!Value {
+    const l = try extractInt(left);
+    const r = try extractInt(right);
+
+    const result = l ^ r;
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Arithmetic right shift (sign extends)
+fn bitShiftRightInts(left: Value, right: Value) EvalError!Value {
+    const val = try extractInt(left);
+    const shift_amount = try extractInt(right);
+
+    // Shift amount must be in valid range
+    if (shift_amount < 0) return error.InvalidShift;
+    if (shift_amount >= 64) return error.InvalidShift;
+
+    const shift: u6 = @intCast(shift_amount);
+    const result = val >> shift;
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Left shift
+fn bitShiftLeftInts(left: Value, right: Value) EvalError!Value {
+    const val = try extractInt(left);
+    const shift_amount = try extractInt(right);
+
+    // Shift amount must be in valid range
+    if (shift_amount < 0) return error.InvalidShift;
+    if (shift_amount >= 64) return error.InvalidShift;
+
+    const shift: u6 = @intCast(shift_amount);
+    const result = val << shift;
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Logical right shift (zero extends)
+fn bitShiftRightZeroedInts(left: Value, right: Value) EvalError!Value {
+    const val = try extractInt(left);
+    const shift_amount = try extractInt(right);
+
+    // Shift amount must be in valid range
+    if (shift_amount < 0) return error.InvalidShift;
+    if (shift_amount >= 64) return error.InvalidShift;
+
+    // Convert to unsigned, shift, convert back
+    const unsigned_val: u64 = @bitCast(val);
+    const shift: u6 = @intCast(shift_amount);
+    const shifted = unsigned_val >> shift;
+    const result: i64 = @bitCast(shifted);
+
+    return switch (left) {
+        .byte => .{ .byte = @truncate(result) },
+        .short => .{ .short = @truncate(result) },
+        .int => .{ .int = @truncate(result) },
+        .long => .{ .long = result },
+        else => error.TypeMismatch,
+    };
+}
+
+/// Bitwise inversion (unary)
+fn bitInvertInt(val: Value) EvalError!Value {
+    const v = try extractInt(val);
+    const result = ~v;
+
+    return switch (val) {
         .byte => .{ .byte = @truncate(result) },
         .short => .{ .short = @truncate(result) },
         .int => .{ .int = @truncate(result) },

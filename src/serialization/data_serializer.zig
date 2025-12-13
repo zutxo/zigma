@@ -303,6 +303,8 @@ pub fn deserialize(
         .func => error.NotSupported,
         // Object types cannot be deserialized as data (only accessed via context)
         .any, .box, .context, .header, .pre_header, .global => error.NotSupported,
+        // Type variables are placeholders, cannot be serialized as data
+        .type_var => error.NotSupported,
     };
 }
 
