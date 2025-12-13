@@ -3047,6 +3047,16 @@ pub const Evaluator = struct {
         const starts_with: u8 = 31; // coll.startsWith(other) → Boolean
         const ends_with: u8 = 32; // coll.endsWith(other) → Boolean
         const get: u8 = 33; // coll.get(idx) → Option[A]
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ indices, flatmap, patch, updated, update_many, index_of, zip, reverse, starts_with, ends_with, get };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("CollMethodId collision detected");
+                }
+            }
+        }
     };
 
     /// AvlTree type code from Rust types/savltree.rs
@@ -3065,6 +3075,16 @@ pub const Evaluator = struct {
         const height: u8 = 6; // CONTEXT.HEIGHT → Int
         const self_box: u8 = 7; // CONTEXT.SELF → Box
         const self_box_index: u8 = 8; // CONTEXT.selfBoxIndex → Int
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ data_inputs, headers, pre_header, inputs, outputs, height, self_box, self_box_index };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("ContextMethodId collision detected");
+                }
+            }
+        }
     };
 
     /// AvlTree method IDs from Rust types/savltree.rs
@@ -3085,6 +3105,16 @@ pub const Evaluator = struct {
         const remove: u8 = 14; // tree.remove(keys, proof) → Option[AvlTree]
         const update_digest: u8 = 15; // tree.updateDigest(digest) → AvlTree
         const insert_or_update: u8 = 16; // tree.insertOrUpdate(entries, proof) → Option[AvlTree]
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ digest, enabled_operations, key_length, value_length_opt, is_insert_allowed, is_update_allowed, is_remove_allowed, update_operations, contains, get, get_many, insert, update, remove, update_digest, insert_or_update };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("AvlTreeMethodId collision detected");
+                }
+            }
+        }
     };
 
     /// Compute method call: dispatch based on type_code and method_id
