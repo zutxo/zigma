@@ -3263,6 +3263,7 @@ pub const Evaluator = struct {
     fn computeStartsWith(self: *Evaluator) EvalError!void {
         // PRECONDITIONS: 2 values on stack (coll, prefix)
         assert(self.value_sp >= 2);
+        assert(self.value_sp <= max_value_stack); // Stack within bounds
         const initial_sp = self.value_sp;
 
         // Pop in reverse order
@@ -3272,6 +3273,9 @@ pub const Evaluator = struct {
         const result: bool = switch (coll_val) {
             .coll_byte => |coll| switch (prefix_val) {
                 .coll_byte => |prefix| blk: {
+                    // INVARIANT: prefix.len and coll.len are valid slice lengths
+                    assert(prefix.len <= std.math.maxInt(u32));
+                    assert(coll.len <= std.math.maxInt(u32));
                     if (prefix.len > coll.len) break :blk false;
                     break :blk std.mem.eql(u8, coll[0..prefix.len], prefix);
                 },
@@ -3282,8 +3286,9 @@ pub const Evaluator = struct {
 
         try self.pushValue(.{ .boolean = result });
 
-        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
-        assert(self.value_sp == initial_sp - 1);
+        // POSTCONDITIONS
+        assert(self.value_sp == initial_sp - 1); // Stack reduced by 1
+        assert(self.value_sp >= 1); // At least result on stack
     }
 
     /// Compute endsWith: Coll[T].endsWith(Coll[T]) → Boolean
@@ -3291,6 +3296,7 @@ pub const Evaluator = struct {
     fn computeEndsWith(self: *Evaluator) EvalError!void {
         // PRECONDITIONS: 2 values on stack (coll, suffix)
         assert(self.value_sp >= 2);
+        assert(self.value_sp <= max_value_stack); // Stack within bounds
         const initial_sp = self.value_sp;
 
         // Pop in reverse order
@@ -3300,8 +3306,13 @@ pub const Evaluator = struct {
         const result: bool = switch (coll_val) {
             .coll_byte => |coll| switch (suffix_val) {
                 .coll_byte => |suffix| blk: {
+                    // INVARIANT: suffix.len and coll.len are valid slice lengths
+                    assert(suffix.len <= std.math.maxInt(u32));
+                    assert(coll.len <= std.math.maxInt(u32));
                     if (suffix.len > coll.len) break :blk false;
                     const start = coll.len - suffix.len;
+                    // INVARIANT: start is valid index (no underflow since suffix.len <= coll.len)
+                    assert(start <= coll.len);
                     break :blk std.mem.eql(u8, coll[start..], suffix);
                 },
                 else => return error.TypeMismatch,
@@ -3311,8 +3322,9 @@ pub const Evaluator = struct {
 
         try self.pushValue(.{ .boolean = result });
 
-        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
-        assert(self.value_sp == initial_sp - 1);
+        // POSTCONDITIONS
+        assert(self.value_sp == initial_sp - 1); // Stack reduced by 1
+        assert(self.value_sp >= 1); // At least result on stack
     }
 
     // ========================================================================
@@ -3554,6 +3566,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeDigest(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3565,9 +3578,15 @@ pub const Evaluator = struct {
 
         const tree_data = tree_val.avl_tree;
 
+        // INVARIANT: digest has correct size
+        assert(tree_data.digest.len == avl_tree.digest_size);
+
         // Copy digest to arena
         const result = self.arena.allocSlice(u8, avl_tree.digest_size) catch return error.OutOfMemory;
         @memcpy(result, &tree_data.digest);
+
+        // INVARIANT: result has correct size
+        assert(result.len == avl_tree.digest_size);
 
         try self.pushValue(.{ .coll_byte = result });
 
@@ -3579,6 +3598,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeEnabledOps(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3591,6 +3611,9 @@ pub const Evaluator = struct {
         const tree_data = tree_val.avl_tree;
         const flags_byte = tree_data.tree_flags.toByte();
 
+        // INVARIANT: flags fit in a byte (reserved bits zero)
+        assert(flags_byte <= 0x07); // Only lower 3 bits used
+
         try self.pushValue(.{ .byte = @bitCast(flags_byte) });
 
         // POSTCONDITION: Stack unchanged
@@ -3601,6 +3624,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeKeyLength(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3612,6 +3636,10 @@ pub const Evaluator = struct {
 
         const tree_data = tree_val.avl_tree;
 
+        // INVARIANT: key_length within protocol limits
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
         try self.pushValue(.{ .int = @intCast(tree_data.key_length) });
 
         // POSTCONDITION: Stack unchanged
@@ -3622,6 +3650,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeValueLengthOpt(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3634,6 +3663,9 @@ pub const Evaluator = struct {
         const tree_data = tree_val.avl_tree;
 
         if (tree_data.value_length_opt) |vl| {
+            // INVARIANT: value_length within protocol limits
+            assert(vl <= avl_tree.max_value_length);
+
             // Some(vl) - store int in pool
             const idx = self.pools.values.alloc() catch return error.OutOfMemory;
             const pooled = value_pool.PooledValue{
@@ -3657,6 +3689,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeIsInsertAllowed(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3667,6 +3700,10 @@ pub const Evaluator = struct {
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
         const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: key_length valid (tree was validated on construction)
+        assert(tree_data.key_length > 0);
+
         try self.pushValue(.{ .boolean = tree_data.isInsertAllowed() });
 
         // POSTCONDITION: Stack unchanged
@@ -3677,6 +3714,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeIsUpdateAllowed(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3687,6 +3725,10 @@ pub const Evaluator = struct {
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
         const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: key_length valid (tree was validated on construction)
+        assert(tree_data.key_length > 0);
+
         try self.pushValue(.{ .boolean = tree_data.isUpdateAllowed() });
 
         // POSTCONDITION: Stack unchanged
@@ -3697,6 +3739,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeIsRemoveAllowed(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3707,6 +3750,10 @@ pub const Evaluator = struct {
         if (tree_val != .avl_tree) return error.TypeMismatch;
 
         const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: key_length valid (tree was validated on construction)
+        assert(tree_data.key_length > 0);
+
         try self.pushValue(.{ .boolean = tree_data.isRemoveAllowed() });
 
         // POSTCONDITION: Stack unchanged
@@ -3717,6 +3764,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeContains(self: *Evaluator) EvalError!void {
         // PRECONDITIONS: 3 values on stack (tree, key, proof)
         assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3724,6 +3772,9 @@ pub const Evaluator = struct {
         const proof_val = try self.popValue();
         if (proof_val != .coll_byte) return error.TypeMismatch;
         const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
 
         // Cost: per-item based on proof size (LookupAvlTree)
         // PerItemCost(40, 10, 1) means base 40 + 10 per proof element
@@ -3737,6 +3788,10 @@ pub const Evaluator = struct {
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
         const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
 
         // Validate key length
         if (key.len != tree_data.key_length) {
@@ -3780,6 +3835,7 @@ pub const Evaluator = struct {
     fn computeAvlTreeGet(self: *Evaluator) EvalError!void {
         // PRECONDITIONS: 3 values on stack (tree, key, proof)
         assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
 
         const initial_sp = self.value_sp;
 
@@ -3787,6 +3843,9 @@ pub const Evaluator = struct {
         const proof_val = try self.popValue();
         if (proof_val != .coll_byte) return error.TypeMismatch;
         const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
 
         // Cost: per-item based on proof size (LookupAvlTree)
         // PerItemCost(40, 10, 1) means base 40 + 10 per proof element
@@ -3800,6 +3859,10 @@ pub const Evaluator = struct {
         const tree_val = try self.popValue();
         if (tree_val != .avl_tree) return error.TypeMismatch;
         const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
 
         // Validate key length
         if (key.len != tree_data.key_length) {
