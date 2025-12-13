@@ -52,6 +52,11 @@ pub const max_proof_size: usize = 65536;
 /// Blake2b256 hash output size
 pub const hash_size: usize = 32;
 
+/// Maximum verification iterations (DoS protection)
+/// Each iteration processes at least 1 proof byte, so this bounds loop execution.
+/// Set to 2x max_proof_size to allow for overhead while still preventing infinite loops.
+pub const max_verification_iterations: usize = max_proof_size * 2;
+
 // Compile-time sanity checks (ZIGMA_STYLE)
 comptime {
     assert(digest_size == 33);
@@ -59,6 +64,7 @@ comptime {
     assert(max_key_length >= 1);
     assert(max_value_length >= 1);
     assert(max_proof_size >= 1024);
+    assert(max_verification_iterations >= max_proof_size);
 }
 
 // ============================================================================
@@ -390,6 +396,7 @@ pub const BatchAVLVerifier = struct {
         InvalidValueLength,
         StackOverflow,
         InvalidNodeType,
+        IterationLimitExceeded,
     };
 
     /// Initialize verifier with starting digest and proof
@@ -554,8 +561,15 @@ pub const BatchAVLVerifier = struct {
     /// Find where the direction bits start in the proof
     fn findDirectionsStart(self: *BatchAVLVerifier) VerifyError!usize {
         var pos: usize = 0;
+        var iterations: usize = 0;
 
         while (pos < self.proof.len) {
+            // DoS protection: limit iterations
+            iterations += 1;
+            if (iterations > max_verification_iterations) {
+                return error.IterationLimitExceeded;
+            }
+
             const marker = self.proof[pos];
             pos += 1;
 
@@ -589,8 +603,17 @@ pub const BatchAVLVerifier = struct {
     /// Reconstruct tree from proof and search for key
     /// Returns the computed root label
     fn reconstructAndSearch(self: *BatchAVLVerifier, search_key: []const u8) VerifyError![hash_size]u8 {
+        // Iteration counter for DoS protection
+        var iterations: usize = 0;
+
         // Parse proof in post-order, building tree on stack
         while (self.tree_pos < self.directions_start) {
+            // DoS protection: limit iterations to prevent malicious proofs from causing long loops
+            iterations += 1;
+            if (iterations > max_verification_iterations) {
+                return error.IterationLimitExceeded;
+            }
+
             const marker = self.proof[self.tree_pos];
             self.tree_pos += 1;
 
@@ -796,7 +819,16 @@ pub const BatchAVLVerifier = struct {
 
     /// Reconstruct tree from proof without searching for a key
     fn reconstructTree(self: *BatchAVLVerifier) VerifyError![hash_size]u8 {
+        // Iteration counter for DoS protection
+        var iterations: usize = 0;
+
         while (self.tree_pos < self.directions_start) {
+            // DoS protection: limit iterations
+            iterations += 1;
+            if (iterations > max_verification_iterations) {
+                return error.IterationLimitExceeded;
+            }
+
             const marker = self.proof[self.tree_pos];
             self.tree_pos += 1;
 
