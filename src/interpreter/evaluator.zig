@@ -26,6 +26,7 @@ const hash = @import("../crypto/hash.zig");
 const crypto_ops = @import("ops/crypto.zig");
 const sigma_tree = @import("../sigma/sigma_tree.zig");
 const avl_tree = @import("../crypto/avl_tree.zig");
+const crypto_bigint = @import("../crypto/bigint.zig");
 
 const Context = context.Context;
 const BoxView = context.BoxView;
@@ -918,6 +919,21 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            .mod_q => {
+                // Unary: BigInt → BigInt (reduce mod secp256k1 group order)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            .plus_mod_q, .minus_mod_q => {
+                // Binary: BigInt, BigInt → BigInt (mod secp256k1 group order)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const left_idx = node_idx + 1;
+                const right_idx = self.findSubtreeEnd(left_idx);
+                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+            },
+
             .group_generator => {
                 // Nullary: → GroupElement (no children to evaluate)
                 try self.addCost(FixedCost.group_generator);
@@ -1237,6 +1253,18 @@ pub const Evaluator = struct {
                 try self.computeDecodePoint();
             },
 
+            .mod_q => {
+                try self.computeModQ();
+            },
+
+            .plus_mod_q => {
+                try self.computePlusModQ();
+            },
+
+            .minus_mod_q => {
+                try self.computeMinusModQ();
+            },
+
             .exponentiate => {
                 try self.computeExponentiate();
             },
@@ -1504,6 +1532,127 @@ pub const Evaluator = struct {
         var result: [33]u8 = undefined;
         @memcpy(&result, bytes);
         try self.pushValue(.{ .group_element = result });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute ModQ - reduce BigInt mod secp256k1 group order
+    fn computeModQ(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(100); // ModQ cost from opcodes
+
+        const input = try self.popValue();
+        if (input != .big_int) return error.TypeMismatch;
+
+        // INVARIANT: Input has correct type
+        assert(input == .big_int);
+
+        const input_bigint = input.big_int;
+
+        // Convert to BigInt256 for modular arithmetic
+        const value = crypto_bigint.BigInt256.fromBytes(input_bigint.bytes[0..input_bigint.len]) catch
+            return error.InvalidData;
+
+        // Perform modQ operation
+        const result = value.modQ() catch return error.ArithmeticOverflow;
+
+        // Convert back to serialized format
+        var result_buf: [33]u8 = undefined;
+        const result_bytes = result.toBytes(&result_buf);
+
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+
+        try self.pushValue(.{ .big_int = output });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute PlusModQ - (a + b) mod secp256k1 group order
+    fn computePlusModQ(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(100); // PlusModQ cost from opcodes
+
+        // Pop right then left - stack order
+        const right_val = try self.popValue();
+        const left_val = try self.popValue();
+
+        if (left_val != .big_int) return error.TypeMismatch;
+        if (right_val != .big_int) return error.TypeMismatch;
+
+        // INVARIANT: Both values have correct types
+        assert(left_val == .big_int);
+        assert(right_val == .big_int);
+
+        const left_bigint = left_val.big_int;
+        const right_bigint = right_val.big_int;
+
+        // Convert to BigInt256
+        const left = crypto_bigint.BigInt256.fromBytes(left_bigint.bytes[0..left_bigint.len]) catch
+            return error.InvalidData;
+        const right = crypto_bigint.BigInt256.fromBytes(right_bigint.bytes[0..right_bigint.len]) catch
+            return error.InvalidData;
+
+        // Perform plusModQ operation
+        const result = left.plusModQ(right) catch return error.ArithmeticOverflow;
+
+        // Convert back to serialized format
+        var result_buf: [33]u8 = undefined;
+        const result_bytes = result.toBytes(&result_buf);
+
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+
+        try self.pushValue(.{ .big_int = output });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute MinusModQ - (a - b) mod secp256k1 group order
+    fn computeMinusModQ(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(100); // MinusModQ cost from opcodes
+
+        // Pop right then left - stack order
+        const right_val = try self.popValue();
+        const left_val = try self.popValue();
+
+        if (left_val != .big_int) return error.TypeMismatch;
+        if (right_val != .big_int) return error.TypeMismatch;
+
+        // INVARIANT: Both values have correct types
+        assert(left_val == .big_int);
+        assert(right_val == .big_int);
+
+        const left_bigint = left_val.big_int;
+        const right_bigint = right_val.big_int;
+
+        // Convert to BigInt256
+        const left = crypto_bigint.BigInt256.fromBytes(left_bigint.bytes[0..left_bigint.len]) catch
+            return error.InvalidData;
+        const right = crypto_bigint.BigInt256.fromBytes(right_bigint.bytes[0..right_bigint.len]) catch
+            return error.InvalidData;
+
+        // Perform minusModQ operation
+        const result = left.minusModQ(right) catch return error.ArithmeticOverflow;
+
+        // Convert back to serialized format
+        var result_buf: [33]u8 = undefined;
+        const result_bytes = result.toBytes(&result_buf);
+
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+
+        try self.pushValue(.{ .big_int = output });
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -3920,10 +4069,10 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q => 1,
 
             // Binary operations (2 children)
-            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map => 2,
+            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
 
             // Ternary operations (3 children)
             .if_then_else, .triple_construct, .fold, .tree_lookup => 3,

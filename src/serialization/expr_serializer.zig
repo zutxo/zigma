@@ -171,6 +171,14 @@ pub const ExprTag = enum(u8) {
     /// data: low 4 bits = register_id (0-9), rest = type_idx for inner type
     extract_register_as,
 
+    // Modular arithmetic mod secp256k1 group order (opcodes 0xE7-0xE9 / 231-233)
+    /// ModQ: reduce BigInt mod q (opcode 0xE7/231) - BigInt → BigInt
+    mod_q,
+    /// PlusModQ: (a + b) mod q (opcode 0xE8/232) - BigInt, BigInt → BigInt
+    plus_mod_q,
+    /// MinusModQ: (a - b) mod q (opcode 0xE9/233) - BigInt, BigInt → BigInt
+    minus_mod_q,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -508,6 +516,10 @@ fn deserializeWithDepth(
             opcodes.AvlTreeGet => try deserializeTreeLookup(tree, reader, arena, depth),
             // Box extraction operations
             opcodes.ExtractRegisterAs => try deserializeExtractRegisterAs(tree, reader, arena, depth),
+            // Modular arithmetic mod secp256k1 group order
+            opcodes.ModQ => try deserializeUnaryOp(tree, reader, arena, .mod_q, depth),
+            opcodes.PlusModQ => try deserializeBinaryModQOp(tree, reader, arena, .plus_mod_q, depth),
+            opcodes.MinusModQ => try deserializeBinaryModQOp(tree, reader, arena, .minus_mod_q, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -630,7 +642,8 @@ fn deserializeUnaryOp(
     assert(tag == .calc_blake2b256 or tag == .calc_sha256 or
         tag == .option_get or tag == .option_is_defined or
         tag == .long_to_byte_array or tag == .byte_array_to_bigint or
-        tag == .byte_array_to_long or tag == .decode_point);
+        tag == .byte_array_to_long or tag == .decode_point or
+        tag == .mod_q);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {
@@ -638,7 +651,7 @@ fn deserializeUnaryOp(
         .option_is_defined => TypePool.BOOLEAN,
         .option_get => TypePool.ANY, // Will be inner type of option at runtime
         .byte_array_to_long => TypePool.LONG,
-        .byte_array_to_bigint => TypePool.BIG_INT,
+        .byte_array_to_bigint, .mod_q => TypePool.BIG_INT,
         .decode_point => TypePool.GROUP_ELEMENT,
         else => TypePool.ANY,
     };
@@ -673,6 +686,29 @@ fn deserializeBinaryGroupOp(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 
     // Parse right operand (BigInt for exponentiate, GroupElement for multiply)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+fn deserializeBinaryModQOp(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITION: tag is a valid binary ModQ operation
+    assert(tag == .plus_mod_q or tag == .minus_mod_q);
+
+    // Add the binary op node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .result_type = TypePool.BIG_INT,
+    });
+
+    // Parse left operand (BigInt)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse right operand (BigInt)
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 

@@ -56,6 +56,20 @@ pub const BigInt256 = struct {
     /// Negative one
     pub const neg_one = BigInt256{ .limbs = .{ 1, 0, 0, 0 }, .negative = true };
 
+    /// secp256k1 group order q (for ModQ operations)
+    /// q = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    /// This is used for threshold signature scripts and sigma protocols.
+    /// Reference: CryptoConstants.groupOrder in Scala sigmastate
+    pub const GROUP_ORDER = BigInt256{
+        .limbs = .{
+            0xBFD25E8CD0364141, // LSB
+            0xBAAEDCE6AF48A03B,
+            0xFFFFFFFFFFFFFFFE,
+            0xFFFFFFFFFFFFFFFF, // MSB
+        },
+        .negative = false,
+    };
+
     /// Maximum positive value: 2^255 - 1
     pub const max_value = BigInt256{
         .limbs = .{
@@ -557,6 +571,234 @@ pub const BigInt256 = struct {
     }
 
     // ========================================================================
+    // ModQ Operations (mod secp256k1 group order)
+    // ========================================================================
+
+    /// Reduce value mod q (secp256k1 group order)
+    /// Returns value in range [0, q-1]
+    /// Used by threshold signature scripts
+    /// Reference: Scala SBigInt.modQ
+    pub fn modQ(self: BigInt256) BigIntError!BigInt256 {
+        // PRECONDITION: GROUP_ORDER is positive
+        assert(!GROUP_ORDER.negative);
+        assert(!GROUP_ORDER.isZero());
+
+        var result = try self.mod(GROUP_ORDER);
+
+        // Handle negative remainders: convert to positive range
+        // Scala semantics: result should be in [0, q-1]
+        if (result.isNegative()) {
+            result = try result.add(GROUP_ORDER);
+        }
+
+        // POSTCONDITION: result is in range [0, q-1]
+        assert(!result.isNegative());
+        assert(result.compare(GROUP_ORDER) == .lt);
+        return result;
+    }
+
+    /// Add two values mod q (secp256k1 group order)
+    /// Returns (a + b) mod q in range [0, q-1]
+    /// Reference: Scala SBigInt.plusModQ
+    pub fn plusModQ(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // PRECONDITION: inputs are valid BigInt256
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
+        // Reduce inputs to [0, q-1] first to avoid overflow
+        const a_mod = try a.modQ();
+        const b_mod = try b.modQ();
+
+        // Now both are in [0, q-1], so sum is in [0, 2q-2]
+        // Since q is very close to 2^256, sum may still overflow signed BigInt256
+        // Use unsigned limb addition and compare with q
+        const sum_result = addLimbs(a_mod.limbs, b_mod.limbs);
+
+        if (sum_result.overflow) {
+            // Sum >= 2^256, definitely >= q, so subtract q
+            // sum - q = (sum - q) which fits since sum < 2q
+            const result_limbs = subLimbs(sum_result.limbs, GROUP_ORDER.limbs);
+            return BigInt256{ .limbs = result_limbs, .negative = false };
+        } else {
+            // No overflow, but may still be >= q
+            const result = BigInt256{ .limbs = sum_result.limbs, .negative = false };
+            if (compareMagnitude(result.limbs, GROUP_ORDER.limbs) != .lt) {
+                // result >= q, subtract q
+                const final_limbs = subLimbs(result.limbs, GROUP_ORDER.limbs);
+                return BigInt256{ .limbs = final_limbs, .negative = false };
+            }
+            return result;
+        }
+    }
+
+    /// Subtract two values mod q (secp256k1 group order)
+    /// Returns (a - b) mod q in range [0, q-1]
+    /// Reference: Scala SBigInt.minusModQ
+    pub fn minusModQ(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // PRECONDITION: inputs are valid BigInt256
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
+        // Reduce inputs to [0, q-1] first
+        const a_mod = try a.modQ();
+        const b_mod = try b.modQ();
+
+        // Compare magnitudes to determine sign
+        const cmp = compareMagnitude(a_mod.limbs, b_mod.limbs);
+
+        if (cmp == .eq) {
+            return zero;
+        } else if (cmp == .gt) {
+            // a_mod > b_mod, result is positive: a_mod - b_mod
+            const result_limbs = subLimbs(a_mod.limbs, b_mod.limbs);
+            return BigInt256{ .limbs = result_limbs, .negative = false };
+        } else {
+            // a_mod < b_mod, result would be negative: need to add q
+            // (a - b) mod q = q - (b - a) when a < b
+            const diff_limbs = subLimbs(b_mod.limbs, a_mod.limbs);
+            const neg_result = BigInt256{ .limbs = diff_limbs, .negative = false };
+            // q - diff
+            const result_limbs = subLimbs(GROUP_ORDER.limbs, neg_result.limbs);
+            return BigInt256{ .limbs = result_limbs, .negative = false };
+        }
+    }
+
+    /// Multiply two values mod q (secp256k1 group order)
+    /// Returns (a * b) mod q in range [0, q-1]
+    /// Reference: Scala SBigInt.multModQ (v3+ only)
+    pub fn multModQ(a: BigInt256, b: BigInt256) BigIntError!BigInt256 {
+        // PRECONDITION: inputs are valid BigInt256
+        assert(!a.isZero() or !a.negative);
+        assert(!b.isZero() or !b.negative);
+
+        // Reduce inputs first, then multiply, then reduce again
+        const a_mod = try a.modQ();
+        const b_mod = try b.modQ();
+
+        // For multiplication, we need to handle larger intermediate values
+        // Since both a_mod, b_mod < q < 2^256, product can be up to 2^512
+        // We use the full 8-limb multiplication result and reduce mod q
+        const product = try mulLimbsFull(a_mod.limbs, b_mod.limbs);
+
+        // Reduce 512-bit result mod q using Barrett reduction or repeated subtraction
+        // For correctness over speed, use repeated halving/subtraction
+        return reduceModQ512(product);
+    }
+
+    /// Full 8-limb multiplication (returns 512-bit result)
+    fn mulLimbsFull(a: [4]u64, b: [4]u64) BigIntError![8]u64 {
+        var result: [8]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        for (0..4) |i| {
+            var carry: u64 = 0;
+            for (0..4) |j| {
+                const prod: u128 = @as(u128, a[i]) * @as(u128, b[j]);
+                const sum: u128 = @as(u128, result[i + j]) + prod + @as(u128, carry);
+                result[i + j] = @truncate(sum);
+                carry = @truncate(sum >> 64);
+            }
+            result[i + 4] = carry;
+        }
+
+        return result;
+    }
+
+    /// Reduce 512-bit value mod q to 256-bit result
+    fn reduceModQ512(value: [8]u64) BigIntError!BigInt256 {
+        // Check if high limbs are all zero (fits in 256 bits)
+        if (value[4] == 0 and value[5] == 0 and value[6] == 0 and value[7] == 0) {
+            const result = BigInt256{ .limbs = .{ value[0], value[1], value[2], value[3] }, .negative = false };
+            return result.modQ();
+        }
+
+        // Use shift-and-subtract method for larger values
+        // This is not the fastest but is correct
+        var rem: [8]u64 = value;
+        const q_extended: [8]u64 = .{ GROUP_ORDER.limbs[0], GROUP_ORDER.limbs[1], GROUP_ORDER.limbs[2], GROUP_ORDER.limbs[3], 0, 0, 0, 0 };
+
+        // Find highest set bit in remainder
+        var highest_bit: i32 = 511;
+        while (highest_bit >= 256) : (highest_bit -= 1) {
+            const limb_idx: usize = @intCast(@divTrunc(highest_bit, 64));
+            const bit_idx: u6 = @intCast(@mod(highest_bit, 64));
+            if ((rem[limb_idx] >> bit_idx) & 1 != 0) break;
+        }
+
+        // Repeatedly subtract shifted q
+        while (highest_bit >= 256) {
+            const shift: u32 = @intCast(highest_bit - 255);
+            const q_shifted = shiftLeft512(q_extended, @intCast(shift));
+
+            if (compare512(rem, q_shifted) != .lt) {
+                rem = sub512(rem, q_shifted);
+            }
+
+            highest_bit -= 1;
+            // Recompute highest bit
+            while (highest_bit >= 256) : (highest_bit -= 1) {
+                const limb_idx: usize = @intCast(@divTrunc(highest_bit, 64));
+                const bit_idx: u6 = @intCast(@mod(highest_bit, 64));
+                if ((rem[limb_idx] >> bit_idx) & 1 != 0) break;
+            }
+        }
+
+        // Now result fits in 256 bits
+        const result = BigInt256{
+            .limbs = .{ rem[0], rem[1], rem[2], rem[3] },
+            .negative = false,
+        };
+        return result.modQ();
+    }
+
+    /// Shift 512-bit value left by n bits
+    fn shiftLeft512(a: [8]u64, n: u16) [8]u64 {
+        if (n == 0) return a;
+        if (n >= 512) return .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        var result: [8]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        const limb_shift = n / 64;
+        const bit_shift: u6 = @intCast(n % 64);
+
+        for (0..8) |i| {
+            if (i + limb_shift < 8) {
+                result[i + limb_shift] |= a[i] << bit_shift;
+                if (bit_shift > 0 and i + limb_shift + 1 < 8) {
+                    result[i + limb_shift + 1] |= a[i] >> @intCast(64 - @as(u7, bit_shift));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// Compare two 512-bit values
+    fn compare512(a: [8]u64, b: [8]u64) std.math.Order {
+        var i: usize = 8;
+        while (i > 0) {
+            i -= 1;
+            if (a[i] > b[i]) return .gt;
+            if (a[i] < b[i]) return .lt;
+        }
+        return .eq;
+    }
+
+    /// Subtract 512-bit values (a - b, assumes a >= b)
+    fn sub512(a: [8]u64, b: [8]u64) [8]u64 {
+        var result: [8]u64 = undefined;
+        var borrow: u64 = 0;
+
+        for (0..8) |i| {
+            const diff1 = @subWithOverflow(a[i], b[i]);
+            const diff2 = @subWithOverflow(diff1[0], borrow);
+            result[i] = diff2[0];
+            borrow = diff1[1] + diff2[1];
+        }
+
+        assert(borrow == 0);
+        return result;
+    }
+
+    // ========================================================================
     // Bitwise Operations (on magnitude)
     // ========================================================================
 
@@ -999,4 +1241,100 @@ test "bigint: modInverse negative value" {
         check = try check.add(m);
     }
     try std.testing.expect(check.eql(BigInt256.one));
+}
+
+// ============================================================================
+// ModQ Tests (secp256k1 group order)
+// ============================================================================
+
+test "bigint: GROUP_ORDER matches secp256k1 N" {
+    // Verify GROUP_ORDER constant matches expected hex value
+    // q = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    const q = BigInt256.GROUP_ORDER;
+
+    // Check it's positive and non-zero
+    try std.testing.expect(!q.negative);
+    try std.testing.expect(!q.isZero());
+
+    // Verify limb values match secp256k1.N
+    try std.testing.expectEqual(@as(u64, 0xBFD25E8CD0364141), q.limbs[0]);
+    try std.testing.expectEqual(@as(u64, 0xBAAEDCE6AF48A03B), q.limbs[1]);
+    try std.testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFE), q.limbs[2]);
+    try std.testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFF), q.limbs[3]);
+}
+
+test "bigint: modQ reduces value to [0, q-1]" {
+    // Small positive: unchanged
+    const small = BigInt256.fromInt(42);
+    const small_mod = try small.modQ();
+    try std.testing.expect(small_mod.eql(small));
+
+    // q mod q = 0
+    const q_mod = try BigInt256.GROUP_ORDER.modQ();
+    try std.testing.expect(q_mod.isZero());
+
+    // Negative value: normalized to positive range
+    const neg = BigInt256.fromInt(-1);
+    const neg_mod = try neg.modQ();
+    // -1 mod q = q - 1
+    const expected = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    try std.testing.expect(neg_mod.eql(expected));
+}
+
+test "bigint: plusModQ basic" {
+    const a = BigInt256.fromInt(100);
+    const b = BigInt256.fromInt(50);
+
+    const result = try a.plusModQ(b);
+    try std.testing.expect(result.eql(BigInt256.fromInt(150)));
+}
+
+test "bigint: plusModQ with wrap" {
+    // (q - 1) + 2 = q + 1 mod q = 1
+    const q_minus_1 = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    const two = BigInt256.fromInt(2);
+
+    const result = try q_minus_1.plusModQ(two);
+    try std.testing.expect(result.eql(BigInt256.one));
+}
+
+test "bigint: minusModQ basic" {
+    const a = BigInt256.fromInt(100);
+    const b = BigInt256.fromInt(30);
+
+    const result = try a.minusModQ(b);
+    try std.testing.expect(result.eql(BigInt256.fromInt(70)));
+}
+
+test "bigint: minusModQ with wrap to negative" {
+    // 1 - 2 = -1 mod q = q - 1
+    const one = BigInt256.one;
+    const two = BigInt256.fromInt(2);
+
+    const result = try one.minusModQ(two);
+    const expected = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    try std.testing.expect(result.eql(expected));
+}
+
+test "bigint: multModQ basic" {
+    const a = BigInt256.fromInt(6);
+    const b = BigInt256.fromInt(7);
+
+    const result = try a.multModQ(b);
+    try std.testing.expect(result.eql(BigInt256.fromInt(42)));
+}
+
+test "bigint: modQ result always in valid range" {
+    // Test various values
+    const test_cases = [_]i64{ 0, 1, -1, 100, -100, std.math.maxInt(i64), std.math.minInt(i64) };
+
+    for (test_cases) |v| {
+        const val = BigInt256.fromInt(v);
+        const result = try val.modQ();
+
+        // Result must be non-negative
+        try std.testing.expect(!result.isNegative());
+        // Result must be < q
+        try std.testing.expect(result.compare(BigInt256.GROUP_ORDER) == .lt);
+    }
 }
