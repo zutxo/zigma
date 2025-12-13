@@ -1499,3 +1499,163 @@ test "avl_tree: BatchAVLVerifier label-only node (pruned subtree)" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+// ============================================================================
+// Property Tests
+// ============================================================================
+
+test "avl_tree: property - label computation is deterministic" {
+    // Property: computeLabel(node, key_length) called twice produces identical results
+    const key_length: usize = 4;
+    const key = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const value = [_]u8{ 0xAA, 0xBB, 0xCC };
+    const next_key = [_]u8{ 0x05, 0x06, 0x07, 0x08 };
+
+    const leaf = AvlNode{
+        .leaf = .{
+            .key = &key,
+            .value = &value,
+            .next_leaf_key = &next_key,
+        },
+    };
+
+    // Compute label multiple times - must be identical
+    const label1 = leaf.computeLabel(key_length);
+    const label2 = leaf.computeLabel(key_length);
+    const label3 = leaf.computeLabel(key_length);
+
+    try std.testing.expectEqualSlices(u8, &label1, &label2);
+    try std.testing.expectEqualSlices(u8, &label2, &label3);
+
+    // Internal node determinism
+    var left_label: [hash_size]u8 = undefined;
+    var right_label: [hash_size]u8 = undefined;
+    @memset(&left_label, 0x11);
+    @memset(&right_label, 0x22);
+
+    const internal = AvlNode{
+        .internal = .{
+            .balance = 1,
+            .left_label = left_label,
+            .right_label = right_label,
+        },
+    };
+
+    const int_label1 = internal.computeLabel(key_length);
+    const int_label2 = internal.computeLabel(key_length);
+    try std.testing.expectEqualSlices(u8, &int_label1, &int_label2);
+}
+
+test "avl_tree: property - different keys produce different labels" {
+    // Property: distinct keys should (with overwhelming probability) produce distinct labels
+    const key_length: usize = 2;
+    const value = [_]u8{0xFF};
+    const next_key = [_]u8{ 0xFF, 0xFF };
+
+    const key1 = [_]u8{ 0x00, 0x01 };
+    const key2 = [_]u8{ 0x00, 0x02 };
+
+    const leaf1 = AvlNode{
+        .leaf = .{
+            .key = &key1,
+            .value = &value,
+            .next_leaf_key = &next_key,
+        },
+    };
+
+    const leaf2 = AvlNode{
+        .leaf = .{
+            .key = &key2,
+            .value = &value,
+            .next_leaf_key = &next_key,
+        },
+    };
+
+    const label1 = leaf1.computeLabel(key_length);
+    const label2 = leaf2.computeLabel(key_length);
+
+    // Labels must differ (collision probability is negligible for Blake2b)
+    var differs = false;
+    for (label1, 0..) |b, i| {
+        if (b != label2[i]) {
+            differs = true;
+            break;
+        }
+    }
+    try std.testing.expect(differs);
+}
+
+test "avl_tree: property - lookup consistency across reinit" {
+    // Property: reinitializing verifier with same inputs produces same lookup results
+    const backing_allocator = std.testing.allocator;
+    var arena1 = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena1.deinit();
+    var arena2 = std.heap.ArenaAllocator.init(backing_allocator);
+    defer arena2.deinit();
+
+    const key_length: usize = 1;
+
+    // Build a simple one-leaf tree proof
+    const key = [_]u8{0x42};
+    const value = [_]u8{ 0xDE, 0xAD };
+    const next_key = [_]u8{0xFF};
+
+    var proof_buf: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Leaf
+    proof_buf[pos] = ProofMarker.leaf;
+    pos += 1;
+    proof_buf[pos] = key[0];
+    pos += 1;
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 2;
+    pos += 2;
+    @memcpy(proof_buf[pos..][0..2], &value);
+    pos += 2;
+    proof_buf[pos] = next_key[0];
+    pos += 1;
+
+    // End
+    proof_buf[pos] = ProofMarker.end_of_tree;
+    pos += 1;
+
+    const proof = proof_buf[0..pos];
+
+    // Compute digest
+    const leaf = AvlNode{
+        .leaf = .{
+            .key = &key,
+            .value = &value,
+            .next_leaf_key = &next_key,
+        },
+    };
+    const root_hash = leaf.computeLabel(key_length);
+
+    var digest: [digest_size]u8 = undefined;
+    @memcpy(digest[0..hash_size], &root_hash);
+    digest[hash_size] = key_length;
+
+    // Two independent verifiers with same inputs
+    var verifier1 = try BatchAVLVerifier.init(digest, proof, key_length, null, &arena1);
+    var verifier2 = try BatchAVLVerifier.init(digest, proof, key_length, null, &arena2);
+
+    const result1 = try verifier1.lookup(&key);
+    const result2 = try verifier2.lookup(&key);
+
+    // Both should find the same value
+    switch (result1) {
+        .found => |v1| {
+            switch (result2) {
+                .found => |v2| try std.testing.expectEqualSlices(u8, v1, v2),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// Note: Balance value validation (rejecting values outside {-1, 0, 1})
+// is not currently implemented. Invalid balance values are accepted and
+// may cause incorrect tree structure. This could be addressed in a future
+// validation task.
