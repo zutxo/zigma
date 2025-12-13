@@ -3011,11 +3011,17 @@ pub const Evaluator = struct {
 
     /// Collection method IDs from Rust types/scoll.rs
     const CollMethodId = struct {
-        const zip: u8 = 29;
-        const indices: u8 = 14;
-        const reverse: u8 = 30;
-        const starts_with: u8 = 31;
-        const ends_with: u8 = 32;
+        const indices: u8 = 14; // coll.indices → Coll[Int]
+        const flatmap: u8 = 15; // coll.flatMap(f) → Coll[B]
+        const patch: u8 = 19; // coll.patch(from, patch, replaced) → Coll[A]
+        const updated: u8 = 20; // coll.updated(idx, value) → Coll[A]
+        const update_many: u8 = 21; // coll.updateMany(idxs, values) → Coll[A]
+        const index_of: u8 = 26; // coll.indexOf(elem, from) → Int
+        const zip: u8 = 29; // coll.zip(other) → Coll[(A, B)]
+        const reverse: u8 = 30; // coll.reverse → Coll[A]
+        const starts_with: u8 = 31; // coll.startsWith(other) → Boolean
+        const ends_with: u8 = 32; // coll.endsWith(other) → Boolean
+        const get: u8 = 33; // coll.get(idx) → Option[A]
     };
 
     /// AvlTree type code from Rust types/savltree.rs
@@ -3080,6 +3086,16 @@ pub const Evaluator = struct {
                 CollMethodId.zip => try self.computeZip(node_idx),
                 CollMethodId.indices => try self.computeIndices(),
                 CollMethodId.reverse => try self.computeReverse(),
+                CollMethodId.starts_with => try self.computeStartsWith(),
+                CollMethodId.ends_with => try self.computeEndsWith(),
+                // Complex methods that need more support
+                CollMethodId.flatmap,
+                CollMethodId.patch,
+                CollMethodId.updated,
+                CollMethodId.update_many,
+                CollMethodId.index_of,
+                CollMethodId.get,
+                => return self.handleUnsupported(),
                 else => return self.handleUnsupported(),
             }
         } else if (type_code == AvlTreeTypeCode) {
@@ -3215,6 +3231,63 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
         assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute startsWith: Coll[T].startsWith(Coll[T]) → Boolean
+    /// Returns true if this collection starts with the given prefix
+    fn computeStartsWith(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 2 values on stack (coll, prefix)
+        assert(self.value_sp >= 2);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order
+        const prefix_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        const result: bool = switch (coll_val) {
+            .coll_byte => |coll| switch (prefix_val) {
+                .coll_byte => |prefix| blk: {
+                    if (prefix.len > coll.len) break :blk false;
+                    break :blk std.mem.eql(u8, coll[0..prefix.len], prefix);
+                },
+                else => return error.TypeMismatch,
+            },
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(.{ .boolean = result });
+
+        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Compute endsWith: Coll[T].endsWith(Coll[T]) → Boolean
+    /// Returns true if this collection ends with the given suffix
+    fn computeEndsWith(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 2 values on stack (coll, suffix)
+        assert(self.value_sp >= 2);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order
+        const suffix_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        const result: bool = switch (coll_val) {
+            .coll_byte => |coll| switch (suffix_val) {
+                .coll_byte => |suffix| blk: {
+                    if (suffix.len > coll.len) break :blk false;
+                    const start = coll.len - suffix.len;
+                    break :blk std.mem.eql(u8, coll[start..], suffix);
+                },
+                else => return error.TypeMismatch,
+            },
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(.{ .boolean = result });
+
+        // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
+        assert(self.value_sp == initial_sp - 1);
     }
 
     // ========================================================================
