@@ -898,14 +898,19 @@ pub const Evaluator = struct {
                 const var_bytes = self.ctx.getVar(var_id);
 
                 if (var_bytes) |bytes| {
-                    // Variable exists - deserialize and check type
-                    // TODO: Full implementation should deserialize bytes and check type
-                    // For now, return Some with the expected type
-                    _ = bytes; // TODO: deserialize value and store in pool
+                    // Variable exists - deserialize according to expected type
+                    const value_idx = self.deserializeContextVar(bytes, expected_type_idx) catch {
+                        // Type mismatch or deserialization failure - return None
+                        try self.pushValue(.{ .option = .{
+                            .inner_type = expected_type_idx,
+                            .value_idx = null_value_idx,
+                        } });
+                        return;
+                    };
                     try self.pushValue(.{
                         .option = .{
                             .inner_type = expected_type_idx,
-                            .value_idx = 0, // TODO: store actual deserialized value
+                            .value_idx = value_idx,
                         },
                     });
                 } else {
@@ -3663,6 +3668,7 @@ pub const Evaluator = struct {
     ///   - input_idx is out of bounds
     ///   - extension_cache is not set
     ///   - variable is not set for that input
+    ///   - deserialized type doesn't match expected type T
     fn computeGetVarFromInput(self: *Evaluator, node: ExprNode) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 3); // context, input_idx, var_id on stack
@@ -3689,22 +3695,31 @@ pub const Evaluator = struct {
             else => return error.TypeMismatch,
         };
 
-        // Determine expected type from node (method_call doesn't carry type args currently)
-        // For now, use ANY as placeholder - proper implementation needs explicit type args
-        _ = node; // TODO: extract type arg from method_call when explicit type args are supported
-        const expected_type_idx: TypeIndex = TypePool.ANY;
+        // Get expected inner type T from node.result_type
+        // This was parsed from the explicit type arg during deserialization
+        const expected_type_idx: TypeIndex = node.result_type;
 
         // Look up the variable
         const var_bytes = self.ctx.getVarFromInput(input_idx, var_id);
 
         if (var_bytes) |bytes| {
-            // Variable exists - for now, treat as Some with placeholder value
-            // TODO: Deserialize bytes according to expected type when type args supported
-            _ = bytes;
+            // Variable exists - deserialize according to expected type
+            const value_idx = self.deserializeContextVar(bytes, expected_type_idx) catch {
+                // Type mismatch or deserialization failure - return None (per Rust semantics)
+                try self.pushValue(.{
+                    .option = .{
+                        .inner_type = expected_type_idx,
+                        .value_idx = null_value_idx,
+                    },
+                });
+                return;
+            };
+
+            // Return Some(value)
             try self.pushValue(.{
                 .option = .{
                     .inner_type = expected_type_idx,
-                    .value_idx = 0, // TODO: store actual deserialized value
+                    .value_idx = value_idx,
                 },
             });
         } else {
@@ -3719,6 +3734,49 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: One Option value on stack
         assert(self.value_sp > 0);
+    }
+
+    /// Deserialize a context variable from bytes and store in ValuePool.
+    /// Context extension data is serialized as Constant: type_code + value_data.
+    /// Returns the value index, or error if deserialization fails.
+    fn deserializeContextVar(self: *Evaluator, bytes: []const u8, expected_type_idx: TypeIndex) EvalError!u16 {
+        // Create a reader from the bytes
+        var reader = vlq.Reader.init(bytes);
+
+        // First, read the type code from the serialized Constant
+        const actual_type_idx = type_serializer.deserialize(
+            &self.pools.type_pool,
+            &reader,
+        ) catch {
+            return error.InvalidData;
+        };
+
+        // Verify the type matches the expected type
+        // For now, require exact match; later can add coercion support
+        if (actual_type_idx != expected_type_idx) {
+            return error.TypeMismatch;
+        }
+
+        // Deserialize the value according to its type
+        const value = data.deserialize(
+            actual_type_idx,
+            &self.pools.type_pool,
+            &reader,
+            &self.arena,
+            &self.pools.values,
+        ) catch |err| {
+            return switch (err) {
+                error.InvalidGroupElement => error.InvalidGroupElement,
+                error.TypeMismatch => error.TypeMismatch,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidData,
+            };
+        };
+
+        // Store the deserialized value in the pool
+        const value_idx = try self.storeValueInPool(value, actual_type_idx);
+
+        return value_idx;
     }
 
     // ========================================================================
@@ -7169,12 +7227,12 @@ test "evaluator: get_var returns Some when variable is set" {
 // ============================================================================
 
 test "evaluator: getVarFromInput returns None when cache not set" {
-    // CONTEXT.getVarFromInput(0, 5) when extension_cache is null returns None
+    // CONTEXT.getVarFromInput[Int](0, 5) when extension_cache is null returns None
     var tree = ExprTree.init();
 
-    // method_call: data = (method_id << 8) | type_code
+    // method_call: data = (method_id << 8) | type_code, result_type = T
     const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
-    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
     // Object: unit (placeholder for Context - we ignore it anyway)
     tree.nodes[1] = .{ .tag = .unit };
     // Arg1: input_idx = 0 (Short)
@@ -7204,7 +7262,7 @@ test "evaluator: getVarFromInput returns None when variable not in cache" {
     var tree = ExprTree.init();
 
     const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
-    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
     tree.nodes[1] = .{ .tag = .unit };
     tree.constants[0] = .{ .short = 0 };
     tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
@@ -7234,7 +7292,7 @@ test "evaluator: getVarFromInput returns Some when variable in cache" {
     var tree = ExprTree.init();
 
     const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
-    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
     tree.nodes[1] = .{ .tag = .unit };
     tree.constants[0] = .{ .short = 0 };
     tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
@@ -7245,7 +7303,7 @@ test "evaluator: getVarFromInput returns Some when variable in cache" {
 
     // Create extension cache and set the variable
     var cache = context.ContextExtensionCache.init();
-    const var_data = [_]u8{ 0x04, 0x54 }; // SInt 42
+    const var_data = [_]u8{ 0x04, 0x54 }; // SInt 42 (type_code 4 + ZigZag(42)=0x54)
     cache.set(.inputs, 0, 5, &var_data);
 
     const test_inputs = [_]context.BoxView{context.testBox()};
@@ -7266,7 +7324,7 @@ test "evaluator: getVarFromInput returns None for out-of-bounds input" {
     var tree = ExprTree.init();
 
     const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
-    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
     tree.nodes[1] = .{ .tag = .unit };
     // input_idx = 10 (out of bounds - only 1 input)
     tree.constants[0] = .{ .short = 10 };
@@ -7290,6 +7348,39 @@ test "evaluator: getVarFromInput returns None for out-of-bounds input" {
     const result = try eval.evaluate();
 
     // Should be None (input_idx out of bounds)
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+}
+
+test "evaluator: getVarFromInput returns None on type mismatch" {
+    // getVarFromInput[Long](0, 5) with SInt stored should return None
+    var tree = ExprTree.init();
+
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    // Request type T = Long (5), but stored value is Int (4)
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.LONG };
+    tree.nodes[1] = .{ .tag = .unit };
+    tree.constants[0] = .{ .short = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    var cache = context.ContextExtensionCache.init();
+    const var_data = [_]u8{ 0x04, 0x54 }; // SInt 42 (type_code 4 = Int, not Long)
+    cache.set(.inputs, 0, 5, &var_data);
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.extension_cache = &cache;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be None (type mismatch: requested Long but stored Int)
     try std.testing.expect(result == .option);
     try std.testing.expectEqual(null_value_idx, result.option.value_idx);
 }

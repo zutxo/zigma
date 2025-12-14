@@ -844,14 +844,39 @@ fn deserializeApply(
     }
 }
 
+/// Type codes for methods with explicit type arguments
+const ContextTypeCode: u8 = 101; // SContext
+const BoxTypeCode: u8 = 99; // SBox
+
+/// Method IDs that require explicit type arguments
+const ContextMethodId = struct {
+    const get_var_from_input: u8 = 12; // getVarFromInput[T](Short, Byte): Option[T]
+};
+const BoxMethodId = struct {
+    const get_reg: u8 = 7; // getReg[T](Int): Option[T]
+};
+
+/// Check if a method requires explicit type arguments
+fn methodNeedsExplicitTypeArg(type_code: u8, method_id: u8) bool {
+    // Context.getVarFromInput[T]
+    if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input) return true;
+    // Box.getReg[T]
+    if (type_code == BoxTypeCode and method_id == BoxMethodId.get_reg) return true;
+    return false;
+}
+
 fn deserializeMethodCall(
     tree: *ExprTree,
     reader: *vlq.Reader,
     arena: anytype,
     depth: u8,
 ) DeserializeError!void {
-    // MethodCall format: type_code (1 byte) + method_id (1 byte) + obj + args[]
+    // MethodCall format: type_code + method_id + obj + args[] + explicit_type_args[]
     // Reference: Rust ergotree-ir/src/serialization/method_call.rs
+    //
+    // For methods with explicit type args (like getVarFromInput[T]):
+    //   - Type args are serialized AFTER the arguments
+    //   - We store the inner type T in result_type for later use
 
     // PRECONDITIONS
     assert(depth < max_expr_depth);
@@ -872,7 +897,7 @@ fn deserializeMethodCall(
     const node_idx = try tree.addNode(.{
         .tag = .method_call,
         .data = data,
-        .result_type = TypePool.ANY, // Determined at runtime by method
+        .result_type = TypePool.ANY, // Will be updated if explicit type arg present
     });
 
     // POSTCONDITION: Node was added
@@ -893,8 +918,23 @@ fn deserializeMethodCall(
         try deserializeWithDepth(tree, reader, arena, depth + 1);
     }
 
-    // TODO: Handle explicit type args for generic methods if needed
-    // For now, assume no explicit type args (method_raw.explicit_type_args.len == 0)
+    // Parse explicit type arguments if method requires them
+    // For methods like getVarFromInput[T] and getReg[T], there's 1 type arg (T)
+    // We store T in result_type so evaluation can use it for deserialization
+    if (methodNeedsExplicitTypeArg(type_code, method_id)) {
+        const inner_type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+            return switch (e) {
+                error.InvalidTypeCode => error.InvalidTypeCode,
+                error.PoolFull => error.PoolFull,
+                error.NestingTooDeep => error.NestingTooDeep,
+                error.InvalidTupleLength => error.InvalidTupleLength,
+                else => error.InvalidData,
+            };
+        };
+        // Store inner type T in result_type
+        // The actual result type is Option[T], but we need T for deserialization
+        tree.nodes[node_idx].result_type = inner_type_idx;
+    }
 }
 
 /// Deserialize CreateAvlTree operation (opcode 0xB6/182)
