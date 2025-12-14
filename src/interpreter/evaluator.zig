@@ -2119,16 +2119,18 @@ pub const Evaluator = struct {
 
         // PRECONDITION: target_type is a valid numeric type
         assert(target_type == TypePool.SHORT or target_type == TypePool.INT or
-            target_type == TypePool.LONG or target_type == TypePool.BIG_INT);
+            target_type == TypePool.LONG or target_type == TypePool.BIG_INT or
+            target_type == TypePool.UNSIGNED_BIG_INT);
 
         try self.addCost(FixedCost.upcast);
 
         const input = try self.popValue();
 
         // INVARIANT: Input must be a numeric value
-        assert(input == .byte or input == .short or input == .int or input == .long);
+        assert(input == .byte or input == .short or input == .int or
+            input == .long or input == .big_int);
 
-        // Upcast conversions: Byte → Short → Int → Long → BigInt
+        // Upcast conversions: Byte → Short → Int → Long → BigInt → UnsignedBigInt
         const result: Value = switch (target_type) {
             // Target is Short
             TypePool.SHORT => switch (input) {
@@ -2188,6 +2190,66 @@ pub const Evaluator = struct {
                 }
                 break :blk .{ .big_int = bigint };
             },
+            // Target is UnsignedBigInt (v6+)
+            TypePool.UNSIGNED_BIG_INT => blk: {
+                // Convert numeric or BigInt to UnsignedBigInt
+                // Note: negative values from signed types become large unsigned values
+                var ubigint: data.Value.UnsignedBigInt = .{ .bytes = undefined, .len = 0 };
+                switch (input) {
+                    .byte => |v| {
+                        // Byte is signed, convert to unsigned representation
+                        if (v >= 0) {
+                            ubigint.bytes[0] = @intCast(v);
+                            ubigint.len = 1;
+                        } else {
+                            // Negative byte: sign-extend to 256-bit unsigned (wraps)
+                            return error.ArithmeticOverflow;
+                        }
+                    },
+                    .short => |v| {
+                        if (v >= 0) {
+                            const u: u16 = @intCast(v);
+                            if (u <= 0xFF) {
+                                ubigint.bytes[0] = @truncate(u);
+                                ubigint.len = 1;
+                            } else {
+                                ubigint.bytes[0] = @truncate(u >> 8);
+                                ubigint.bytes[1] = @truncate(u);
+                                ubigint.len = 2;
+                            }
+                        } else {
+                            return error.ArithmeticOverflow;
+                        }
+                    },
+                    .int => |v| {
+                        if (v >= 0) {
+                            const u: u32 = @intCast(v);
+                            ubigint.len = minimalUnsignedLen(u32, u);
+                            writeUnsignedBigEndian(u32, u, ubigint.bytes[0..ubigint.len]);
+                        } else {
+                            return error.ArithmeticOverflow;
+                        }
+                    },
+                    .long => |v| {
+                        if (v >= 0) {
+                            const u: u64 = @intCast(v);
+                            ubigint.len = minimalUnsignedLen(u64, u);
+                            writeUnsignedBigEndian(u64, u, ubigint.bytes[0..ubigint.len]);
+                        } else {
+                            return error.ArithmeticOverflow;
+                        }
+                    },
+                    .big_int => |v| {
+                        // BigInt → UnsignedBigInt: reject negative values
+                        if (v.isNegative()) return error.ArithmeticOverflow;
+                        // Copy bytes directly (already big-endian)
+                        @memcpy(ubigint.bytes[0..v.len], v.bytes[0..v.len]);
+                        ubigint.len = v.len;
+                    },
+                    else => return error.TypeMismatch,
+                }
+                break :blk .{ .unsigned_big_int = ubigint };
+            },
             else => return error.TypeMismatch,
         };
 
@@ -2206,7 +2268,7 @@ pub const Evaluator = struct {
 
         const input = try self.popValue();
 
-        // Downcast conversions: BigInt → Long → Int → Short → Byte
+        // Downcast conversions: UnsignedBigInt → BigInt → Long → Int → Short → Byte
         // May overflow - returns error.ArithmeticOverflow
         const result: Value = switch (target_type) {
             // Target is Byte
@@ -2223,6 +2285,16 @@ pub const Evaluator = struct {
                     if (v < -128 or v > 127) return error.ArithmeticOverflow;
                     break :blk .{ .byte = @truncate(v) };
                 },
+                .big_int => |v| blk: {
+                    const long_val = try bigIntToLong(v);
+                    if (long_val < -128 or long_val > 127) return error.ArithmeticOverflow;
+                    break :blk .{ .byte = @truncate(long_val) };
+                },
+                .unsigned_big_int => |v| blk: {
+                    const long_val = try unsignedBigIntToLong(v);
+                    if (long_val > 127) return error.ArithmeticOverflow;
+                    break :blk .{ .byte = @intCast(long_val) };
+                },
                 else => return error.TypeMismatch,
             },
             // Target is Short
@@ -2235,6 +2307,16 @@ pub const Evaluator = struct {
                     if (v < -32768 or v > 32767) return error.ArithmeticOverflow;
                     break :blk .{ .short = @truncate(v) };
                 },
+                .big_int => |v| blk: {
+                    const long_val = try bigIntToLong(v);
+                    if (long_val < -32768 or long_val > 32767) return error.ArithmeticOverflow;
+                    break :blk .{ .short = @truncate(long_val) };
+                },
+                .unsigned_big_int => |v| blk: {
+                    const long_val = try unsignedBigIntToLong(v);
+                    if (long_val > 32767) return error.ArithmeticOverflow;
+                    break :blk .{ .short = @intCast(long_val) };
+                },
                 else => return error.TypeMismatch,
             },
             // Target is Int
@@ -2243,26 +2325,42 @@ pub const Evaluator = struct {
                     if (v < std.math.minInt(i32) or v > std.math.maxInt(i32)) return error.ArithmeticOverflow;
                     break :blk .{ .int = @truncate(v) };
                 },
+                .big_int => |v| blk: {
+                    const long_val = try bigIntToLong(v);
+                    if (long_val < std.math.minInt(i32) or long_val > std.math.maxInt(i32)) return error.ArithmeticOverflow;
+                    break :blk .{ .int = @truncate(long_val) };
+                },
+                .unsigned_big_int => |v| blk: {
+                    const long_val = try unsignedBigIntToLong(v);
+                    if (long_val > std.math.maxInt(i32)) return error.ArithmeticOverflow;
+                    break :blk .{ .int = @intCast(long_val) };
+                },
                 else => return error.TypeMismatch,
             },
             // Target is Long
             TypePool.LONG => switch (input) {
                 .big_int => |v| blk: {
-                    // Check if BigInt fits in i64
-                    if (v.len > 8) return error.ArithmeticOverflow;
-                    // Convert big-endian bytes to i64
-                    var u: u64 = 0;
-                    for (v.bytes[0..v.len]) |b| {
-                        u = (u << 8) | b;
+                    break :blk .{ .long = try bigIntToLong(v) };
+                },
+                .unsigned_big_int => |v| blk: {
+                    const uval = try unsignedBigIntToLong(v);
+                    // Check if fits in signed i64
+                    if (uval > @as(u64, @intCast(std.math.maxInt(i64)))) return error.ArithmeticOverflow;
+                    break :blk .{ .long = @intCast(uval) };
+                },
+                else => return error.TypeMismatch,
+            },
+            // Target is BigInt (v6+: downcast from UnsignedBigInt)
+            TypePool.BIG_INT => switch (input) {
+                .unsigned_big_int => |v| blk: {
+                    // Check MSB - if set, value is too large for signed BigInt
+                    if (v.len > 0 and (v.bytes[0] & 0x80) != 0) {
+                        // Value has high bit set, check if it needs sign byte
+                        if (v.len >= 32) return error.ArithmeticOverflow;
                     }
-                    // Sign extend if negative
-                    if (v.isNegative()) {
-                        // Extend sign bits
-                        const shift: u6 = @intCast(64 - (v.len * 8));
-                        const signed: i64 = @bitCast(u << shift);
-                        break :blk .{ .long = signed >> shift };
-                    }
-                    break :blk .{ .long = @bitCast(u) };
+                    var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = v.len };
+                    @memcpy(bigint.bytes[0..v.len], v.bytes[0..v.len]);
+                    break :blk .{ .big_int = bigint };
                 },
                 else => return error.TypeMismatch,
             },
@@ -4751,6 +4849,52 @@ fn compareInts(left: Value, right: Value) EvalError!i2 {
     return 0;
 }
 
+/// Calculate minimal byte length for unsigned integer
+fn minimalUnsignedLen(comptime T: type, value: T) u8 {
+    if (value == 0) return 1;
+    const bits = @typeInfo(T).int.bits;
+    const leading = @clz(value);
+    const significant_bits = bits - leading;
+    return @intCast((significant_bits + 7) / 8);
+}
+
+/// Write unsigned integer as big-endian bytes
+fn writeUnsignedBigEndian(comptime T: type, value: T, buf: []u8) void {
+    const bits = @typeInfo(T).int.bits;
+    const bytes = bits / 8;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        const shift: std.math.Log2Int(T) = @intCast((bytes - (bytes - buf.len) - i - 1) * 8);
+        buf[i] = @truncate(value >> shift);
+    }
+}
+
+/// Convert BigInt to i64 (overflow if doesn't fit)
+fn bigIntToLong(v: Value.BigInt) EvalError!i64 {
+    if (v.len > 8) return error.ArithmeticOverflow;
+    var u: u64 = 0;
+    for (v.bytes[0..v.len]) |b| {
+        u = (u << 8) | b;
+    }
+    // Sign extend if negative
+    if (v.isNegative()) {
+        const shift: u6 = @intCast(64 - (v.len * 8));
+        const signed: i64 = @bitCast(u << shift);
+        return signed >> shift;
+    }
+    return @bitCast(u);
+}
+
+/// Convert UnsignedBigInt to u64 (overflow if doesn't fit)
+fn unsignedBigIntToLong(v: Value.UnsignedBigInt) EvalError!u64 {
+    if (v.len > 8) return error.ArithmeticOverflow;
+    var u: u64 = 0;
+    for (v.bytes[0..v.len]) |b| {
+        u = (u << 8) | b;
+    }
+    return u;
+}
+
 /// Extract integer value from Value
 fn extractInt(v: Value) EvalError!i64 {
     return switch (v) {
@@ -6935,4 +7079,85 @@ test "evaluator: get_var returns Some when variable is set" {
     // Should be Some (value_idx != null_value_idx)
     try std.testing.expect(result == .option);
     try std.testing.expect(result.option.value_idx != null_value_idx);
+}
+
+// ============================================================================
+// Upcast/Downcast Tests
+// ============================================================================
+
+test "upcast: long to unsigned_big_int" {
+    // Test upcast from long to unsigned_big_int
+    const long_val: Value = .{ .long = 12345 };
+
+    // Simulate the upcast manually using helper functions
+    var ubigint: data.Value.UnsignedBigInt = .{ .bytes = undefined, .len = 0 };
+    const u: u64 = @intCast(long_val.long);
+    ubigint.len = minimalUnsignedLen(u64, u);
+    writeUnsignedBigEndian(u64, u, ubigint.bytes[0..ubigint.len]);
+
+    const result: Value = .{ .unsigned_big_int = ubigint };
+    try std.testing.expect(result == .unsigned_big_int);
+    try std.testing.expectEqual(@as(u8, 2), result.unsigned_big_int.len); // 12345 = 0x3039
+}
+
+test "upcast: big_int to unsigned_big_int" {
+    // Test upcast from positive big_int to unsigned_big_int
+    var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 2 };
+    bigint.bytes[0] = 0x12;
+    bigint.bytes[1] = 0x34;
+
+    // Simulate the upcast (positive BigInt → UnsignedBigInt)
+    try std.testing.expect(!bigint.isNegative());
+    var ubigint: data.Value.UnsignedBigInt = .{ .bytes = undefined, .len = bigint.len };
+    @memcpy(ubigint.bytes[0..bigint.len], bigint.bytes[0..bigint.len]);
+
+    try std.testing.expectEqual(@as(u8, 2), ubigint.len);
+    try std.testing.expectEqual(@as(u8, 0x12), ubigint.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0x34), ubigint.bytes[1]);
+}
+
+test "downcast: unsigned_big_int to long" {
+    // Test downcast from unsigned_big_int that fits in i64
+    var ubigint: data.Value.UnsignedBigInt = .{ .bytes = undefined, .len = 2 };
+    ubigint.bytes[0] = 0x30;
+    ubigint.bytes[1] = 0x39; // 0x3039 = 12345
+
+    const u = try unsignedBigIntToLong(ubigint);
+    try std.testing.expectEqual(@as(u64, 12345), u);
+}
+
+test "downcast: unsigned_big_int to long overflow" {
+    // Test downcast from unsigned_big_int that's too large for u64
+    var ubigint: data.Value.UnsignedBigInt = .{ .bytes = undefined, .len = 9 };
+    @memset(&ubigint.bytes, 0xFF);
+
+    const result = unsignedBigIntToLong(ubigint);
+    try std.testing.expectError(error.ArithmeticOverflow, result);
+}
+
+test "bigIntToLong: positive value" {
+    var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 2 };
+    bigint.bytes[0] = 0x30;
+    bigint.bytes[1] = 0x39; // 0x3039 = 12345
+
+    const result = try bigIntToLong(bigint);
+    try std.testing.expectEqual(@as(i64, 12345), result);
+}
+
+test "bigIntToLong: negative value" {
+    var bigint: data.Value.BigInt = .{ .bytes = undefined, .len = 1 };
+    bigint.bytes[0] = 0xFF; // -1 in two's complement
+
+    const result = try bigIntToLong(bigint);
+    try std.testing.expectEqual(@as(i64, -1), result);
+}
+
+test "minimalUnsignedLen: various values" {
+    try std.testing.expectEqual(@as(u8, 1), minimalUnsignedLen(u32, 0));
+    try std.testing.expectEqual(@as(u8, 1), minimalUnsignedLen(u32, 1));
+    try std.testing.expectEqual(@as(u8, 1), minimalUnsignedLen(u32, 255));
+    try std.testing.expectEqual(@as(u8, 2), minimalUnsignedLen(u32, 256));
+    try std.testing.expectEqual(@as(u8, 2), minimalUnsignedLen(u32, 12345));
+    try std.testing.expectEqual(@as(u8, 4), minimalUnsignedLen(u32, 0xFFFFFFFF));
+    try std.testing.expectEqual(@as(u8, 8), minimalUnsignedLen(u64, 0xFFFFFFFFFFFFFFFF));
 }
