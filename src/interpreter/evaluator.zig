@@ -7386,6 +7386,213 @@ test "evaluator: getVarFromInput returns None on type mismatch" {
 }
 
 // ============================================================================
+// Property Tests for Context Variable Type Checking
+// ============================================================================
+
+test "evaluator: property - getVarFromInput[T] with T value returns Some" {
+    // Property: forall T, v:T. store(v:T) => getVarFromInput[T](...) = Some(v')
+    // Test with multiple primitive types to verify the property holds across types
+    const TestCase = struct {
+        type_idx: u8,
+        type_code: u8,
+        encoded_value: []const u8,
+    };
+
+    const test_cases = [_]TestCase{
+        // Boolean true: type_code=1, value=1
+        .{ .type_idx = types.TypePool.BOOLEAN, .type_code = 0x01, .encoded_value = &[_]u8{ 0x01, 0x01 } },
+        // Byte 42: type_code=2, value=42
+        .{ .type_idx = types.TypePool.BYTE, .type_code = 0x02, .encoded_value = &[_]u8{ 0x02, 42 } },
+        // Short 1000: type_code=3, ZigZag(1000)=2000=0xD0,0x0F
+        .{ .type_idx = types.TypePool.SHORT, .type_code = 0x03, .encoded_value = &[_]u8{ 0x03, 0xD0, 0x0F } },
+        // Int 42: type_code=4, ZigZag(42)=84=0x54
+        .{ .type_idx = types.TypePool.INT, .type_code = 0x04, .encoded_value = &[_]u8{ 0x04, 0x54 } },
+        // Long 100: type_code=5, ZigZag(100)=200=0xC8,0x01
+        .{ .type_idx = types.TypePool.LONG, .type_code = 0x05, .encoded_value = &[_]u8{ 0x05, 0xC8, 0x01 } },
+    };
+
+    for (test_cases) |tc| {
+        var tree = ExprTree.init();
+
+        const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+        tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = tc.type_idx };
+        tree.nodes[1] = .{ .tag = .unit };
+        tree.constants[0] = .{ .short = 0 };
+        tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+        tree.constants[1] = .{ .byte = 7 }; // var_id = 7
+        tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+        tree.constant_count = 2;
+        tree.node_count = 4;
+
+        var cache = context.ContextExtensionCache.init();
+        cache.set(.inputs, 0, 7, tc.encoded_value);
+
+        const test_inputs = [_]context.BoxView{context.testBox()};
+        var ctx = Context.forHeight(100, &test_inputs);
+        ctx.extension_cache = &cache;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+
+        const result = try eval.evaluate();
+
+        // Property: Same type T stored and requested => Some(value)
+        try std.testing.expect(result == .option);
+        try std.testing.expect(result.option.value_idx != null_value_idx);
+        try std.testing.expectEqual(tc.type_idx, result.option.inner_type);
+    }
+}
+
+test "evaluator: property - getVarFromInput[T] with U!=T value returns None" {
+    // Property: forall T, U where T != U, v:U. store(v:U) => getVarFromInput[T](...) = None
+    // Each type pair (request, stored) should return None when they differ
+    const TypePair = struct {
+        request_type: u8,
+        stored_type_code: u8,
+        stored_value: []const u8,
+    };
+
+    const test_pairs = [_]TypePair{
+        // Request Boolean, store Int
+        .{ .request_type = types.TypePool.BOOLEAN, .stored_type_code = 0x04, .stored_value = &[_]u8{ 0x04, 0x54 } },
+        // Request Int, store Long
+        .{ .request_type = types.TypePool.INT, .stored_type_code = 0x05, .stored_value = &[_]u8{ 0x05, 0xC8, 0x01 } },
+        // Request Long, store Byte
+        .{ .request_type = types.TypePool.LONG, .stored_type_code = 0x02, .stored_value = &[_]u8{ 0x02, 42 } },
+        // Request Byte, store Boolean
+        .{ .request_type = types.TypePool.BYTE, .stored_type_code = 0x01, .stored_value = &[_]u8{ 0x01, 0x01 } },
+        // Request Short, store Int
+        .{ .request_type = types.TypePool.SHORT, .stored_type_code = 0x04, .stored_value = &[_]u8{ 0x04, 0x00 } },
+    };
+
+    for (test_pairs) |pair| {
+        var tree = ExprTree.init();
+
+        const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+        tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = pair.request_type };
+        tree.nodes[1] = .{ .tag = .unit };
+        tree.constants[0] = .{ .short = 0 };
+        tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+        tree.constants[1] = .{ .byte = 3 }; // var_id = 3
+        tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+        tree.constant_count = 2;
+        tree.node_count = 4;
+
+        var cache = context.ContextExtensionCache.init();
+        cache.set(.inputs, 0, 3, pair.stored_value);
+
+        const test_inputs = [_]context.BoxView{context.testBox()};
+        var ctx = Context.forHeight(100, &test_inputs);
+        ctx.extension_cache = &cache;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+
+        const result = try eval.evaluate();
+
+        // Property: Different types T != U => None
+        try std.testing.expect(result == .option);
+        try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+    }
+}
+
+test "evaluator: property - GetVar and getVarFromInput[T] equivalent for SELF" {
+    // Property: GetVar(id) ≡ getVarFromInput[T](self_index, id) for SELF's variables
+    // Both should return the same result when accessing SELF's context extension
+
+    // Test data: Int 42
+    const var_data = [_]u8{ 0x04, 0x54 };
+    const var_id: u8 = 10;
+
+    // === Test GetVar ===
+    var tree1 = ExprTree.init();
+    // get_var node: data = (type_idx << 8) | var_id
+    tree1.nodes[0] = .{ .tag = .get_var, .data = (types.TypePool.INT << 8) | var_id };
+    tree1.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx1 = Context.forHeight(100, &test_inputs);
+    ctx1.context_vars[var_id] = &var_data;
+
+    var eval1 = Evaluator.init(&tree1, &ctx1);
+    eval1.cost_limit = 10000;
+    const result1 = try eval1.evaluate();
+
+    // === Test getVarFromInput ===
+    var tree2 = ExprTree.init();
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree2.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
+    tree2.nodes[1] = .{ .tag = .unit };
+    tree2.constants[0] = .{ .short = 0 }; // input_idx = 0 (SELF)
+    tree2.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree2.constants[1] = .{ .byte = var_id };
+    tree2.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree2.constant_count = 2;
+    tree2.node_count = 4;
+
+    var cache = context.ContextExtensionCache.init();
+    cache.set(.inputs, 0, var_id, &var_data); // Same data in extension cache
+
+    var ctx2 = Context.forHeight(100, &test_inputs);
+    ctx2.extension_cache = &cache;
+
+    var eval2 = Evaluator.init(&tree2, &ctx2);
+    eval2.cost_limit = 10000;
+    const result2 = try eval2.evaluate();
+
+    // Property: Both return Some with matching inner_type
+    try std.testing.expect(result1 == .option);
+    try std.testing.expect(result2 == .option);
+    try std.testing.expect(result1.option.value_idx != null_value_idx);
+    try std.testing.expect(result2.option.value_idx != null_value_idx);
+    try std.testing.expectEqual(result1.option.inner_type, result2.option.inner_type);
+}
+
+test "evaluator: property - missing variable returns None regardless of type" {
+    // Property: forall T. getVarFromInput[T](idx, missing_var_id) = None
+    // The type T should not affect the result when variable doesn't exist
+
+    const type_indices = [_]u8{
+        types.TypePool.BOOLEAN,
+        types.TypePool.BYTE,
+        types.TypePool.SHORT,
+        types.TypePool.INT,
+        types.TypePool.LONG,
+    };
+
+    for (type_indices) |type_idx| {
+        var tree = ExprTree.init();
+
+        const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+        tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = type_idx };
+        tree.nodes[1] = .{ .tag = .unit };
+        tree.constants[0] = .{ .short = 0 };
+        tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+        tree.constants[1] = .{ .byte = 99 }; // var_id = 99 (not set)
+        tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+        tree.constant_count = 2;
+        tree.node_count = 4;
+
+        var cache = context.ContextExtensionCache.init();
+        // Don't set var_id 99
+
+        const test_inputs = [_]context.BoxView{context.testBox()};
+        var ctx = Context.forHeight(100, &test_inputs);
+        ctx.extension_cache = &cache;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+
+        const result = try eval.evaluate();
+
+        // Property: Missing variable => None, for any type T
+        try std.testing.expect(result == .option);
+        try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+        try std.testing.expectEqual(type_idx, result.option.inner_type);
+    }
+}
+
+// ============================================================================
 // Upcast/Downcast Tests
 // ============================================================================
 
