@@ -457,6 +457,37 @@ comptime {
     assert(AvlTreeCost.lookup.cost(0) == 40);
 }
 
+/// Per-operation PerItemCost configurations for hash operations (JIT/v2).
+/// Source: sigmastate LanguageSpecificationV5.scala test vectors
+/// CalcBlake2b256: PerItemCost(JitCost(20), JitCost(7), 128)
+/// CalcSha256: PerItemCost(JitCost(80), JitCost(8), 64)
+const HashCost = struct {
+    // Blake2b256: base 20, per chunk 7, chunk size 128 bytes
+    pub const blake2b256 = PerItemCost{ .base_cost = 20, .per_chunk_cost = 7, .chunk_size = 128 };
+
+    // SHA256: base 80, per chunk 8, chunk size 64 bytes
+    pub const sha256 = PerItemCost{ .base_cost = 80, .per_chunk_cost = 8, .chunk_size = 64 };
+};
+
+// Compile-time tests for HashCost
+comptime {
+    // Blake2b256 empty: base cost only = 20
+    assert(HashCost.blake2b256.cost(0) == 20);
+    // Blake2b256 128 bytes: 1 chunk = 20 + 7 = 27
+    assert(HashCost.blake2b256.cost(128) == 20 + 7);
+    // Blake2b256 129 bytes: 2 chunks = 20 + 14 = 34
+    assert(HashCost.blake2b256.cost(129) == 20 + 14);
+    // Blake2b256 256 bytes: 2 chunks = 20 + 14 = 34
+    assert(HashCost.blake2b256.cost(256) == 20 + 14);
+
+    // SHA256 empty: base cost only = 80
+    assert(HashCost.sha256.cost(0) == 80);
+    // SHA256 64 bytes: 1 chunk = 80 + 8 = 88
+    assert(HashCost.sha256.cost(64) == 80 + 8);
+    // SHA256 65 bytes: 2 chunks = 80 + 16 = 96
+    assert(HashCost.sha256.cost(65) == 80 + 16);
+}
+
 // ============================================================================
 // Evaluator
 // ============================================================================
@@ -1476,12 +1507,14 @@ pub const Evaluator = struct {
 
         const input_data = input.coll_byte;
 
-        // Add cost: base + per-byte
-        const base_cost: u32 = switch (algo) {
-            .blake2b256 => FixedCost.blake2b256_base,
-            .sha256 => FixedCost.sha256_base,
+        // Chunk-based cost: PerItemCost(base, perChunk, chunkSize)
+        // Blake2b256: PerItemCost(20, 7, 128) - per 128-byte block
+        // SHA256: PerItemCost(80, 8, 64) - per 64-byte block
+        const cost: u32 = switch (algo) {
+            .blake2b256 => HashCost.blake2b256.cost(@truncate(input_data.len)),
+            .sha256 => HashCost.sha256.cost(@truncate(input_data.len)),
         };
-        try self.addCost(base_cost + @as(u32, @truncate(input_data.len)) * FixedCost.hash_per_byte);
+        try self.addCost(cost);
 
         // Compute hash and store inline (no arena allocation needed)
         const hash_result: [32]u8 = switch (algo) {
@@ -5718,6 +5751,169 @@ test "evaluator: hash type mismatch" {
 
     var eval = Evaluator.init(&tree, &ctx);
     try std.testing.expectError(error.TypeMismatch, eval.evaluate());
+}
+
+// ============================================================================
+// PerItemCost Model Tests
+// ============================================================================
+
+test "evaluator: blake2b256 cost scales with input size (PerItemCost)" {
+    // Verify Blake2b256 uses PerItemCost(20, 7, 128) chunk-based costing
+    // Formula: nChunks = (nItems - 1) / chunkSize + 1; total = baseCost + perChunkCost * nChunks
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+    const const_cost: u64 = 5; // FixedCost.constant = 5
+
+    // Test 1: Empty input - base cost only = 20
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        tree.values[0] = .{ .coll_byte = "" };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // Empty: base 20 + constant cost (5)
+        try std.testing.expectEqual(@as(u64, 20 + const_cost), eval.cost_used);
+    }
+
+    // Test 2: 128 bytes - 1 chunk = 20 + 7 = 27
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        const data_128 = [_]u8{0} ** 128;
+        tree.values[0] = .{ .coll_byte = &data_128 };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // 128 bytes: 1 chunk = 20 + 7 = 27, plus constant cost 5
+        try std.testing.expectEqual(@as(u64, 27 + const_cost), eval.cost_used);
+    }
+
+    // Test 3: 129 bytes - 2 chunks = 20 + 14 = 34
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_blake2b256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        const data_129 = [_]u8{0} ** 129;
+        tree.values[0] = .{ .coll_byte = &data_129 };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // 129 bytes: 2 chunks = 20 + 14 = 34, plus constant cost 5
+        try std.testing.expectEqual(@as(u64, 34 + const_cost), eval.cost_used);
+    }
+}
+
+test "evaluator: sha256 cost scales with input size (PerItemCost)" {
+    // Verify SHA256 uses PerItemCost(80, 8, 64) chunk-based costing
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+    const const_cost: u64 = 5; // FixedCost.constant = 5
+
+    // Test 1: Empty input - base cost only = 80
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_sha256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        tree.values[0] = .{ .coll_byte = "" };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // Empty: base 80 + constant cost (5)
+        try std.testing.expectEqual(@as(u64, 80 + const_cost), eval.cost_used);
+    }
+
+    // Test 2: 64 bytes - 1 chunk = 80 + 8 = 88
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_sha256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        const data_64 = [_]u8{0} ** 64;
+        tree.values[0] = .{ .coll_byte = &data_64 };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // 64 bytes: 1 chunk = 80 + 8 = 88, plus constant cost 5
+        try std.testing.expectEqual(@as(u64, 88 + const_cost), eval.cost_used);
+    }
+
+    // Test 3: 65 bytes - 2 chunks = 80 + 16 = 96
+    {
+        var tree = ExprTree.init();
+        tree.nodes[0] = .{ .tag = .calc_sha256 };
+        tree.nodes[1] = .{ .tag = .constant, .data = 0 };
+        tree.node_count = 2;
+        const data_65 = [_]u8{0} ** 65;
+        tree.values[0] = .{ .coll_byte = &data_65 };
+        tree.value_count = 1;
+
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+
+        // 65 bytes: 2 chunks = 80 + 16 = 96, plus constant cost 5
+        try std.testing.expectEqual(@as(u64, 96 + const_cost), eval.cost_used);
+    }
+}
+
+test "evaluator: hash cost comparison empty vs large" {
+    // Property: Larger inputs should cost more than empty inputs
+    const inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &inputs);
+
+    // Blake2b256 with empty input
+    var tree_empty = ExprTree.init();
+    tree_empty.nodes[0] = .{ .tag = .calc_blake2b256 };
+    tree_empty.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree_empty.node_count = 2;
+    tree_empty.values[0] = .{ .coll_byte = "" };
+    tree_empty.value_count = 1;
+
+    var eval_empty = Evaluator.init(&tree_empty, &ctx);
+    eval_empty.cost_limit = 10000;
+    _ = try eval_empty.evaluate();
+
+    // Blake2b256 with 1KB input (1024 bytes = 8 chunks)
+    var tree_large = ExprTree.init();
+    tree_large.nodes[0] = .{ .tag = .calc_blake2b256 };
+    tree_large.nodes[1] = .{ .tag = .constant, .data = 0 };
+    tree_large.node_count = 2;
+    const data_1k = [_]u8{0} ** 1024;
+    tree_large.values[0] = .{ .coll_byte = &data_1k };
+    tree_large.value_count = 1;
+
+    var eval_large = Evaluator.init(&tree_large, &ctx);
+    eval_large.cost_limit = 10000;
+    _ = try eval_large.evaluate();
+
+    // Property: Large input should cost more than empty
+    try std.testing.expect(eval_large.cost_used > eval_empty.cost_used);
+
+    // Verify chunk calculation: 1024 bytes / 128 chunk_size = 8 chunks
+    // Cost = 20 + 7*8 = 76, plus constant 5 = 81
+    try std.testing.expectEqual(@as(u64, 76 + 5), eval_large.cost_used);
 }
 
 test "evaluator: val_use undefined variable" {
