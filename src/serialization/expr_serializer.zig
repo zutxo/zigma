@@ -171,6 +171,11 @@ pub const ExprTag = enum(u8) {
     /// data: low 4 bits = register_id (0-9), rest = type_idx for inner type
     extract_register_as,
 
+    // Context variable access (opcode 0xE3 / 227)
+    /// GetVar: access context extension variable (opcode 0xE3/227) - varId, type → Option[T]
+    /// data: low 8 bits = var_id, high 8 bits = type_idx for expected type
+    get_var,
+
     // Modular arithmetic mod secp256k1 group order (opcodes 0xE7-0xE9 / 231-233)
     /// ModQ: reduce BigInt mod q (opcode 0xE7/231) - BigInt → BigInt
     mod_q,
@@ -527,6 +532,8 @@ fn deserializeWithDepth(
             opcodes.AvlTreeGet => try deserializeTreeLookup(tree, reader, arena, depth),
             // Box extraction operations
             opcodes.ExtractRegisterAs => try deserializeExtractRegisterAs(tree, reader, arena, depth),
+            // Context variable access
+            opcodes.GetVar => try deserializeGetVar(tree, reader, depth),
             // Modular arithmetic mod secp256k1 group order
             opcodes.ModQ => try deserializeUnaryOp(tree, reader, arena, .mod_q, depth),
             opcodes.PlusModQ => try deserializeBinaryModQOp(tree, reader, arena, .plus_mod_q, depth),
@@ -1096,6 +1103,42 @@ fn deserializeExtractRegisterAs(
 
     // POSTCONDITION: Node has valid data
     assert(tree.nodes[node_idx].tag == .extract_register_as);
+}
+
+/// Deserialize GetVar (opcode 0xE3 / 227)
+/// Serialization format: var_id (u8) + var_tpe (type)
+/// Returns Option[T] where T is the expected type
+fn deserializeGetVar(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    depth: u8,
+) DeserializeError!void {
+    _ = depth; // GetVar is a leaf node, no recursion needed
+
+    // Read var_id (1 byte)
+    const var_id = reader.readByte() catch |e| return mapVlqError(e);
+
+    // Read expected type
+    const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            else => error.InvalidData,
+        };
+    };
+
+    // Pack var_id (8 bits) and type_idx (8 bits) into data field
+    // data = (type_idx << 8) | var_id
+    const data: u16 = (@as(u16, type_idx) << 8) | @as(u16, var_id);
+
+    // Add the get_var node
+    _ = try tree.addNode(.{
+        .tag = .get_var,
+        .data = data,
+        .result_type = TypePool.ANY, // Returns Option[T], resolved at runtime
+    });
 }
 
 fn deserializeTuple(

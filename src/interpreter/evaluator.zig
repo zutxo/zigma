@@ -882,6 +882,37 @@ pub const Evaluator = struct {
                 try self.pushValue(.{ .coll_byte = &state_root });
             },
 
+            .get_var => {
+                // GetVar: access context extension variable by ID
+                // node.data: (type_idx << 8) | var_id
+                try self.addCost(100); // GetVar cost from opcodes.zig
+
+                const var_id: u8 = @truncate(node.data & 0xFF);
+                const expected_type_idx: u8 = @truncate(node.data >> 8);
+
+                // Look up the context variable
+                const var_bytes = self.ctx.getVar(var_id);
+
+                if (var_bytes) |bytes| {
+                    // Variable exists - deserialize and check type
+                    // TODO: Full implementation should deserialize bytes and check type
+                    // For now, return Some with the expected type
+                    _ = bytes; // TODO: deserialize value and store in pool
+                    try self.pushValue(.{
+                        .option = .{
+                            .inner_type = expected_type_idx,
+                            .value_idx = 0, // TODO: store actual deserialized value
+                        },
+                    });
+                } else {
+                    // Variable not found - return None
+                    try self.pushValue(.{ .option = .{
+                        .inner_type = expected_type_idx,
+                        .value_idx = null_value_idx,
+                    } });
+                }
+            },
+
             .calc_blake2b256, .calc_sha256 => {
                 // Unary hash operations: push compute phase, then push operand
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
@@ -4617,7 +4648,7 @@ pub const Evaluator = struct {
 
         return switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator => 0,
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var => 0,
 
             // Unary operations (1 child)
             .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion => 1,
@@ -6690,4 +6721,56 @@ test "evaluator: property - empty startsWith empty is true" {
 
     const result = try eval.evaluate();
     try std.testing.expectEqual(Value{ .boolean = true }, result);
+}
+
+// ============================================================================
+// GetVar Tests
+// ============================================================================
+
+test "evaluator: get_var returns None when variable not set" {
+    // GetVar(42) when context_vars[42] is null should return None
+    var tree = ExprTree.init();
+
+    // get_var node: var_id=42, expected_type_idx=INT (4)
+    // data = (type_idx << 8) | var_id = (4 << 8) | 42 = 0x042A
+    tree.nodes[0] = .{ .tag = .get_var, .data = (types.TypePool.INT << 8) | 42 };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+    // context_vars[42] is null by default
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be None (value_idx = null_value_idx)
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+}
+
+test "evaluator: get_var returns Some when variable is set" {
+    // GetVar(5) when context_vars[5] has data should return Some
+    var tree = ExprTree.init();
+
+    // get_var node: var_id=5, expected_type_idx=INT (4)
+    tree.nodes[0] = .{ .tag = .get_var, .data = (types.TypePool.INT << 8) | 5 };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    // Set context variable 5 to some bytes
+    const var_data = [_]u8{ 0x04, 0x54 }; // SInt constant 42
+    ctx.context_vars[5] = &var_data;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be Some (value_idx != null_value_idx)
+    try std.testing.expect(result == .option);
+    try std.testing.expect(result.option.value_idx != null_value_idx);
 }
