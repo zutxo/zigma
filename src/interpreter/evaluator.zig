@@ -1206,25 +1206,33 @@ pub const Evaluator = struct {
             .method_call => {
                 // Method call structure: [method_call] [obj] [args...]
                 // data: low 8 bits = type_code, high 8 bits = method_id
-                // Extract arg count by scanning the tree
                 //
                 // PRECONDITIONS
                 const obj_idx = node_idx + 1;
                 assert(obj_idx < self.tree.node_count);
 
+                // Extract type_code and method_id
+                const type_code: u8 = @truncate(node.data);
+                const method_id: u8 = @truncate(node.data >> 8);
+
                 // Push compute phase first
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
 
                 // Find args by walking past obj
-                const args_start = self.findSubtreeEnd(obj_idx);
+                const arg1_start = self.findSubtreeEnd(obj_idx);
 
-                // For now, support 0 or 1 args (zip has 1 arg, indices has 0)
-                // We'll push obj for evaluation, args handled in compute
-                if (args_start < self.tree.node_count and
-                    self.tree.nodes[args_start].tag != .unsupported)
+                // Special case: Context.getVarFromInput has 2 args
+                if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input) {
+                    // 2 args: push both
+                    const arg2_start = self.findSubtreeEnd(arg1_start);
+                    try self.pushWork(.{ .node_idx = arg2_start, .phase = .evaluate });
+                    try self.pushWork(.{ .node_idx = arg1_start, .phase = .evaluate });
+                } else if (arg1_start < self.tree.node_count and
+                    self.tree.nodes[arg1_start].tag != .unsupported)
                 {
-                    // Has at least one arg - push it
-                    try self.pushWork(.{ .node_idx = args_start, .phase = .evaluate });
+                    // Generic case: 0 or 1 arg based on tree structure
+                    // If there's something after obj, it's an arg
+                    try self.pushWork(.{ .node_idx = arg1_start, .phase = .evaluate });
                 }
 
                 // Push obj for evaluation
@@ -3225,10 +3233,11 @@ pub const Evaluator = struct {
         const height: u8 = 6; // CONTEXT.HEIGHT → Int
         const self_box: u8 = 7; // CONTEXT.SELF → Box
         const self_box_index: u8 = 8; // CONTEXT.selfBoxIndex → Int
+        const get_var_from_input: u8 = 12; // CONTEXT.getVarFromInput[T](Short, Byte) → Option[T]
 
         // Compile-time collision detection (ZIGMA_STYLE)
         comptime {
-            const ids = [_]u8{ data_inputs, headers, pre_header, inputs, outputs, height, self_box, self_box_index };
+            const ids = [_]u8{ data_inputs, headers, pre_header, inputs, outputs, height, self_box, self_box_index, get_var_from_input };
             for (ids, 0..) |id, i| {
                 for (ids[i + 1 ..]) |other| {
                     if (id == other) @compileError("ContextMethodId collision detected");
@@ -3334,6 +3343,7 @@ pub const Evaluator = struct {
             // Context methods
             switch (method_id) {
                 ContextMethodId.data_inputs => try self.computeDataInputs(),
+                ContextMethodId.get_var_from_input => try self.computeGetVarFromInput(node),
                 else => return self.handleUnsupported(),
             }
         } else {
@@ -3640,6 +3650,74 @@ pub const Evaluator = struct {
         try self.pushValue(.{ .box_coll = .{ .source = .data_inputs } });
 
         // POSTCONDITION: One value pushed to stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute getVarFromInput: CONTEXT.getVarFromInput[T](inputIndex, varId) → Option[T]
+    /// Accesses context extension variable from a specific input box.
+    ///
+    /// Stack layout: [context_obj, input_idx (Short), var_id (Byte)]
+    /// Pop order: var_id, input_idx, context_obj
+    ///
+    /// Returns None if:
+    ///   - input_idx is out of bounds
+    ///   - extension_cache is not set
+    ///   - variable is not set for that input
+    fn computeGetVarFromInput(self: *Evaluator, node: ExprNode) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3); // context, input_idx, var_id on stack
+
+        // Cost same as GetVar (100)
+        try self.addCost(100);
+
+        // Pop arguments in reverse order
+        const var_id_val = try self.popValue();
+        const input_idx_val = try self.popValue();
+        _ = try self.popValue(); // context object (we use self.ctx directly)
+
+        // Extract var_id (Byte = i8)
+        const var_id: u8 = switch (var_id_val) {
+            .byte => |b| @bitCast(b),
+            .int => |i| if (i >= 0 and i <= 255) @intCast(i) else return error.TypeMismatch,
+            else => return error.TypeMismatch,
+        };
+
+        // Extract input_idx (Short = i16)
+        const input_idx: u16 = switch (input_idx_val) {
+            .short => |s| if (s >= 0) @intCast(s) else return error.TypeMismatch,
+            .int => |i| if (i >= 0 and i <= std.math.maxInt(u16)) @intCast(i) else return error.TypeMismatch,
+            else => return error.TypeMismatch,
+        };
+
+        // Determine expected type from node (method_call doesn't carry type args currently)
+        // For now, use ANY as placeholder - proper implementation needs explicit type args
+        _ = node; // TODO: extract type arg from method_call when explicit type args are supported
+        const expected_type_idx: TypeIndex = TypePool.ANY;
+
+        // Look up the variable
+        const var_bytes = self.ctx.getVarFromInput(input_idx, var_id);
+
+        if (var_bytes) |bytes| {
+            // Variable exists - for now, treat as Some with placeholder value
+            // TODO: Deserialize bytes according to expected type when type args supported
+            _ = bytes;
+            try self.pushValue(.{
+                .option = .{
+                    .inner_type = expected_type_idx,
+                    .value_idx = 0, // TODO: store actual deserialized value
+                },
+            });
+        } else {
+            // Variable not found or out of bounds - return None
+            try self.pushValue(.{
+                .option = .{
+                    .inner_type = expected_type_idx,
+                    .value_idx = null_value_idx,
+                },
+            });
+        }
+
+        // POSTCONDITION: One Option value on stack
         assert(self.value_sp > 0);
     }
 
@@ -4768,9 +4846,14 @@ pub const Evaluator = struct {
             // create_avl_tree: 3 or 4 children (data = 1 if value_length present)
             .create_avl_tree => if (node.data == 1) 4 else 3,
 
-            // method_call: 1 or 2 (obj + optional arg based on method_id)
+            // method_call: 1, 2, or 3 (obj + args based on method_id)
             .method_call => blk: {
                 const method_id: u8 = @truncate(node.data >> 8);
+                const type_code: u8 = @truncate(node.data);
+                // Context.getVarFromInput (12) has 2 args
+                if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input) {
+                    break :blk 3; // obj + 2 args
+                }
                 // zip (29) has 1 arg, indices (14) and reverse (30) have 0
                 break :blk if (method_id == 29) 2 else 1;
             },
@@ -7079,6 +7162,136 @@ test "evaluator: get_var returns Some when variable is set" {
     // Should be Some (value_idx != null_value_idx)
     try std.testing.expect(result == .option);
     try std.testing.expect(result.option.value_idx != null_value_idx);
+}
+
+// ============================================================================
+// GetVarFromInput Tests
+// ============================================================================
+
+test "evaluator: getVarFromInput returns None when cache not set" {
+    // CONTEXT.getVarFromInput(0, 5) when extension_cache is null returns None
+    var tree = ExprTree.init();
+
+    // method_call: data = (method_id << 8) | type_code
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    // Object: unit (placeholder for Context - we ignore it anyway)
+    tree.nodes[1] = .{ .tag = .unit };
+    // Arg1: input_idx = 0 (Short)
+    tree.constants[0] = .{ .short = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    // Arg2: var_id = 5 (Byte)
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+    // extension_cache is null by default
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be None (cache not set)
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+}
+
+test "evaluator: getVarFromInput returns None when variable not in cache" {
+    var tree = ExprTree.init();
+
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[1] = .{ .tag = .unit };
+    tree.constants[0] = .{ .short = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    // Create extension cache but don't set the variable
+    var cache = context.ContextExtensionCache.init();
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.extension_cache = &cache;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be None (variable not set)
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
+}
+
+test "evaluator: getVarFromInput returns Some when variable in cache" {
+    var tree = ExprTree.init();
+
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[1] = .{ .tag = .unit };
+    tree.constants[0] = .{ .short = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    // Create extension cache and set the variable
+    var cache = context.ContextExtensionCache.init();
+    const var_data = [_]u8{ 0x04, 0x54 }; // SInt 42
+    cache.set(.inputs, 0, 5, &var_data);
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.extension_cache = &cache;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be Some (variable is set)
+    try std.testing.expect(result == .option);
+    try std.testing.expect(result.option.value_idx != null_value_idx);
+}
+
+test "evaluator: getVarFromInput returns None for out-of-bounds input" {
+    var tree = ExprTree.init();
+
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data };
+    tree.nodes[1] = .{ .tag = .unit };
+    // input_idx = 10 (out of bounds - only 1 input)
+    tree.constants[0] = .{ .short = 10 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    var cache = context.ContextExtensionCache.init();
+    const var_data = [_]u8{ 0x04, 0x54 };
+    cache.set(.inputs, 10, 5, &var_data); // Set at index 10
+
+    const test_inputs = [_]context.BoxView{context.testBox()}; // Only 1 input
+    var ctx = Context.forHeight(100, &test_inputs);
+    ctx.extension_cache = &cache;
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+
+    // Should be None (input_idx out of bounds)
+    try std.testing.expect(result == .option);
+    try std.testing.expectEqual(null_value_idx, result.option.value_idx);
 }
 
 // ============================================================================

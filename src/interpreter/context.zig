@@ -16,6 +16,10 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const context_extension_cache = @import("context_extension_cache.zig");
+pub const ContextExtensionCache = context_extension_cache.ContextExtensionCache;
+pub const ExtensionSource = context_extension_cache.ExtensionSource;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -355,9 +359,13 @@ pub const Context = struct {
     /// Pre-header for current block
     pre_header: PreHeaderView,
 
-    /// Context variables for executeFromVar
+    /// Context variables for executeFromVar (SELF's context extension)
     /// Indexed by variable ID (0-255)
     context_vars: [max_context_vars]?[]const u8,
+
+    /// Per-input context extension cache (optional, for getVarFromInput)
+    /// When null, getVarFromInput returns None for all queries
+    extension_cache: ?*const ContextExtensionCache,
 
     /// Get SELF box (the box being validated)
     pub fn getSelf(self: *const Context) *const BoxView {
@@ -365,9 +373,39 @@ pub const Context = struct {
         return &self.inputs[self.self_index];
     }
 
-    /// Get context variable by ID
+    /// Get context variable by ID (from SELF's context extension)
     pub fn getVar(self: *const Context, id: u8) ?[]const u8 {
         return self.context_vars[id];
+    }
+
+    /// Get context variable from a specific input box.
+    /// Returns null if:
+    ///   - input_idx is out of bounds
+    ///   - extension_cache is not set
+    ///   - variable is not set for that input
+    pub fn getVarFromInput(self: *const Context, input_idx: u16, var_id: u8) ?[]const u8 {
+        // PRECONDITION: input_idx checked against inputs.len
+        if (input_idx >= self.inputs.len) return null;
+
+        // Extension cache required for cross-input access
+        const cache = self.extension_cache orelse return null;
+
+        return cache.get(.inputs, input_idx, var_id);
+    }
+
+    /// Get context variable from a specific data input box.
+    /// Returns null if:
+    ///   - data_input_idx is out of bounds
+    ///   - extension_cache is not set
+    ///   - variable is not set for that data input
+    pub fn getVarFromDataInput(self: *const Context, data_input_idx: u16, var_id: u8) ?[]const u8 {
+        // PRECONDITION: data_input_idx checked against data_inputs.len
+        if (data_input_idx >= self.data_inputs.len) return null;
+
+        // Extension cache required for cross-input access
+        const cache = self.extension_cache orelse return null;
+
+        return cache.get(.data_inputs, data_input_idx, var_id);
     }
 
     /// Validate context consistency before evaluation.
@@ -429,6 +467,7 @@ pub const Context = struct {
                 .votes = [_]u8{0} ** 3,
             },
             .context_vars = [_]?[]const u8{null} ** max_context_vars,
+            .extension_cache = null,
         };
     }
 };
@@ -525,6 +564,72 @@ test "context: getVar" {
 
     try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVar(0));
     try std.testing.expectEqualSlices(u8, &var_data, ctx.getVar(42).?);
+}
+
+test "context: getVarFromInput without cache returns null" {
+    const inputs = [_]BoxView{ testBox(), testBox() };
+    const ctx = Context.forHeight(100, &inputs);
+
+    // No extension_cache set
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(0, 5));
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(1, 10));
+}
+
+test "context: getVarFromInput with cache" {
+    var cache = ContextExtensionCache.init();
+    const var_data = [_]u8{ 0x04, 0x54 }; // SInt 42
+    cache.set(.inputs, 0, 5, &var_data);
+
+    const inputs = [_]BoxView{ testBox(), testBox() };
+    var ctx = Context.forHeight(100, &inputs);
+    ctx.extension_cache = &cache;
+
+    // Variable set on input 0, var 5
+    const result = ctx.getVarFromInput(0, 5);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, &var_data, result.?);
+
+    // Unset variable returns null
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(0, 6));
+
+    // Different input returns null (not set)
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(1, 5));
+}
+
+test "context: getVarFromInput out of bounds returns null" {
+    var cache = ContextExtensionCache.init();
+    const var_data = [_]u8{0x42};
+    cache.set(.inputs, 10, 5, &var_data); // Set at index 10
+
+    const inputs = [_]BoxView{ testBox(), testBox() }; // Only 2 inputs
+    var ctx = Context.forHeight(100, &inputs);
+    ctx.extension_cache = &cache;
+
+    // Index 10 is out of bounds (only 2 inputs)
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(10, 5));
+
+    // Valid indices still work
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromInput(0, 5));
+}
+
+test "context: getVarFromDataInput with cache" {
+    var cache = ContextExtensionCache.init();
+    const var_data = [_]u8{ 0x01, 0x01 }; // Boolean true
+    cache.set(.data_inputs, 2, 100, &var_data);
+
+    const inputs = [_]BoxView{testBox()};
+    const data_inputs = [_]BoxView{ testBox(), testBox(), testBox() };
+    var ctx = Context.forHeight(100, &inputs);
+    ctx.data_inputs = &data_inputs;
+    ctx.extension_cache = &cache;
+
+    // Variable set on data_input 2, var 100
+    const result = ctx.getVarFromDataInput(2, 100);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, &var_data, result.?);
+
+    // Out of bounds returns null
+    try std.testing.expectEqual(@as(?[]const u8, null), ctx.getVarFromDataInput(5, 100));
 }
 
 test "context: validation success" {

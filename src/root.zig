@@ -42,6 +42,9 @@ pub const memory = @import("interpreter/memory.zig");
 /// Execution context (boxes, headers, height)
 pub const context = @import("interpreter/context.zig");
 
+/// Per-input context extension cache (for getVarFromInput)
+pub const context_extension_cache = @import("interpreter/context_extension_cache.zig");
+
 /// Expression evaluator
 pub const evaluator = @import("interpreter/evaluator.zig");
 
@@ -89,6 +92,7 @@ comptime {
     _ = opcodes;
     _ = memory;
     _ = context;
+    _ = context_extension_cache;
     _ = evaluator;
     _ = ops;
     _ = hash;
