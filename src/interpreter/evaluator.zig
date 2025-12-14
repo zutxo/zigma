@@ -46,6 +46,8 @@ const null_value_idx = value_pool.null_value_idx;
 const RegisterCache = register_cache.RegisterCache;
 const RegisterCacheEntry = register_cache.RegisterCacheEntry;
 const BoxSource = register_cache.BoxSource;
+const BigInt256 = crypto_bigint.BigInt256;
+const UnsignedBigInt256 = crypto_bigint.UnsignedBigInt256;
 
 // ============================================================================
 // Configuration
@@ -177,6 +179,8 @@ pub const EvalError = error{
     InvalidData,
     /// Invalid group element (not on curve or bad encoding)
     InvalidGroupElement,
+    /// Invalid BigInt or UnsignedBigInt data
+    InvalidBigInt,
     /// Tuple field index out of bounds
     IndexOutOfBounds,
     /// Invalid context state (missing headers, etc.)
@@ -4717,6 +4721,28 @@ pub const Evaluator = struct {
 
 /// Compare two integer values, returns -1, 0, or 1
 fn compareInts(left: Value, right: Value) EvalError!i2 {
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        return switch (l.compare(r)) {
+            .lt => @as(i2, -1),
+            .eq => @as(i2, 0),
+            .gt => @as(i2, 1),
+        };
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        return switch (l.compare(r)) {
+            .lt => @as(i2, -1),
+            .eq => @as(i2, 0),
+            .gt => @as(i2, 1),
+        };
+    }
+
     const l = try extractInt(left);
     const r = try extractInt(right);
 
@@ -4745,13 +4771,82 @@ fn valuesEqual(a: Value, b: Value) bool {
         .short => |av| b == .short and av == b.short,
         .int => |av| b == .int and av == b.int,
         .long => |av| b == .long and av == b.long,
+        .big_int => |av| blk: {
+            if (b != .big_int) break :blk false;
+            const bv = b.big_int;
+            if (av.len != bv.len) break :blk false;
+            break :blk std.mem.eql(u8, av.bytes[0..av.len], bv.bytes[0..bv.len]);
+        },
+        .unsigned_big_int => |av| blk: {
+            if (b != .unsigned_big_int) break :blk false;
+            const bv = b.unsigned_big_int;
+            if (av.len != bv.len) break :blk false;
+            break :blk std.mem.eql(u8, av.bytes[0..av.len], bv.bytes[0..bv.len]);
+        },
         else => false, // Complex types need deeper comparison
     };
 }
 
+// ============================================================================
+// BigInt/UnsignedBigInt Conversion Helpers
+// ============================================================================
+
+/// Convert Value.BigInt to BigInt256 for arithmetic
+fn valueToBigInt256(v: Value.BigInt) EvalError!BigInt256 {
+    return BigInt256.fromBytes(v.bytes[0..v.len]) catch return error.InvalidBigInt;
+}
+
+/// Convert BigInt256 to Value.big_int
+fn bigInt256ToValue(bi: BigInt256) Value {
+    var temp_buf: [33]u8 = undefined;
+    const slice = bi.toBytes(&temp_buf);
+
+    var result: Value.BigInt = undefined;
+    // INVARIANT: BigInt256 minimal encoding is at most 33 bytes, but Value.BigInt has 32
+    // For values within Value.BigInt range, slice.len <= 32
+    assert(slice.len <= 32);
+    result.len = @intCast(slice.len);
+    @memcpy(result.bytes[0..result.len], slice);
+    return .{ .big_int = result };
+}
+
+/// Convert Value.UnsignedBigInt to UnsignedBigInt256 for arithmetic
+fn valueToUnsignedBigInt256(v: Value.UnsignedBigInt) EvalError!UnsignedBigInt256 {
+    return UnsignedBigInt256.fromBytes(v.bytes[0..v.len]) catch return error.InvalidBigInt;
+}
+
+/// Convert UnsignedBigInt256 to Value.unsigned_big_int
+fn unsignedBigInt256ToValue(ubi: UnsignedBigInt256) Value {
+    var temp_buf: [32]u8 = undefined;
+    const slice = ubi.toBytes(&temp_buf);
+
+    var result: Value.UnsignedBigInt = undefined;
+    // INVARIANT: UnsignedBigInt256 minimal encoding is at most 32 bytes
+    assert(slice.len <= 32);
+    result.len = @intCast(slice.len);
+    @memcpy(result.bytes[0..result.len], slice);
+    return .{ .unsigned_big_int = result };
+}
+
 /// Add two integer values with overflow checking
 fn addInts(left: Value, right: Value) EvalError!Value {
-    // For now, promote to i64 and check overflow
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        const result = l.add(r) catch return error.ArithmeticOverflow;
+        return bigInt256ToValue(result);
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        const result = l.add(r) catch return error.ArithmeticOverflow;
+        return unsignedBigInt256ToValue(result);
+    }
+
+    // For standard int types, promote to i64 and check overflow
     const l = try extractInt(left);
     const r = try extractInt(right);
 
@@ -4770,6 +4865,22 @@ fn addInts(left: Value, right: Value) EvalError!Value {
 
 /// Subtract two integer values with overflow checking
 fn subInts(left: Value, right: Value) EvalError!Value {
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        const result = l.sub(r) catch return error.ArithmeticOverflow;
+        return bigInt256ToValue(result);
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        const result = l.sub(r) catch return error.ArithmeticOverflow;
+        return unsignedBigInt256ToValue(result);
+    }
+
     const l = try extractInt(left);
     const r = try extractInt(right);
 
@@ -4787,6 +4898,22 @@ fn subInts(left: Value, right: Value) EvalError!Value {
 
 /// Multiply two integer values with overflow checking
 fn mulInts(left: Value, right: Value) EvalError!Value {
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        const result = l.mul(r) catch return error.ArithmeticOverflow;
+        return bigInt256ToValue(result);
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        const result = l.mul(r) catch return error.ArithmeticOverflow;
+        return unsignedBigInt256ToValue(result);
+    }
+
     const l = try extractInt(left);
     const r = try extractInt(right);
 
@@ -4804,6 +4931,25 @@ fn mulInts(left: Value, right: Value) EvalError!Value {
 
 /// Divide two integer values
 fn divInts(left: Value, right: Value) EvalError!Value {
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        const result = l.div(r) catch |e| return switch (e) {
+            error.DivisionByZero => error.DivisionByZero,
+            else => error.ArithmeticOverflow,
+        };
+        return bigInt256ToValue(result);
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        const result = l.div(r) catch return error.DivisionByZero;
+        return unsignedBigInt256ToValue(result);
+    }
+
     const l = try extractInt(left);
     const r = try extractInt(right);
 
@@ -4823,6 +4969,22 @@ fn divInts(left: Value, right: Value) EvalError!Value {
 
 /// Modulo of two integer values
 fn modInts(left: Value, right: Value) EvalError!Value {
+    // Handle BigInt (signed 256-bit)
+    if (left == .big_int and right == .big_int) {
+        const l = try valueToBigInt256(left.big_int);
+        const r = try valueToBigInt256(right.big_int);
+        const result = l.mod(r) catch return error.DivisionByZero;
+        return bigInt256ToValue(result);
+    }
+
+    // Handle UnsignedBigInt (unsigned 256-bit, v6+)
+    if (left == .unsigned_big_int and right == .unsigned_big_int) {
+        const l = try valueToUnsignedBigInt256(left.unsigned_big_int);
+        const r = try valueToUnsignedBigInt256(right.unsigned_big_int);
+        const result = l.mod(r) catch return error.DivisionByZero;
+        return unsignedBigInt256ToValue(result);
+    }
+
     const l = try extractInt(left);
     const r = try extractInt(right);
 

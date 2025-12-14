@@ -1338,3 +1338,440 @@ test "bigint: modQ result always in valid range" {
         try std.testing.expect(result.compare(BigInt256.GROUP_ORDER) == .lt);
     }
 }
+
+// ============================================================================
+// UnsignedBigInt256 - 256-bit Unsigned Integer (v6+)
+// ============================================================================
+
+/// 256-bit unsigned integer for ErgoTree v6+.
+/// Range: [0, 2^256 - 1]
+/// Used for cryptographic operations without sign extension issues.
+pub const UnsignedBigInt256 = struct {
+    /// Magnitude as 4 x u64 limbs, little-endian (limbs[0] is LSB)
+    limbs: [4]u64,
+
+    // ========================================================================
+    // Constants
+    // ========================================================================
+
+    pub const zero = UnsignedBigInt256{ .limbs = .{ 0, 0, 0, 0 } };
+    pub const one = UnsignedBigInt256{ .limbs = .{ 1, 0, 0, 0 } };
+
+    /// Maximum value: 2^256 - 1
+    pub const max_value = UnsignedBigInt256{
+        .limbs = .{
+            std.math.maxInt(u64),
+            std.math.maxInt(u64),
+            std.math.maxInt(u64),
+            std.math.maxInt(u64),
+        },
+    };
+
+    // ========================================================================
+    // Construction
+    // ========================================================================
+
+    /// Create from u64
+    pub fn fromUint(value: u64) UnsignedBigInt256 {
+        return .{ .limbs = .{ value, 0, 0, 0 } };
+    }
+
+    /// Create from big-endian bytes (unsigned)
+    pub fn fromBytes(bytes: []const u8) BigIntError!UnsignedBigInt256 {
+        if (bytes.len == 0) return zero;
+        if (bytes.len > 32) return error.ValueTooLarge;
+
+        // Pad to 32 bytes (zero-extend)
+        var padded: [32]u8 = [_]u8{0} ** 32;
+        @memcpy(padded[32 - bytes.len ..], bytes);
+
+        // Convert big-endian bytes to little-endian u64 limbs
+        var limbs: [4]u64 = undefined;
+        for (0..4) |i| {
+            const offset = 32 - (i + 1) * 8;
+            limbs[i] = std.mem.readInt(u64, padded[offset..][0..8], .big);
+        }
+
+        return .{ .limbs = limbs };
+    }
+
+    /// Convert to big-endian bytes (minimal encoding)
+    pub fn toBytes(self: UnsignedBigInt256, buffer: *[32]u8) []u8 {
+        // Convert limbs to big-endian
+        var full: [32]u8 = undefined;
+        for (0..4) |i| {
+            const offset = 32 - (i + 1) * 8;
+            std.mem.writeInt(u64, full[offset..][0..8], self.limbs[i], .big);
+        }
+
+        // Find minimal encoding (skip leading zeros)
+        var start: usize = 0;
+        while (start < 31 and full[start] == 0) : (start += 1) {}
+
+        const len = 32 - start;
+        if (len == 0) {
+            buffer[0] = 0;
+            return buffer[0..1];
+        }
+        @memcpy(buffer[0..len], full[start..]);
+        return buffer[0..len];
+    }
+
+    // ========================================================================
+    // Comparison
+    // ========================================================================
+
+    pub fn isZero(self: UnsignedBigInt256) bool {
+        return self.limbs[0] == 0 and self.limbs[1] == 0 and
+            self.limbs[2] == 0 and self.limbs[3] == 0;
+    }
+
+    pub fn eql(self: UnsignedBigInt256, other: UnsignedBigInt256) bool {
+        return self.limbs[0] == other.limbs[0] and self.limbs[1] == other.limbs[1] and
+            self.limbs[2] == other.limbs[2] and self.limbs[3] == other.limbs[3];
+    }
+
+    pub const Order = enum { lt, eq, gt };
+
+    pub fn compare(self: UnsignedBigInt256, other: UnsignedBigInt256) Order {
+        // Compare from MSB to LSB
+        var i: usize = 4;
+        while (i > 0) {
+            i -= 1;
+            if (self.limbs[i] < other.limbs[i]) return .lt;
+            if (self.limbs[i] > other.limbs[i]) return .gt;
+        }
+        return .eq;
+    }
+
+    // ========================================================================
+    // Arithmetic
+    // ========================================================================
+
+    /// Add two unsigned BigInts
+    pub fn add(a: UnsignedBigInt256, b: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        var result: UnsignedBigInt256 = undefined;
+        var carry: u64 = 0;
+
+        for (0..4) |i| {
+            const sum1 = @addWithOverflow(a.limbs[i], b.limbs[i]);
+            const sum2 = @addWithOverflow(sum1[0], carry);
+            result.limbs[i] = sum2[0];
+            carry = sum1[1] + sum2[1];
+        }
+
+        if (carry != 0) return error.Overflow;
+        return result;
+    }
+
+    /// Subtract b from a (a >= b required)
+    pub fn sub(a: UnsignedBigInt256, b: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (a.compare(b) == .lt) return error.Overflow; // Would underflow
+
+        var result: UnsignedBigInt256 = undefined;
+        var borrow: u64 = 0;
+
+        for (0..4) |i| {
+            const diff1 = @subWithOverflow(a.limbs[i], b.limbs[i]);
+            const diff2 = @subWithOverflow(diff1[0], borrow);
+            result.limbs[i] = diff2[0];
+            borrow = diff1[1] + diff2[1];
+        }
+
+        assert(borrow == 0); // Guaranteed by compare check above
+        return result;
+    }
+
+    /// Multiply two unsigned BigInts
+    pub fn mul(a: UnsignedBigInt256, b: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        // Use 512-bit intermediate result
+        var result: [8]u64 = [_]u64{0} ** 8;
+
+        for (0..4) |i| {
+            var carry: u64 = 0;
+            for (0..4) |j| {
+                const wide = @as(u128, a.limbs[i]) * @as(u128, b.limbs[j]);
+                const sum = @as(u128, result[i + j]) + wide + @as(u128, carry);
+                result[i + j] = @truncate(sum);
+                carry = @truncate(sum >> 64);
+            }
+            result[i + 4] = carry;
+        }
+
+        // Check for overflow (high limbs must be zero)
+        if (result[4] != 0 or result[5] != 0 or result[6] != 0 or result[7] != 0) {
+            return error.Overflow;
+        }
+
+        return .{ .limbs = result[0..4].* };
+    }
+
+    /// Divide a by b (truncating division)
+    pub fn div(a: UnsignedBigInt256, b: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (b.isZero()) return error.DivisionByZero;
+        if (a.compare(b) == .lt) return zero;
+        if (a.eql(b)) return one;
+
+        // Binary long division
+        var quotient = zero;
+        var remainder = zero;
+
+        // Process bits from MSB to LSB
+        var bit: i32 = 255;
+        while (bit >= 0) : (bit -= 1) {
+            // Shift remainder left by 1
+            remainder = remainder.shiftLeft(1);
+
+            // Bring down next bit from dividend
+            const limb_idx: usize = @intCast(@divTrunc(bit, 64));
+            const bit_idx: u6 = @intCast(@mod(bit, 64));
+            const a_bit = (a.limbs[limb_idx] >> bit_idx) & 1;
+            remainder.limbs[0] |= a_bit;
+
+            // If remainder >= divisor, subtract and set quotient bit
+            if (remainder.compare(b) != .lt) {
+                remainder = remainder.sub(b) catch unreachable;
+                const q_limb_idx: usize = @intCast(@divTrunc(bit, 64));
+                const q_bit_idx: u6 = @intCast(@mod(bit, 64));
+                quotient.limbs[q_limb_idx] |= @as(u64, 1) << q_bit_idx;
+            }
+        }
+
+        return quotient;
+    }
+
+    /// Modulo operation (remainder after division)
+    pub fn mod(a: UnsignedBigInt256, b: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (b.isZero()) return error.DivisionByZero;
+        if (a.compare(b) == .lt) return a;
+
+        // Binary long division to get remainder
+        var remainder = zero;
+
+        var bit: i32 = 255;
+        while (bit >= 0) : (bit -= 1) {
+            remainder = remainder.shiftLeft(1);
+
+            const limb_idx: usize = @intCast(@divTrunc(bit, 64));
+            const bit_idx: u6 = @intCast(@mod(bit, 64));
+            const a_bit = (a.limbs[limb_idx] >> bit_idx) & 1;
+            remainder.limbs[0] |= a_bit;
+
+            if (remainder.compare(b) != .lt) {
+                remainder = remainder.sub(b) catch unreachable;
+            }
+        }
+
+        return remainder;
+    }
+
+    /// Shift left by 1 bit
+    fn shiftLeft(self: UnsignedBigInt256, n: u32) UnsignedBigInt256 {
+        assert(n <= 1); // Only used for shift by 1
+        if (n == 0) return self;
+
+        var result: UnsignedBigInt256 = undefined;
+        var carry: u64 = 0;
+
+        for (0..4) |i| {
+            result.limbs[i] = (self.limbs[i] << 1) | carry;
+            carry = self.limbs[i] >> 63;
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Modular Arithmetic
+    // ========================================================================
+
+    /// (a + b) mod m
+    pub fn addMod(a: UnsignedBigInt256, b: UnsignedBigInt256, m: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (m.isZero()) return error.DivisionByZero;
+
+        // Compute a + b (may overflow 256 bits)
+        // Use add with overflow detection, then mod
+        const sum = a.add(b) catch {
+            // Overflow: compute (a mod m + b mod m) mod m instead
+            const a_mod = try a.mod(m);
+            const b_mod = try b.mod(m);
+            const sum2 = try a_mod.add(b_mod);
+            return try sum2.mod(m);
+        };
+        return try sum.mod(m);
+    }
+
+    /// (a - b) mod m (result is always non-negative)
+    pub fn subMod(a: UnsignedBigInt256, b: UnsignedBigInt256, m: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (m.isZero()) return error.DivisionByZero;
+
+        const a_mod = try a.mod(m);
+        const b_mod = try b.mod(m);
+
+        if (a_mod.compare(b_mod) != .lt) {
+            return try (try a_mod.sub(b_mod)).mod(m);
+        } else {
+            // a < b: result = m - (b - a)
+            const diff = try b_mod.sub(a_mod);
+            return try m.sub(diff);
+        }
+    }
+
+    /// (a * b) mod m
+    pub fn mulMod(a: UnsignedBigInt256, b: UnsignedBigInt256, m: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (m.isZero()) return error.DivisionByZero;
+
+        // For safety, reduce inputs first
+        const a_mod = try a.mod(m);
+        const b_mod = try b.mod(m);
+
+        // Multiply with overflow handling via 512-bit intermediate
+        const product = a_mod.mul(b_mod) catch {
+            // Overflow in 256 bits - need 512-bit multiplication
+            // For simplicity, use repeated doubling
+            return try mulModSlow(a_mod, b_mod, m);
+        };
+
+        return try product.mod(m);
+    }
+
+    /// Slow but safe modular multiplication via repeated addition
+    fn mulModSlow(a: UnsignedBigInt256, b: UnsignedBigInt256, m: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        var result = zero;
+        var base = a;
+
+        var bit: usize = 0;
+        while (bit < 256) : (bit += 1) {
+            const limb_idx = bit / 64;
+            const bit_idx: u6 = @intCast(bit % 64);
+
+            if ((b.limbs[limb_idx] >> bit_idx) & 1 != 0) {
+                result = try result.addMod(base, m);
+            }
+            base = try base.addMod(base, m); // base = base * 2 mod m
+        }
+
+        return result;
+    }
+
+    /// Modular inverse: a^(-1) mod m using extended Euclidean algorithm
+    pub fn modInverse(self: UnsignedBigInt256, m: UnsignedBigInt256) BigIntError!UnsignedBigInt256 {
+        if (m.isZero()) return error.DivisionByZero;
+        if (self.isZero()) return error.DivisionByZero;
+
+        // Convert to signed BigInt256 for extended GCD
+        const a_signed = BigInt256{ .limbs = self.limbs, .negative = false };
+        const m_signed = BigInt256{ .limbs = m.limbs, .negative = false };
+
+        const inv_signed = try a_signed.modInverse(m_signed);
+
+        // Result should be non-negative
+        if (inv_signed.negative) {
+            const m_copy = BigInt256{ .limbs = m.limbs, .negative = false };
+            const adjusted = try inv_signed.add(m_copy);
+            return .{ .limbs = adjusted.limbs };
+        }
+
+        return .{ .limbs = inv_signed.limbs };
+    }
+};
+
+// ============================================================================
+// UnsignedBigInt256 Tests
+// ============================================================================
+
+test "unsigned_bigint: zero and one" {
+    try std.testing.expect(UnsignedBigInt256.zero.isZero());
+    try std.testing.expect(!UnsignedBigInt256.one.isZero());
+    try std.testing.expect(UnsignedBigInt256.one.eql(UnsignedBigInt256.fromUint(1)));
+}
+
+test "unsigned_bigint: fromBytes roundtrip" {
+    const bytes = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0 };
+    const val = try UnsignedBigInt256.fromBytes(&bytes);
+
+    var buf: [32]u8 = undefined;
+    const out = val.toBytes(&buf);
+
+    try std.testing.expectEqualSlices(u8, &bytes, out);
+}
+
+test "unsigned_bigint: add basic" {
+    const a = UnsignedBigInt256.fromUint(100);
+    const b = UnsignedBigInt256.fromUint(200);
+    const sum = try a.add(b);
+    try std.testing.expect(sum.eql(UnsignedBigInt256.fromUint(300)));
+}
+
+test "unsigned_bigint: add overflow" {
+    const max = UnsignedBigInt256.max_value;
+    try std.testing.expectError(error.Overflow, max.add(UnsignedBigInt256.one));
+}
+
+test "unsigned_bigint: sub basic" {
+    const a = UnsignedBigInt256.fromUint(300);
+    const b = UnsignedBigInt256.fromUint(100);
+    const diff = try a.sub(b);
+    try std.testing.expect(diff.eql(UnsignedBigInt256.fromUint(200)));
+}
+
+test "unsigned_bigint: sub underflow" {
+    const a = UnsignedBigInt256.fromUint(100);
+    const b = UnsignedBigInt256.fromUint(200);
+    try std.testing.expectError(error.Overflow, a.sub(b));
+}
+
+test "unsigned_bigint: mul basic" {
+    const a = UnsignedBigInt256.fromUint(100);
+    const b = UnsignedBigInt256.fromUint(200);
+    const prod = try a.mul(b);
+    try std.testing.expect(prod.eql(UnsignedBigInt256.fromUint(20000)));
+}
+
+test "unsigned_bigint: div basic" {
+    const a = UnsignedBigInt256.fromUint(100);
+    const b = UnsignedBigInt256.fromUint(30);
+    const quot = try a.div(b);
+    try std.testing.expect(quot.eql(UnsignedBigInt256.fromUint(3)));
+}
+
+test "unsigned_bigint: mod basic" {
+    const a = UnsignedBigInt256.fromUint(100);
+    const b = UnsignedBigInt256.fromUint(30);
+    const rem = try a.mod(b);
+    try std.testing.expect(rem.eql(UnsignedBigInt256.fromUint(10)));
+}
+
+test "unsigned_bigint: addMod" {
+    const a = UnsignedBigInt256.fromUint(7);
+    const b = UnsignedBigInt256.fromUint(5);
+    const m = UnsignedBigInt256.fromUint(10);
+    const result = try a.addMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(2)));
+}
+
+test "unsigned_bigint: subMod" {
+    const a = UnsignedBigInt256.fromUint(3);
+    const b = UnsignedBigInt256.fromUint(7);
+    const m = UnsignedBigInt256.fromUint(10);
+    // 3 - 7 mod 10 = -4 mod 10 = 6
+    const result = try a.subMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(6)));
+}
+
+test "unsigned_bigint: mulMod" {
+    const a = UnsignedBigInt256.fromUint(7);
+    const b = UnsignedBigInt256.fromUint(8);
+    const m = UnsignedBigInt256.fromUint(10);
+    // 7 * 8 mod 10 = 56 mod 10 = 6
+    const result = try a.mulMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(6)));
+}
+
+test "unsigned_bigint: modInverse" {
+    const a = UnsignedBigInt256.fromUint(3);
+    const m = UnsignedBigInt256.fromUint(7);
+    const inv = try a.modInverse(m);
+    // 3 * inv mod 7 = 1, inv = 5 (since 3*5=15, 15 mod 7 = 1)
+    try std.testing.expect(inv.eql(UnsignedBigInt256.fromUint(5)));
+}
