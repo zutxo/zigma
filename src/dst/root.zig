@@ -31,7 +31,7 @@ pub const ContextGenOptions = context_gen.ContextGenOptions;
 // Checkers
 pub const determinism = @import("checkers/determinism.zig");
 pub const cost_checker = @import("checkers/cost_checker.zig");
-// pub const type_checker = @import("checkers/type_checker.zig");
+pub const type_checker = @import("checkers/type_checker.zig");
 // pub const conformance = @import("checkers/conformance.zig");
 
 // Main simulator
@@ -44,13 +44,28 @@ pub const EvalResult = determinism.EvalResult;
 pub const CostChecker = cost_checker.CostChecker;
 pub const CostCheckResult = cost_checker.CostCheckResult;
 
-// Fault injection (to be implemented)
-// pub const malformed = @import("fault_injection/malformed.zig");
-// pub const boundary = @import("fault_injection/boundary.zig");
+// Fault injection
+pub const fault_injector = @import("fault_injection/injector.zig");
 
-// Trace (to be implemented)
-// pub const recorder = @import("trace/recorder.zig");
-// pub const replayer = @import("trace/replayer.zig");
+// Re-export fault injector types
+pub const FaultInjector = fault_injector.FaultInjector;
+pub const FaultKind = fault_injector.FaultKind;
+pub const InjectionResult = fault_injector.InjectionResult;
+
+// Trace
+pub const trace_recorder = @import("trace/recorder.zig");
+
+// Re-export trace types
+pub const TraceRecorder = trace_recorder.TraceRecorder;
+pub const TraceEntry = trace_recorder.TraceEntry;
+pub const TraceResult = trace_recorder.TraceResult;
+pub const Divergence = trace_recorder.Divergence;
+pub const traceEvaluation = trace_recorder.traceEvaluation;
+
+// Re-export type checker types
+pub const TypeChecker = type_checker.TypeChecker;
+pub const TypeCheckResult = type_checker.TypeCheckResult;
+pub const TypeViolation = type_checker.TypeViolation;
 
 test {
     // Run all DST tests
@@ -59,5 +74,8 @@ test {
     _ = context_gen;
     _ = determinism;
     _ = cost_checker;
+    _ = type_checker;
+    _ = fault_injector;
+    _ = trace_recorder;
     _ = dst;
 }
