@@ -53,6 +53,20 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&run_mainnet_tests.step);
     test_step.dependOn(&run_mainnet_tests.step);
 
+    // Property-based tests (invariants and metamorphic properties)
+    const property_tests = b.addTest(.{
+        .root_source_file = b.path("tests/property/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    property_tests.root_module.addImport("zigma", lib.root_module);
+    const run_property_tests = b.addRunArtifact(property_tests);
+    const property_step = b.step("property", "Run property-based tests");
+    property_step.dependOn(&run_property_tests.step);
+
+    // Include property tests in main test step
+    test_step.dependOn(&run_property_tests.step);
+
     // Documentation
     const lib_docs = lib.getEmittedDocs();
     const install_docs = b.addInstallDirectory(.{
@@ -66,4 +80,33 @@ pub fn build(b: *std.Build) void {
     // Benchmarks (placeholder for future)
     const bench_step = b.step("bench", "Run benchmarks");
     _ = bench_step;
+
+    // DST (Deterministic Simulation Testing) - Unit tests
+    const dst_tests = b.addTest(.{
+        .root_source_file = b.path("src/dst/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dst_tests.root_module.addImport("zigma", lib.root_module);
+    const run_dst_tests = b.addRunArtifact(dst_tests);
+    const dst_test_step = b.step("dst-test", "Run DST unit tests");
+    dst_test_step.dependOn(&run_dst_tests.step);
+
+    // DST Executable - Main simulator
+    const dst_exe = b.addExecutable(.{
+        .name = "zigma-dst",
+        .root_source_file = b.path("src/dst/dst.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dst_exe.root_module.addImport("zigma", lib.root_module);
+    b.installArtifact(dst_exe);
+
+    // DST run step
+    const run_dst = b.addRunArtifact(dst_exe);
+    if (b.args) |args| {
+        run_dst.addArgs(args);
+    }
+    const dst_step = b.step("dst", "Run deterministic simulation testing");
+    dst_step.dependOn(&run_dst.step);
 }
