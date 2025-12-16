@@ -20,6 +20,7 @@ const register_cache = @import("register_cache.zig");
 const expr = @import("../serialization/expr_serializer.zig");
 const data = @import("../serialization/data_serializer.zig");
 const type_serializer = @import("../serialization/type_serializer.zig");
+const ergotree_serializer = @import("../serialization/ergotree_serializer.zig");
 const vlq = @import("../serialization/vlq.zig");
 const types = @import("../core/types.zig");
 const hash = @import("../crypto/hash.zig");
@@ -27,6 +28,7 @@ const crypto_ops = @import("ops/crypto.zig");
 const sigma_tree = @import("../sigma/sigma_tree.zig");
 const avl_tree = @import("../crypto/avl_tree.zig");
 const crypto_bigint = @import("../crypto/bigint.zig");
+const metrics_mod = @import("metrics.zig");
 
 const Context = context.Context;
 const BoxView = context.BoxView;
@@ -48,6 +50,7 @@ const RegisterCacheEntry = register_cache.RegisterCacheEntry;
 const BoxSource = register_cache.BoxSource;
 const BigInt256 = crypto_bigint.BigInt256;
 const UnsignedBigInt256 = crypto_bigint.UnsignedBigInt256;
+const Metrics = metrics_mod.Metrics;
 
 // ============================================================================
 // Configuration
@@ -489,6 +492,19 @@ comptime {
 }
 
 // ============================================================================
+// Type Compatibility
+// ============================================================================
+
+/// Check if two types are compatible for constant substitution
+/// Types must match exactly (no implicit conversions)
+/// Per Scala: require(c.tpe == newConst.tpe)
+fn typesCompatible(expected: TypeIndex, actual: TypeIndex, type_pool: *const TypePool) bool {
+    _ = type_pool;
+    // Exact match required for SubstConstants
+    return expected == actual;
+}
+
+// ============================================================================
 // Evaluator
 // ============================================================================
 
@@ -537,6 +553,10 @@ pub const Evaluator = struct {
 
     /// Memory pools for complex value storage (Options, nested types)
     pools: MemoryPools = MemoryPools.init(),
+
+    /// Optional metrics collector (null = metrics disabled)
+    /// When non-null, evaluation stats are recorded atomically
+    metrics: ?*Metrics = null,
 
     /// Memory pools container
     const MemoryPools = struct {
@@ -733,6 +753,9 @@ pub const Evaluator = struct {
         // PRECONDITION: Version context is valid
         assert(self.version_ctx.activated_version <= VersionContext.MAX_SUPPORTED_VERSION);
 
+        // METRICS: Record evaluation start
+        if (self.metrics) |m| m.incEvaluations();
+
         // Reset state
         self.work_sp = 0;
         self.value_sp = 0;
@@ -763,7 +786,11 @@ pub const Evaluator = struct {
             assert(loop_count <= max_loop_iterations);
 
             // Check wall-clock timeout periodically (defense in depth)
-            try self.checkTimeout();
+            self.checkTimeout() catch |err| {
+                // METRICS: Record error
+                if (self.metrics) |m| m.incErrors();
+                return err;
+            };
 
             const work = self.popWork();
 
@@ -772,15 +799,29 @@ pub const Evaluator = struct {
                     if (err == error.SoftForkAccepted) {
                         // Soft-fork rule: script with unknown features passes
                         // Reference: Interpreter.scala WhenSoftForkReductionResult
+                        // METRICS: Record as success (soft-fork pass)
+                        if (self.metrics) |m| {
+                            m.incSuccess();
+                            m.addCost(self.cost_used);
+                        }
                         return .{ .boolean = true };
                     }
+                    // METRICS: Record error
+                    if (self.metrics) |m| m.incErrors();
                     return err;
                 },
                 .compute => self.computeNode(work.node_idx) catch |err| {
                     if (err == error.SoftForkAccepted) {
                         // Soft-fork rule: script with unknown features passes
+                        // METRICS: Record as success (soft-fork pass)
+                        if (self.metrics) |m| {
+                            m.incSuccess();
+                            m.addCost(self.cost_used);
+                        }
                         return .{ .boolean = true };
                     }
+                    // METRICS: Record error
+                    if (self.metrics) |m| m.incErrors();
                     return err;
                 },
             }
@@ -793,11 +834,19 @@ pub const Evaluator = struct {
 
         // Result is on value stack
         if (self.value_sp == 0) {
+            // METRICS: Record error
+            if (self.metrics) |m| m.incErrors();
             return error.ValueStackUnderflow;
         }
 
         // POSTCONDITION: Exactly one result
         assert(self.value_sp == 1);
+
+        // METRICS: Record success and cost
+        if (self.metrics) |m| {
+            m.incSuccess();
+            m.addCost(self.cost_used);
+        }
 
         return self.popValue();
     }
@@ -1309,6 +1358,20 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = tree_idx, .phase = .evaluate });
             },
 
+            .subst_constants => {
+                // SubstConstants: 3 children (script_bytes, positions, new_values)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+
+                const script_idx = node_idx + 1;
+                const positions_idx = self.findSubtreeEnd(script_idx);
+                const new_values_idx = self.findSubtreeEnd(positions_idx);
+
+                // Push in reverse order so script evaluates first
+                try self.pushWork(.{ .node_idx = new_values_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = positions_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = script_idx, .phase = .evaluate });
+            },
+
             .unsupported => {
                 // Unknown opcode encountered during deserialization.
                 // Use soft-fork aware handling: returns SoftForkAccepted if
@@ -1486,6 +1549,9 @@ pub const Evaluator = struct {
             // AVL tree operations
             .create_avl_tree => try self.computeCreateAvlTree(node.data),
             .tree_lookup => try self.computeTreeLookup(),
+
+            // Special operations
+            .subst_constants => try self.computeSubstConstants(),
 
             else => {
                 // Other node types don't need compute phase
@@ -3706,6 +3772,12 @@ pub const Evaluator = struct {
         // PRECONDITIONS
         assert(self.value_sp >= 3); // context, input_idx, var_id on stack
 
+        // VERSION GATE: getVarFromInput is a v6 feature (EIP-50)
+        // Reference: Scala LanguageSpecificationV6.scala:1819 - sinceVersion = V6SoftForkVersion
+        if (!self.version_ctx.isV6Activated()) {
+            return error.SoftForkAccepted;
+        }
+
         // Cost same as GetVar (100)
         try self.addCost(100);
 
@@ -4015,6 +4087,412 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
         assert(self.value_sp == initial_sp - 2);
+    }
+
+    // ========================================================================
+    // SubstConstants Operation
+    // ========================================================================
+
+    /// Maximum constants that can be substituted (matches protocol limit)
+    const max_subst_constants: usize = 256;
+
+    /// Compute SubstConstants: substitute constants in serialized ErgoTree
+    /// Takes: script_bytes: Coll[Byte], positions: Coll[Int], new_values: Coll[T]
+    /// Returns: Coll[Byte] (modified serialized ErgoTree)
+    fn computeSubstConstants(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3);
+
+        const initial_sp = self.value_sp;
+
+        // Pop values in reverse order (LIFO): new_values, positions, script_bytes
+        const new_values_val = try self.popValue();
+        const positions_val = try self.popValue();
+        const script_bytes_val = try self.popValue();
+
+        // Type validation: script_bytes must be Coll[Byte]
+        const script_bytes: []const u8 = switch (script_bytes_val) {
+            .coll_byte => |s| s,
+            .hash32 => |*h| h[0..],
+            else => return error.TypeMismatch,
+        };
+
+        // INVARIANT: Script bytes should not be empty
+        if (script_bytes.len == 0) return error.InvalidData;
+
+        // Type validation: positions must be collection (Coll[Int])
+        const positions_coll = switch (positions_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        // Type validation: new_values must be collection
+        const new_values_coll = switch (new_values_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        // VALIDATION: positions.len must equal new_values.len
+        const num_positions: u16 = positions_coll.len;
+        if (num_positions != new_values_coll.len) {
+            return error.InvalidData;
+        }
+
+        // Calculate and charge cost: base + per_item * count
+        const cost: u32 = 100 + 100 * @as(u32, num_positions);
+        try self.addCost(cost);
+
+        // Handle empty substitution case - return original unchanged
+        if (num_positions == 0) {
+            try self.pushValue(script_bytes_val);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        }
+
+        // Perform the substitution
+        const result = try self.performSubstConstants(
+            script_bytes,
+            positions_coll,
+            new_values_coll,
+        );
+
+        try self.pushValue(.{ .coll_byte = result });
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Perform the actual constant substitution
+    /// Parses script, validates types, builds output with substituted constants
+    fn performSubstConstants(
+        self: *Evaluator,
+        script_bytes: []const u8,
+        positions_coll: Value.CollRef,
+        new_values_coll: Value.CollRef,
+    ) EvalError![]const u8 {
+        // PRECONDITIONS
+        assert(positions_coll.len == new_values_coll.len);
+        assert(script_bytes.len > 0);
+
+        var reader = vlq.Reader.init(script_bytes);
+
+        // Step 1: Parse ErgoTree header
+        const header_byte = reader.readByte() catch return error.InvalidData;
+        const header = ergotree_serializer.ErgoTreeHeader.parse(header_byte);
+
+        // CRITICAL: SubstConstants only works with constant_segregation enabled
+        if (!header.constant_segregation) {
+            return error.InvalidData;
+        }
+
+        // Read optional size field
+        if (header.has_size) {
+            _ = reader.readU32() catch return error.InvalidData;
+        }
+
+        // Read constants count
+        const num_constants = reader.readU32() catch return error.InvalidData;
+        if (num_constants > max_subst_constants) {
+            return error.InvalidData;
+        }
+
+        // Step 2: Parse original constant types and offsets
+        var original_types: [max_subst_constants]TypeIndex = undefined;
+        var original_offsets: [max_subst_constants + 1]usize = undefined;
+        original_offsets[0] = reader.pos;
+
+        var i: u32 = 0;
+        while (i < num_constants) : (i += 1) {
+            // Parse type code - for SubstConstants we only support primitive types
+            const type_code = reader.readByte() catch return error.InvalidData;
+
+            // Primitive types: type_code 1-111 maps directly to TypeIndex
+            // Generic types (Coll, Option, Tuple) need additional bytes
+            var type_idx: TypeIndex = undefined;
+            if (type_code <= 111) {
+                type_idx = type_code;
+            } else {
+                // Generic type - for now only handle simple cases
+                // This is a limitation; full support would need type pool
+                return error.UnsupportedExpression;
+            }
+            original_types[i] = type_idx;
+
+            // Skip value data (don't materialize)
+            try skipValueData(type_idx, &reader);
+            original_offsets[i + 1] = reader.pos;
+        }
+
+        const tree_bytes_start = reader.pos;
+        const tree_bytes = script_bytes[tree_bytes_start..];
+
+        // Step 3: Build backreference map for O(n) performance
+        // backrefs[const_idx] = position in positions array, or -1 if not substituted
+        var backrefs: [max_subst_constants]i16 = [_]i16{-1} ** max_subst_constants;
+
+        var pos_idx: u16 = 0;
+        while (pos_idx < positions_coll.len) : (pos_idx += 1) {
+            // Get position value from collection
+            const pos_val = self.getIntCollectionElement(positions_coll, pos_idx) catch return error.InvalidData;
+
+            if (pos_val < 0 or pos_val >= @as(i32, @intCast(num_constants))) {
+                return error.IndexOutOfBounds;
+            }
+
+            const const_idx: usize = @intCast(pos_val);
+
+            // Only first occurrence wins (matches Scala behavior)
+            if (backrefs[const_idx] == -1) {
+                backrefs[const_idx] = @intCast(pos_idx);
+            }
+        }
+
+        // Step 4: Serialize new ErgoTree
+        // Use pre-allocated output buffer (max 4KB per protocol)
+        var output: [ergotree_serializer.max_ergo_tree_size]u8 = undefined;
+        var out_pos: usize = 0;
+
+        // Write header (unchanged)
+        output[out_pos] = header_byte;
+        out_pos += 1;
+
+        // Reserve space for size if needed (max 5 bytes for VLQ u32)
+        var size_offset: ?usize = null;
+        var size_reserved: usize = 0;
+        if (header.has_size) {
+            size_offset = out_pos;
+            size_reserved = 5; // Max VLQ u32 size
+            out_pos += size_reserved;
+        }
+
+        const content_start = out_pos;
+
+        // Write constant count
+        out_pos += vlq.encodeU64(@intCast(num_constants), output[out_pos..]);
+
+        // Write constants (original or substituted)
+        i = 0;
+        while (i < num_constants) : (i += 1) {
+            const backref = backrefs[i];
+
+            if (backref == -1) {
+                // No substitution - copy original bytes
+                const start = original_offsets[i];
+                const end = original_offsets[i + 1];
+                const orig_bytes = script_bytes[start..end];
+
+                if (out_pos + orig_bytes.len > output.len) return error.OutOfMemory;
+                @memcpy(output[out_pos..][0..orig_bytes.len], orig_bytes);
+                out_pos += orig_bytes.len;
+            } else {
+                // Substitution - serialize new value
+                const new_val = self.getCollectionElementFromRef(new_values_coll, @intCast(backref)) catch return error.InvalidData;
+
+                // TYPE CHECK: new value must match original type
+                const expected_type = original_types[i];
+                const actual_type = self.valueTypeIndex(new_val);
+                if (!typesCompatible(expected_type, actual_type, &self.tree.type_pool)) {
+                    return error.TypeMismatch;
+                }
+
+                // Serialize type + value
+                const bytes_written = try self.serializeConstant(
+                    expected_type,
+                    new_val,
+                    output[out_pos..],
+                );
+                out_pos += bytes_written;
+            }
+        }
+
+        // Write tree bytes (unchanged)
+        if (out_pos + tree_bytes.len > output.len) return error.OutOfMemory;
+        @memcpy(output[out_pos..][0..tree_bytes.len], tree_bytes);
+        out_pos += tree_bytes.len;
+
+        // Fill in size field if needed
+        if (size_offset) |offset| {
+            const content_size: u32 = @intCast(out_pos - content_start);
+
+            // Encode size into reserved space
+            var size_buf: [5]u8 = undefined;
+            const size_len = vlq.encodeU64(@intCast(content_size), &size_buf);
+
+            // Copy size bytes, padding rest with zeros if needed
+            @memcpy(output[offset..][0..size_len], size_buf[0..size_len]);
+            if (size_len < size_reserved) {
+                // Shift content left to remove padding
+                const shift = size_reserved - size_len;
+                const content_end = out_pos;
+                std.mem.copyBackwards(
+                    u8,
+                    output[offset + size_len .. content_end - shift],
+                    output[offset + size_reserved .. content_end],
+                );
+                out_pos -= shift;
+            }
+        }
+
+        // Allocate result in arena and return
+        const result = self.arena.allocSlice(u8, out_pos) catch return error.OutOfMemory;
+        @memcpy(result, output[0..out_pos]);
+
+        return result;
+    }
+
+    /// Skip over serialized value data without parsing
+    fn skipValueData(type_idx: TypeIndex, reader: *vlq.Reader) EvalError!void {
+        switch (type_idx) {
+            TypePool.BOOLEAN => _ = reader.readByte() catch return error.InvalidData,
+            TypePool.BYTE => _ = reader.readByte() catch return error.InvalidData,
+            TypePool.SHORT => _ = reader.readI16() catch return error.InvalidData,
+            TypePool.INT => _ = reader.readI32() catch return error.InvalidData,
+            TypePool.LONG => _ = reader.readI64() catch return error.InvalidData,
+            TypePool.BIG_INT => {
+                const len = reader.readU32() catch return error.InvalidData;
+                if (reader.pos + len > reader.data.len) return error.InvalidData;
+                reader.pos += len;
+            },
+            TypePool.GROUP_ELEMENT => {
+                if (reader.pos + 33 > reader.data.len) return error.InvalidData;
+                reader.pos += 33;
+            },
+            TypePool.COLL_BYTE => {
+                const len = reader.readU32() catch return error.InvalidData;
+                if (reader.pos + len > reader.data.len) return error.InvalidData;
+                reader.pos += len;
+            },
+            TypePool.SIGMA_PROP => {
+                // SigmaProp serialization is complex - variable length
+                // For now, this is a limitation
+                return error.UnsupportedExpression;
+            },
+            else => {
+                // For complex types, we'd need full type pool traversal
+                return error.UnsupportedExpression;
+            },
+        }
+    }
+
+    /// Get type index for a runtime Value
+    fn valueTypeIndex(self: *const Evaluator, val: Value) TypeIndex {
+        _ = self;
+        return switch (val) {
+            .unit => TypePool.UNIT,
+            .boolean => TypePool.BOOLEAN,
+            .byte => TypePool.BYTE,
+            .short => TypePool.SHORT,
+            .int => TypePool.INT,
+            .long => TypePool.LONG,
+            .big_int => TypePool.BIG_INT,
+            .group_element => TypePool.GROUP_ELEMENT,
+            .coll_byte, .hash32 => TypePool.COLL_BYTE,
+            .sigma_prop => TypePool.SIGMA_PROP,
+            .avl_tree => TypePool.AVL_TREE,
+            .box => TypePool.BOX,
+            .coll => |c| c.elem_type, // Return element type, need Coll wrapper
+            .option => |o| o.inner_type, // Return inner type, need Option wrapper
+            else => TypePool.ANY,
+        };
+    }
+
+    /// Get element from a CollRef at given index
+    fn getCollectionElementFromRef(self: *const Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
+        if (idx >= coll.len) return error.IndexOutOfBounds;
+
+        // Get from value pool
+        const start_idx = coll.start;
+        const val_idx = start_idx + idx;
+
+        if (self.pools.values.get(val_idx)) |pooled| {
+            return pooledValueToValue(pooled);
+        }
+        return error.InvalidData;
+    }
+
+    /// Serialize a constant (type + value) to bytes
+    /// Returns number of bytes written
+    fn serializeConstant(
+        self: *const Evaluator,
+        type_idx: TypeIndex,
+        val: Value,
+        output: []u8,
+    ) EvalError!usize {
+        _ = self;
+        var pos: usize = 0;
+
+        // Serialize type code
+        if (type_idx <= 111) {
+            output[pos] = @intCast(type_idx);
+            pos += 1;
+        } else {
+            // Handle generic types
+            return error.UnsupportedExpression;
+        }
+
+        // Serialize value
+        switch (val) {
+            .boolean => |b| {
+                output[pos] = if (b) 1 else 0;
+                pos += 1;
+            },
+            .byte => |b| {
+                output[pos] = @bitCast(b);
+                pos += 1;
+            },
+            .short => |s| {
+                const encoded = vlq.zigzagEncode(@as(i64, s));
+                pos += vlq.encodeU64(encoded, output[pos..]);
+            },
+            .int => |i_val| {
+                const encoded = vlq.zigzagEncode(@as(i64, i_val));
+                pos += vlq.encodeU64(encoded, output[pos..]);
+            },
+            .long => |l| {
+                const encoded = vlq.zigzagEncode(l);
+                pos += vlq.encodeU64(encoded, output[pos..]);
+            },
+            .big_int => |bi| {
+                pos += vlq.encodeU64(@intCast(bi.len), output[pos..]);
+                @memcpy(output[pos..][0..bi.len], bi.bytes[0..bi.len]);
+                pos += bi.len;
+            },
+            .group_element => |ge| {
+                @memcpy(output[pos..][0..33], &ge);
+                pos += 33;
+            },
+            .coll_byte => |cb| {
+                pos += vlq.encodeU64(@intCast(cb.len), output[pos..]);
+                @memcpy(output[pos..][0..cb.len], cb);
+                pos += cb.len;
+            },
+            .hash32 => |*h| {
+                pos += vlq.encodeU64(32, output[pos..]);
+                @memcpy(output[pos..][0..32], h);
+                pos += 32;
+            },
+            else => return error.UnsupportedExpression,
+        }
+
+        return pos;
+    }
+
+    /// Get element from an Int collection at given index
+    fn getIntCollectionElement(self: *const Evaluator, coll: Value.CollRef, idx: u16) EvalError!i32 {
+        if (idx >= coll.len) return error.IndexOutOfBounds;
+
+        // Get from value pool
+        const start_idx = coll.start;
+        const val_idx = start_idx + idx;
+
+        if (self.pools.values.get(val_idx)) |pooled| {
+            // Check type is Int
+            if (pooled.type_idx != TypePool.INT) return error.TypeMismatch;
+            // Get primitive value truncated to i32
+            const val: i32 = @truncate(pooled.data.primitive);
+            return val;
+        }
+        return error.InvalidData;
     }
 
     // ========================================================================
@@ -4928,7 +5406,7 @@ pub const Evaluator = struct {
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
 
             // Ternary operations (3 children)
-            .if_then_else, .triple_construct, .fold, .tree_lookup => 3,
+            .if_then_else, .triple_construct, .fold, .tree_lookup, .subst_constants => 3,
 
             // N-ary with data-driven child count
             .block_value => node.data + 1, // items + result
@@ -7444,7 +7922,8 @@ test "evaluator: getVarFromInput returns None when cache not set" {
     const ctx = Context.forHeight(100, &test_inputs);
     // extension_cache is null by default
 
-    var eval = Evaluator.init(&tree, &ctx);
+    // Use v3 context (getVarFromInput requires v6 activation)
+    var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
     eval.cost_limit = 10000;
 
     const result = try eval.evaluate();
@@ -7474,7 +7953,8 @@ test "evaluator: getVarFromInput returns None when variable not in cache" {
     var ctx = Context.forHeight(100, &test_inputs);
     ctx.extension_cache = &cache;
 
-    var eval = Evaluator.init(&tree, &ctx);
+    // Use v3 context (getVarFromInput requires v6 activation)
+    var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
     eval.cost_limit = 10000;
 
     const result = try eval.evaluate();
@@ -7506,7 +7986,8 @@ test "evaluator: getVarFromInput returns Some when variable in cache" {
     var ctx = Context.forHeight(100, &test_inputs);
     ctx.extension_cache = &cache;
 
-    var eval = Evaluator.init(&tree, &ctx);
+    // Use v3 context (getVarFromInput requires v6 activation)
+    var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
     eval.cost_limit = 10000;
 
     const result = try eval.evaluate();
@@ -7538,7 +8019,8 @@ test "evaluator: getVarFromInput returns None for out-of-bounds input" {
     var ctx = Context.forHeight(100, &test_inputs);
     ctx.extension_cache = &cache;
 
-    var eval = Evaluator.init(&tree, &ctx);
+    // Use v3 context (getVarFromInput requires v6 activation)
+    var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
     eval.cost_limit = 10000;
 
     const result = try eval.evaluate();
@@ -7571,7 +8053,8 @@ test "evaluator: getVarFromInput returns None on type mismatch" {
     var ctx = Context.forHeight(100, &test_inputs);
     ctx.extension_cache = &cache;
 
-    var eval = Evaluator.init(&tree, &ctx);
+    // Use v3 context (getVarFromInput requires v6 activation)
+    var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
     eval.cost_limit = 10000;
 
     const result = try eval.evaluate();
@@ -7627,7 +8110,8 @@ test "evaluator: property - getVarFromInput[T] with T value returns Some" {
         var ctx = Context.forHeight(100, &test_inputs);
         ctx.extension_cache = &cache;
 
-        var eval = Evaluator.init(&tree, &ctx);
+        // Use v3 context (getVarFromInput requires v6 activation)
+        var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
         eval.cost_limit = 10000;
 
         const result = try eval.evaluate();
@@ -7681,7 +8165,8 @@ test "evaluator: property - getVarFromInput[T] with U!=T value returns None" {
         var ctx = Context.forHeight(100, &test_inputs);
         ctx.extension_cache = &cache;
 
-        var eval = Evaluator.init(&tree, &ctx);
+        // Use v3 context (getVarFromInput requires v6 activation)
+        var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
         eval.cost_limit = 10000;
 
         const result = try eval.evaluate();
@@ -7732,7 +8217,8 @@ test "evaluator: property - GetVar and getVarFromInput[T] equivalent for SELF" {
     var ctx2 = Context.forHeight(100, &test_inputs);
     ctx2.extension_cache = &cache;
 
-    var eval2 = Evaluator.init(&tree2, &ctx2);
+    // Use v3 context for getVarFromInput (requires v6 activation)
+    var eval2 = Evaluator.initWithVersion(&tree2, &ctx2, context.VersionContext.init(3, 3));
     eval2.cost_limit = 10000;
     const result2 = try eval2.evaluate();
 
@@ -7776,7 +8262,8 @@ test "evaluator: property - missing variable returns None regardless of type" {
         var ctx = Context.forHeight(100, &test_inputs);
         ctx.extension_cache = &cache;
 
-        var eval = Evaluator.init(&tree, &ctx);
+        // Use v3 context (getVarFromInput requires v6 activation)
+        var eval = Evaluator.initWithVersion(&tree, &ctx, context.VersionContext.init(3, 3));
         eval.cost_limit = 10000;
 
         const result = try eval.evaluate();
@@ -7786,6 +8273,48 @@ test "evaluator: property - missing variable returns None regardless of type" {
         try std.testing.expectEqual(null_value_idx, result.option.value_idx);
         try std.testing.expectEqual(type_idx, result.option.inner_type);
     }
+}
+
+test "evaluator: getVarFromInput requires v6 activation" {
+    // getVarFromInput is a v6 feature (EIP-50)
+    // When version context is not v6 activated, returns true (soft-fork mode)
+    // Per Scala soft-fork semantics: unknown features pass with value true
+    var tree = ExprTree.init();
+
+    const method_data: u16 = (@as(u16, Evaluator.ContextMethodId.get_var_from_input) << 8) | Evaluator.ContextTypeCode;
+    tree.nodes[0] = .{ .tag = .method_call, .data = method_data, .result_type = types.TypePool.INT };
+    tree.nodes[1] = .{ .tag = .unit };
+    tree.constants[0] = .{ .short = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.constants[1] = .{ .byte = 5 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.constant_count = 2;
+    tree.node_count = 4;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    // Test with v2 (not v6) - should return true (soft-fork mode)
+    // Per Scala: scripts with unknown v6 features pass with value true
+    var eval_v2 = Evaluator.init(&tree, &ctx);
+    eval_v2.version_ctx = context.VersionContext.init(2, 2);
+    eval_v2.cost_limit = 10000;
+
+    const result_v2 = try eval_v2.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result_v2);
+
+    // Test with v3 activated and v3 tree version - should succeed (return None)
+    var cache = context.ContextExtensionCache.init();
+    ctx.extension_cache = &cache;
+
+    var eval_v3 = Evaluator.init(&tree, &ctx);
+    eval_v3.version_ctx = context.VersionContext.init(3, 3);
+    eval_v3.cost_limit = 10000;
+
+    const result_v3 = try eval_v3.evaluate();
+    try std.testing.expect(result_v3 == .option);
+    // Returns None because variable not set
+    try std.testing.expectEqual(null_value_idx, result_v3.option.value_idx);
 }
 
 // ============================================================================
@@ -7867,4 +8396,105 @@ test "minimalUnsignedLen: various values" {
     try std.testing.expectEqual(@as(u8, 2), minimalUnsignedLen(u32, 12345));
     try std.testing.expectEqual(@as(u8, 4), minimalUnsignedLen(u32, 0xFFFFFFFF));
     try std.testing.expectEqual(@as(u8, 8), minimalUnsignedLen(u64, 0xFFFFFFFFFFFFFFFF));
+}
+
+// ============================================================================
+// Metrics Tests
+// ============================================================================
+
+test "evaluator: metrics are updated on successful evaluation" {
+    // Test that metrics are correctly recorded during evaluation
+    var m = Metrics{};
+    var tree = ExprTree.init();
+
+    // Simple boolean constant (true_leaf) that evaluates successfully
+    tree.nodes[0] = .{ .tag = .true_leaf };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.metrics = &m;
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
+
+    const snap = m.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.evaluations_total);
+    try std.testing.expectEqual(@as(u64, 1), snap.evaluation_success_total);
+    try std.testing.expectEqual(@as(u64, 0), snap.evaluation_errors_total);
+    try std.testing.expect(snap.evaluation_cost_total > 0);
+}
+
+test "evaluator: metrics record errors" {
+    // Test that metrics record errors when cost limit exceeded
+    var m = Metrics{};
+    var tree = ExprTree.init();
+
+    // Create a tree with height operation (consumes cost)
+    tree.nodes[0] = .{ .tag = .height };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.metrics = &m;
+    eval.cost_limit = 1; // Very low cost limit to trigger error
+
+    // This should fail with CostLimitExceeded
+    _ = eval.evaluate() catch {
+        const snap = m.snapshot();
+        try std.testing.expectEqual(@as(u64, 1), snap.evaluations_total);
+        try std.testing.expectEqual(@as(u64, 0), snap.evaluation_success_total);
+        try std.testing.expectEqual(@as(u64, 1), snap.evaluation_errors_total);
+        return;
+    };
+
+    // If we reach here, evaluation should have failed
+    try std.testing.expect(false);
+}
+
+test "evaluator: metrics accumulate across evaluations" {
+    // Test that metrics accumulate across multiple evaluations
+    var m = Metrics{};
+    var tree = ExprTree.init();
+
+    tree.nodes[0] = .{ .tag = .true_leaf };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    // Run three successful evaluations
+    for (0..3) |_| {
+        var eval = Evaluator.init(&tree, &ctx);
+        eval.metrics = &m;
+        eval.cost_limit = 10000;
+        _ = try eval.evaluate();
+    }
+
+    const snap = m.snapshot();
+    try std.testing.expectEqual(@as(u64, 3), snap.evaluations_total);
+    try std.testing.expectEqual(@as(u64, 3), snap.evaluation_success_total);
+    try std.testing.expectEqual(@as(u64, 0), snap.evaluation_errors_total);
+}
+
+test "evaluator: metrics null by default" {
+    // Test that evaluator works fine without metrics
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .true_leaf };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    try std.testing.expectEqual(@as(?*Metrics, null), eval.metrics);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expectEqual(Value{ .boolean = true }, result);
 }

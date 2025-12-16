@@ -284,7 +284,7 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         TaggedVariable => .{ .name = "TaggedVariable", .code = TaggedVariable, .category = .variable, .cost = 10 },
         ValUse => .{ .name = "ValUse", .code = ValUse, .category = .variable, .cost = 10 },
         ConstantPlaceholder => .{ .name = "ConstantPlaceholder", .code = ConstantPlaceholder, .category = .constant, .cost = 10 },
-        SubstConstants => .{ .name = "SubstConstants", .code = SubstConstants, .category = .special, .cost = 100 },
+        SubstConstants => .{ .name = "SubstConstants", .code = SubstConstants, .category = .special, .cost = 100, .per_item_cost = 100 },
 
         // Type conversions (shift 10-14)
         LongToByteArray => .{ .name = "LongToByteArray", .code = LongToByteArray, .category = .type_ops, .cost = 17 },

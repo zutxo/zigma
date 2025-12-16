@@ -188,6 +188,12 @@ pub const ExprTag = enum(u8) {
     /// Bitwise inversion/complement (opcode 0xF1/241) - T → T
     bit_inversion,
 
+    // Special operations
+    /// SubstConstants: substitute constants in serialized ErgoTree (opcode 0x74/116)
+    /// 3 children: script_bytes (Coll[Byte]), positions (Coll[Int]), newValues (Coll[T])
+    /// Returns: Coll[Byte] with substituted constants
+    subst_constants,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -546,6 +552,8 @@ fn deserializeWithDepth(
             opcodes.BitShiftRight => try deserializeBinOp(tree, reader, arena, .bit_shift_right, depth),
             opcodes.BitShiftLeft => try deserializeBinOp(tree, reader, arena, .bit_shift_left, depth),
             opcodes.BitShiftRightZeroed => try deserializeBinOp(tree, reader, arena, .bit_shift_right_zeroed, depth),
+            // Special operations
+            opcodes.SubstConstants => try deserializeSubstConstants(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -1508,6 +1516,37 @@ fn deserializeSigmaConnective(
 /// Maximum children for AND/OR/THRESHOLD
 const max_children: u32 = 255;
 
+/// Deserialize SubstConstants (opcode 0x74 / 116)
+/// Format: script_bytes_expr + positions_expr + new_values_expr
+/// Reference: Scala SubstConstantsSerializer.scala
+fn deserializeSubstConstants(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Add the subst_constants node first (pre-order)
+    // Returns Coll[Byte] (the modified serialized ErgoTree)
+    _ = try tree.addNode(.{
+        .tag = .subst_constants,
+        .result_type = TypePool.COLL_BYTE,
+    });
+
+    // Parse 3 child expressions in order:
+    // 1. script_bytes: Coll[Byte] - the serialized ErgoTree
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // 2. positions: Coll[Int] - indices of constants to replace
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // 3. new_values: Coll[T] - new values to substitute
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1755,4 +1794,43 @@ test "expr_serializer: deserialize SigmaOr with boolean children" {
     try std.testing.expectEqual(@as(u16, 2), tree.nodes[0].data); // 2 children
     try std.testing.expectEqual(ExprTag.true_leaf, tree.nodes[1].tag);
     try std.testing.expectEqual(ExprTag.false_leaf, tree.nodes[2].tag);
+}
+
+test "expr_serializer: deserialize SubstConstants with 3 children" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(512).init();
+
+    // SubstConstants opcode = 116 (0x74)
+    // Format: opcode + 3 child expressions
+    // Child 1: Coll[Byte] constant (script bytes placeholder)
+    // Child 2: Coll[Int] constant (positions)
+    // Child 3: Coll[Int] constant (new values)
+    //
+    // For this test, use simple inline constants:
+    // - Coll[Byte] with 2 bytes: 0x0E (Coll[Byte] type), 0x02, 0xAB, 0xCD
+    // - Two Int constants for positions and values
+    var reader = vlq.Reader.init(&[_]u8{
+        0x74, // SubstConstants opcode (116)
+        // Child 1: Coll[Byte] constant
+        0x0E, // Type code for Coll[Byte]
+        0x02, // Length 2
+        0xAB,
+        0xCD, // Bytes
+        // Child 2: Int constant (position 0)
+        0x04, // Int type
+        0x00, // Value 0 (ZigZag encoded)
+        // Child 3: Int constant (value 100)
+        0x04, // Int type
+        0xC8,
+        0x01, // Value 100 (ZigZag encoded)
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    // Should have 4 nodes: SubstConstants + 3 constants
+    try std.testing.expectEqual(@as(u16, 4), tree.node_count);
+    try std.testing.expectEqual(ExprTag.subst_constants, tree.nodes[0].tag);
+    try std.testing.expectEqual(TypePool.COLL_BYTE, tree.nodes[0].result_type);
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[1].tag);
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[2].tag);
+    try std.testing.expectEqual(ExprTag.constant, tree.nodes[3].tag);
 }
