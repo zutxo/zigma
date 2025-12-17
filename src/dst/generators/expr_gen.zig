@@ -290,6 +290,7 @@ pub const ExprGenerator = struct {
             TypePool.GROUP_ELEMENT => try self.generateGroupElementLeaf(),
             TypePool.BIG_INT => try self.generateBigIntLeaf(),
             TypePool.BOX => try self.generateBoxLeaf(),
+            TypePool.SIGMA_PROP => try self.generateSigmaPropLeaf(),
             else => {
                 // Default to boolean for unknown types
                 try self.generateBooleanLeaf();
@@ -323,7 +324,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateIntLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 1);
+        const choice = self.prng.range_inclusive(u8, 0, 3);
         switch (choice) {
             0 => {
                 // height opcode (returns Int)
@@ -331,6 +332,34 @@ pub const ExprGenerator = struct {
                     .tag = .height,
                     .result_type = TypePool.INT,
                 });
+            },
+            1 => {
+                // downcast: Long → Int (may overflow, returns Int)
+                // node.data = target type (INT)
+                _ = try self.addNode(.{
+                    .tag = .downcast,
+                    .data = TypePool.INT,
+                    .result_type = TypePool.INT,
+                });
+                try self.generateLongLeaf();
+            },
+            2 => {
+                // byte_array_to_long then downcast to int (exercises both opcodes)
+                _ = try self.addNode(.{
+                    .tag = .downcast,
+                    .data = TypePool.INT,
+                    .result_type = TypePool.INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .byte_array_to_long,
+                    .result_type = TypePool.LONG,
+                });
+                // Need 8 bytes for byte_array_to_long
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                try self.generateConstant(.{ .long = self.prng.int(i64) }, TypePool.LONG);
             },
             else => {
                 // Constant int
@@ -341,9 +370,36 @@ pub const ExprGenerator = struct {
     }
 
     fn generateLongLeaf(self: *ExprGenerator) GenerateError!void {
-        // Constant long
-        const value = self.prng.int(i64);
-        try self.generateConstant(.{ .long = value }, TypePool.LONG);
+        const choice = self.prng.range_inclusive(u8, 0, 2);
+        switch (choice) {
+            0 => {
+                // Constant long
+                const value = self.prng.int(i64);
+                try self.generateConstant(.{ .long = value }, TypePool.LONG);
+            },
+            1 => {
+                // upcast: Int → Long
+                // node.data = target type (LONG)
+                _ = try self.addNode(.{
+                    .tag = .upcast,
+                    .data = TypePool.LONG,
+                    .result_type = TypePool.LONG,
+                });
+                try self.generateIntLeaf();
+            },
+            else => {
+                // byte_array_to_long: Coll[Byte] → Long (8 bytes big-endian)
+                _ = try self.addNode(.{
+                    .tag = .byte_array_to_long,
+                    .result_type = TypePool.LONG,
+                });
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                try self.generateConstant(.{ .long = self.prng.int(i64) }, TypePool.LONG);
+            },
+        }
     }
 
     fn generateShortLeaf(self: *ExprGenerator) GenerateError!void {
@@ -364,13 +420,46 @@ pub const ExprGenerator = struct {
     }
 
     fn generateCollByteLeaf(self: *ExprGenerator) GenerateError!void {
-        // Generate a small byte collection: long_to_byte_array(constant)
-        _ = try self.addNode(.{
-            .tag = .long_to_byte_array,
-            .result_type = TypePool.COLL_BYTE,
-        });
-        const value = self.prng.int(i64);
-        try self.generateConstant(.{ .long = value }, TypePool.LONG);
+        const choice = self.prng.range_inclusive(u8, 0, 3);
+        switch (choice) {
+            0 => {
+                // long_to_byte_array: Long → Coll[Byte] (8 bytes)
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                const value = self.prng.int(i64);
+                try self.generateConstant(.{ .long = value }, TypePool.LONG);
+            },
+            1 => {
+                // miner_pk: → Coll[Byte] (33 bytes compressed pubkey)
+                // Reads from context pre-header
+                _ = try self.addNode(.{
+                    .tag = .miner_pk,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+            },
+            2 => {
+                // last_block_utxo_root: → Coll[Byte] (AVL+ tree digest)
+                // Reads from headers in context
+                _ = try self.addNode(.{
+                    .tag = .last_block_utxo_root,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+            },
+            else => {
+                // calc_blake2b256 on a small input
+                _ = try self.addNode(.{
+                    .tag = .calc_blake2b256,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                try self.generateConstant(.{ .long = self.prng.int(i64) }, TypePool.LONG);
+            },
+        }
     }
 
     fn generateGroupElementLeaf(self: *ExprGenerator) GenerateError!void {
@@ -401,6 +490,61 @@ pub const ExprGenerator = struct {
             .tag = .self_box,
             .result_type = TypePool.BOX,
         });
+    }
+
+    fn generateSigmaPropLeaf(self: *ExprGenerator) GenerateError!void {
+        const choice = self.prng.range_inclusive(u8, 0, 2);
+        switch (choice) {
+            0 => {
+                // sigma_and: SigmaProp × SigmaProp → SigmaProp
+                // data = number of children
+                _ = try self.addNode(.{
+                    .tag = .sigma_and,
+                    .data = 2, // Two children
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+                // Generate two SigmaProp children (recursive)
+                try self.generateSigmaPropSimple();
+                try self.generateSigmaPropSimple();
+            },
+            1 => {
+                // sigma_or: SigmaProp × SigmaProp → SigmaProp
+                _ = try self.addNode(.{
+                    .tag = .sigma_or,
+                    .data = 2,
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+                try self.generateSigmaPropSimple();
+                try self.generateSigmaPropSimple();
+            },
+            else => {
+                // Simple SigmaProp from boolean (most common)
+                try self.generateSigmaPropSimple();
+            },
+        }
+    }
+
+    /// Generate a simple SigmaProp (bool coerced to trivial sigma prop)
+    fn generateSigmaPropSimple(self: *ExprGenerator) GenerateError!void {
+        // In ErgoScript, booleans coerce to SigmaProp
+        // For DST, we just use true_leaf or a comparison
+        const choice = self.prng.range_inclusive(u8, 0, 1);
+        switch (choice) {
+            0 => {
+                // TrivialProp(true)
+                _ = try self.addNode(.{
+                    .tag = .true_leaf,
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+            },
+            else => {
+                // TrivialProp(false) - makes sigma_and/or interesting
+                _ = try self.addNode(.{
+                    .tag = .false_leaf,
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+            },
+        }
     }
 
     /// Generate a constant node with given value
@@ -823,14 +967,16 @@ pub const ExprGenerator = struct {
 
     /// Select random primitive type (includes crypto/collection types with lower probability)
     fn randomPrimitiveType(self: *ExprGenerator) TypeIndex {
-        const choice = self.prng.range_inclusive(u8, 0, 9);
+        const choice = self.prng.range_inclusive(u8, 0, 11);
         return switch (choice) {
             0, 1, 2 => TypePool.BOOLEAN,
             3, 4 => TypePool.INT,
             5, 6 => TypePool.LONG,
             7 => TypePool.COLL_BYTE,
             8 => TypePool.GROUP_ELEMENT,
-            else => TypePool.BIG_INT,
+            9 => TypePool.BIG_INT,
+            10 => TypePool.SIGMA_PROP, // SigmaProp for sigma connectives
+            else => TypePool.BOX, // Box for self_box/inputs/outputs
         };
     }
 

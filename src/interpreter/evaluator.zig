@@ -1280,6 +1280,10 @@ pub const Evaluator = struct {
             .sigma_and, .sigma_or => {
                 // N-ary: n SigmaProp children → SigmaProp
                 const child_count = node.data;
+                // Validate child_count is reasonable (may be corrupted by fault injection)
+                if (child_count == 0 or child_count > 255) {
+                    return error.InvalidData;
+                }
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 // Push children in reverse order so first child evaluates first
                 var idx = node_idx + 1;
@@ -2265,18 +2269,24 @@ pub const Evaluator = struct {
         // PRECONDITION: Value stack has at least one value
         assert(self.value_sp > 0);
 
-        // PRECONDITION: target_type is a valid numeric type
-        assert(target_type == TypePool.SHORT or target_type == TypePool.INT or
-            target_type == TypePool.LONG or target_type == TypePool.BIG_INT or
-            target_type == TypePool.UNSIGNED_BIG_INT);
+        // Validate target_type is a valid numeric type (may be corrupted by fault injection)
+        if (target_type != TypePool.SHORT and target_type != TypePool.INT and
+            target_type != TypePool.LONG and target_type != TypePool.BIG_INT and
+            target_type != TypePool.UNSIGNED_BIG_INT)
+        {
+            return error.InvalidData;
+        }
 
         try self.addCost(FixedCost.upcast);
 
         const input = try self.popValue();
 
-        // INVARIANT: Input must be a numeric value
-        assert(input == .byte or input == .short or input == .int or
-            input == .long or input == .big_int);
+        // Validate input is a numeric value (may be corrupted)
+        if (input != .byte and input != .short and input != .int and
+            input != .long and input != .big_int)
+        {
+            return error.TypeMismatch;
+        }
 
         // Upcast conversions: Byte → Short → Int → Long → BigInt → UnsignedBigInt
         const result: Value = switch (target_type) {
