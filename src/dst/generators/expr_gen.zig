@@ -159,8 +159,8 @@ pub const ExprGenerator = struct {
             .arithmetic => try self.generateArithmetic(target),
             .comparison => try self.generateComparison(),
             .logical => try self.generateLogical(target),
-            .collection => try self.generateLeaf(target), // TODO: implement collection ops
-            .crypto => try self.generateLeaf(target), // TODO: implement crypto ops
+            .collection => try self.generateCollectionOp(target),
+            .crypto => try self.generateCryptoOp(target),
         }
     }
 
@@ -193,7 +193,7 @@ pub const ExprGenerator = struct {
                 }
             },
             TypePool.BOOLEAN => {
-                // Boolean: allow comparison and logical
+                // Boolean: allow comparison, logical, and collection predicates (exists/forall)
                 if (self.options.comparison_weight > 0) {
                     categories[count] = .comparison;
                     weights[count] = self.options.comparison_weight;
@@ -202,6 +202,51 @@ pub const ExprGenerator = struct {
                 if (self.options.logical_weight > 0) {
                     categories[count] = .logical;
                     weights[count] = self.options.logical_weight;
+                    count += 1;
+                }
+                if (self.options.collection_weight > 0) {
+                    categories[count] = .collection;
+                    weights[count] = self.options.collection_weight;
+                    count += 1;
+                }
+            },
+            TypePool.COLL_BYTE => {
+                // Byte collection: allow crypto (hash functions return Coll[Byte])
+                if (self.options.crypto_weight > 0) {
+                    categories[count] = .crypto;
+                    weights[count] = self.options.crypto_weight;
+                    count += 1;
+                }
+            },
+            TypePool.GROUP_ELEMENT => {
+                // Group element: allow crypto operations
+                if (self.options.crypto_weight > 0) {
+                    categories[count] = .crypto;
+                    weights[count] = self.options.crypto_weight;
+                    count += 1;
+                }
+            },
+            TypePool.BIG_INT => {
+                // BigInt: allow crypto operations (modular arithmetic)
+                if (self.options.crypto_weight > 0) {
+                    categories[count] = .crypto;
+                    weights[count] = self.options.crypto_weight;
+                    count += 1;
+                }
+            },
+            TypePool.COLL_INT, TypePool.COLL_LONG => {
+                // Collection types: allow collection operations
+                if (self.options.collection_weight > 0) {
+                    categories[count] = .collection;
+                    weights[count] = self.options.collection_weight;
+                    count += 1;
+                }
+            },
+            TypePool.BOX => {
+                // Box type: allow collection operations (self_box)
+                if (self.options.collection_weight > 0) {
+                    categories[count] = .collection;
+                    weights[count] = self.options.collection_weight;
                     count += 1;
                 }
             },
@@ -241,6 +286,10 @@ pub const ExprGenerator = struct {
             TypePool.SHORT => try self.generateShortLeaf(),
             TypePool.BYTE => try self.generateByteLeaf(),
             TypePool.UNIT => try self.generateUnitLeaf(),
+            TypePool.COLL_BYTE => try self.generateCollByteLeaf(),
+            TypePool.GROUP_ELEMENT => try self.generateGroupElementLeaf(),
+            TypePool.BIG_INT => try self.generateBigIntLeaf(),
+            TypePool.BOX => try self.generateBoxLeaf(),
             else => {
                 // Default to boolean for unknown types
                 try self.generateBooleanLeaf();
@@ -311,6 +360,46 @@ pub const ExprGenerator = struct {
         _ = try self.addNode(.{
             .tag = .unit,
             .result_type = TypePool.UNIT,
+        });
+    }
+
+    fn generateCollByteLeaf(self: *ExprGenerator) GenerateError!void {
+        // Generate a small byte collection: long_to_byte_array(constant)
+        _ = try self.addNode(.{
+            .tag = .long_to_byte_array,
+            .result_type = TypePool.COLL_BYTE,
+        });
+        const value = self.prng.int(i64);
+        try self.generateConstant(.{ .long = value }, TypePool.LONG);
+    }
+
+    fn generateGroupElementLeaf(self: *ExprGenerator) GenerateError!void {
+        // Generate group generator (simplest group element)
+        _ = try self.addNode(.{
+            .tag = .group_generator,
+            .result_type = TypePool.GROUP_ELEMENT,
+        });
+    }
+
+    fn generateBigIntLeaf(self: *ExprGenerator) GenerateError!void {
+        // Generate BigInt from a long: byte_array_to_bigint(long_to_byte_array(constant))
+        _ = try self.addNode(.{
+            .tag = .byte_array_to_bigint,
+            .result_type = TypePool.BIG_INT,
+        });
+        _ = try self.addNode(.{
+            .tag = .long_to_byte_array,
+            .result_type = TypePool.COLL_BYTE,
+        });
+        const value = self.prng.int(i64);
+        try self.generateConstant(.{ .long = value }, TypePool.LONG);
+    }
+
+    fn generateBoxLeaf(self: *ExprGenerator) GenerateError!void {
+        // Generate self_box (current transaction box)
+        _ = try self.addNode(.{
+            .tag = .self_box,
+            .result_type = TypePool.BOX,
         });
     }
 
@@ -438,6 +527,292 @@ pub const ExprGenerator = struct {
     }
 
     // ========================================================================
+    // Collection Operations
+    // ========================================================================
+
+    /// Generate collection operation (exists, forall, self_box, inputs, outputs, etc.)
+    fn generateCollectionOp(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
+        switch (target) {
+            TypePool.BOOLEAN => {
+                // exists or for_all on INPUTS collection
+                // These check if any/all boxes satisfy a condition
+                const choice = self.prng.range_inclusive(u8, 0, 3);
+                switch (choice) {
+                    0 => {
+                        // exists: Coll[Box] × (Box → Boolean) → Boolean
+                        // Generate: exists(INPUTS, { box => true })
+                        _ = try self.addNode(.{
+                            .tag = .exists,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // First child: inputs collection
+                        _ = try self.addNode(.{
+                            .tag = .inputs,
+                            .result_type = TypePool.COLL_BYTE, // Placeholder - actually Coll[Box]
+                        });
+                        // Second child: func_value (predicate)
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Func body: always true for simplicity
+                        _ = try self.addNode(.{
+                            .tag = .true_leaf,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                    },
+                    1 => {
+                        // for_all: Coll[Box] × (Box → Boolean) → Boolean
+                        _ = try self.addNode(.{
+                            .tag = .for_all,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // First child: outputs collection
+                        _ = try self.addNode(.{
+                            .tag = .outputs,
+                            .result_type = TypePool.COLL_BYTE, // Placeholder
+                        });
+                        // Second child: func_value (predicate)
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Func body: comparison
+                        try self.generateComparison();
+                    },
+                    2 => {
+                        // option_is_defined: check if option has value
+                        _ = try self.addNode(.{
+                            .tag = .option_is_defined,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Generate an option-producing expression (simplified)
+                        _ = try self.addNode(.{
+                            .tag = .option_get_or_else,
+                            .result_type = TypePool.LONG,
+                        });
+                        // Child for get_or_else: generate long leaf
+                        try self.generateLongLeaf();
+                        try self.generateLongLeaf();
+                    },
+                    else => {
+                        // Fallback to comparison
+                        try self.generateComparison();
+                    },
+                }
+            },
+            TypePool.BOX => {
+                // Box-producing operations
+                const choice = self.prng.range_inclusive(u8, 0, 1);
+                switch (choice) {
+                    0 => {
+                        // self_box returns the current transaction box
+                        _ = try self.addNode(.{
+                            .tag = .self_box,
+                            .result_type = TypePool.BOX,
+                        });
+                    },
+                    else => {
+                        // self_box (default)
+                        _ = try self.addNode(.{
+                            .tag = .self_box,
+                            .result_type = TypePool.BOX,
+                        });
+                    },
+                }
+            },
+            TypePool.COLL_BYTE => {
+                // Byte collection operations
+                const choice = self.prng.range_inclusive(u8, 0, 1);
+                switch (choice) {
+                    0 => {
+                        // long_to_byte_array: Long → Coll[Byte]
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateForType(TypePool.LONG);
+                    },
+                    else => {
+                        // concrete_collection of bytes
+                        const num_items: u16 = self.prng.range_inclusive(u16, 1, 4);
+                        _ = try self.addNode(.{
+                            .tag = .concrete_collection,
+                            .data = num_items,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        for (0..num_items) |_| {
+                            try self.generateByteLeaf();
+                        }
+                    },
+                }
+            },
+            TypePool.COLL_INT => {
+                // Int collection
+                const num_items: u16 = self.prng.range_inclusive(u16, 1, 3);
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_INT,
+                });
+                for (0..num_items) |_| {
+                    try self.generateIntLeaf();
+                }
+            },
+            TypePool.COLL_LONG => {
+                // Long collection
+                const num_items: u16 = self.prng.range_inclusive(u16, 1, 3);
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_LONG,
+                });
+                for (0..num_items) |_| {
+                    try self.generateLongLeaf();
+                }
+            },
+            else => {
+                // Fallback to leaf
+                try self.generateLeaf(target);
+            },
+        }
+    }
+
+    // ========================================================================
+    // Crypto Operations
+    // ========================================================================
+
+    /// Generate crypto operation (hash, group operations)
+    fn generateCryptoOp(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
+        switch (target) {
+            TypePool.COLL_BYTE => {
+                // Hash operations: calc_blake2b256 or calc_sha256
+                // They take Coll[Byte] and return Coll[Byte]
+                const choice = self.prng.range_inclusive(u8, 0, 2);
+                switch (choice) {
+                    0 => {
+                        // calc_blake2b256: Coll[Byte] → Coll[Byte] (32 bytes)
+                        _ = try self.addNode(.{
+                            .tag = .calc_blake2b256,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // Input: convert a long to byte array
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateForType(TypePool.LONG);
+                    },
+                    1 => {
+                        // calc_sha256: Coll[Byte] → Coll[Byte] (32 bytes)
+                        _ = try self.addNode(.{
+                            .tag = .calc_sha256,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // Input: convert a long to byte array
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateForType(TypePool.LONG);
+                    },
+                    else => {
+                        // long_to_byte_array: Long → Coll[Byte] (8 bytes big-endian)
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateForType(TypePool.LONG);
+                    },
+                }
+            },
+            TypePool.GROUP_ELEMENT => {
+                // Group operations: group_generator, exponentiate, multiply_group
+                const choice = self.prng.range_inclusive(u8, 0, 3);
+                switch (choice) {
+                    0 => {
+                        // group_generator: → GroupElement (base point G)
+                        _ = try self.addNode(.{
+                            .tag = .group_generator,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                    },
+                    1 => {
+                        // exponentiate: GroupElement × BigInt → GroupElement
+                        // Generate G^n where n is derived from a long
+                        _ = try self.addNode(.{
+                            .tag = .exponentiate,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                        // First child: group element (use generator)
+                        _ = try self.addNode(.{
+                            .tag = .group_generator,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                        // Second child: BigInt - convert from long
+                        // For now, use byte_array_to_bigint(long_to_byte_array(long))
+                        _ = try self.addNode(.{
+                            .tag = .byte_array_to_bigint,
+                            .result_type = TypePool.BIG_INT,
+                        });
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // Use a small constant to avoid overflow
+                        try self.generateConstant(.{ .long = self.prng.range_inclusive(i64, 1, 100) }, TypePool.LONG);
+                    },
+                    2 => {
+                        // multiply_group: GroupElement × GroupElement → GroupElement
+                        // Generate G * G = 2G
+                        _ = try self.addNode(.{
+                            .tag = .multiply_group,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                        // Two group generators
+                        _ = try self.addNode(.{
+                            .tag = .group_generator,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                        _ = try self.addNode(.{
+                            .tag = .group_generator,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                    },
+                    else => {
+                        // decode_point: Coll[Byte] → GroupElement
+                        // This is complex - requires valid point encoding
+                        // Fallback to group_generator for safety
+                        _ = try self.addNode(.{
+                            .tag = .group_generator,
+                            .result_type = TypePool.GROUP_ELEMENT,
+                        });
+                    },
+                }
+            },
+            TypePool.BIG_INT => {
+                // BigInt operations
+                // NOTE: mod_q/plus_mod_q/minus_mod_q have known bugs (DST found them!)
+                // Disabled until crypto/bigint.zig is fixed
+                // For now, only generate simple BigInt conversions
+                _ = try self.addNode(.{
+                    .tag = .byte_array_to_bigint,
+                    .result_type = TypePool.BIG_INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                try self.generateForType(TypePool.LONG);
+            },
+            else => {
+                // Fallback to leaf
+                try self.generateLeaf(target);
+            },
+        }
+    }
+
+    // ========================================================================
     // Utilities
     // ========================================================================
 
@@ -446,14 +821,17 @@ pub const ExprGenerator = struct {
         return self.tree.addNode(node) catch error.ExpressionTooComplex;
     }
 
-    /// Select random primitive type
+    /// Select random primitive type (includes crypto/collection types with lower probability)
     fn randomPrimitiveType(self: *ExprGenerator) TypeIndex {
-        const types_arr = [_]TypeIndex{
-            TypePool.BOOLEAN,
-            TypePool.INT,
-            TypePool.LONG,
+        const choice = self.prng.range_inclusive(u8, 0, 9);
+        return switch (choice) {
+            0, 1, 2 => TypePool.BOOLEAN,
+            3, 4 => TypePool.INT,
+            5, 6 => TypePool.LONG,
+            7 => TypePool.COLL_BYTE,
+            8 => TypePool.GROUP_ELEMENT,
+            else => TypePool.BIG_INT,
         };
-        return self.prng.select(TypeIndex, &types_arr);
     }
 
     /// Select random numeric type

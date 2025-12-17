@@ -303,3 +303,118 @@ test "cost_checker: comparison has more cost than leaf" {
         .violation => try std.testing.expect(false),
     }
 }
+
+// ============================================================================
+// Opcode-Specific Cost Verification Tests
+// ============================================================================
+
+test "cost_checker: height opcode cost >= 5" {
+    // Height opcode should cost at least FixedCost.height (default: 5)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .height, .result_type = zigma.types.TypePool.INT };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    const result = CostChecker.check(&tree, &ctx);
+    switch (result) {
+        .valid => |stats| {
+            // Height should cost at least 5 (FixedCost.height)
+            try std.testing.expect(stats.cost_used >= 5);
+        },
+        .violation => try std.testing.expect(false),
+    }
+}
+
+test "cost_checker: constant opcode cost >= 5" {
+    // Constant opcode should cost at least FixedCost.constant (default: 5)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .constant, .data = 0, .result_type = zigma.types.TypePool.INT };
+    tree.values[0] = .{ .int = 42 };
+    tree.node_count = 1;
+    tree.value_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    const result = CostChecker.check(&tree, &ctx);
+    switch (result) {
+        .valid => |stats| {
+            // Constant should cost at least 5 (FixedCost.constant)
+            try std.testing.expect(stats.cost_used >= 5);
+        },
+        .violation => try std.testing.expect(false),
+    }
+}
+
+test "cost_checker: inputs opcode cost >= 10" {
+    // Inputs opcode should cost at least FixedCost.inputs (default: 10)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .inputs, .result_type = zigma.types.TypePool.COLL_BYTE };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    const result = CostChecker.check(&tree, &ctx);
+    switch (result) {
+        .valid => |stats| {
+            // Inputs should cost at least 10 (FixedCost.inputs)
+            try std.testing.expect(stats.cost_used >= 10);
+        },
+        .violation => try std.testing.expect(false),
+    }
+}
+
+test "cost_checker: self_box opcode cost >= 10" {
+    // Self_box opcode should cost at least FixedCost.self_box (default: 10)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .self_box, .result_type = zigma.types.TypePool.BOX };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    const result = CostChecker.check(&tree, &ctx);
+    switch (result) {
+        .valid => |stats| {
+            // Self_box should cost at least 10 (FixedCost.self_box)
+            try std.testing.expect(stats.cost_used >= 10);
+        },
+        .violation => try std.testing.expect(false),
+    }
+}
+
+test "cost_checker: group_generator opcode cost >= 10" {
+    // GroupGenerator opcode should cost at least FixedCost.group_generator (default: 10)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .group_generator, .result_type = zigma.types.TypePool.GROUP_ELEMENT };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    const result = CostChecker.check(&tree, &ctx);
+    switch (result) {
+        .valid => |stats| {
+            // GroupGenerator should cost at least 10 (FixedCost.group_generator)
+            try std.testing.expect(stats.cost_used >= 10);
+        },
+        .violation => try std.testing.expect(false),
+    }
+}
+
+test "cost_checker: exact limit enforcement" {
+    // Test that checkExactLimitEnforcement works
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .true_leaf, .result_type = zigma.types.TypePool.BOOLEAN };
+    tree.node_count = 1;
+
+    const test_inputs = [_]context_mod.BoxView{context_mod.testBox()};
+    const ctx = Context.forHeight(100, &test_inputs);
+
+    // Should not report a violation for simple valid expression
+    const violation = CostChecker.checkExactLimitEnforcement(&tree, &ctx);
+    try std.testing.expect(violation == null);
+}
