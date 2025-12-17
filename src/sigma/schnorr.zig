@@ -17,6 +17,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const secp256k1 = @import("../crypto/secp256k1.zig");
+const timing = @import("../crypto/timing.zig");
 const challenge_mod = @import("challenge.zig");
 const sigma_tree = @import("sigma_tree.zig");
 
@@ -140,8 +141,8 @@ pub fn verify(proof: UncheckedSchnorr) SchnorrError!bool {
     // 3. Get response scalar
     const z = proof.second_message.toScalar();
 
-    // Validate z < n (curve order)
-    if (cmpLimbs(z, CURVE_ORDER) != .lt) {
+    // Validate z < n (curve order) - MUST be constant-time to prevent timing attacks
+    if (!timing.constantTimeLtLimbs(z, CURVE_ORDER)) {
         return error.InvalidResponse;
     }
 
@@ -161,9 +162,9 @@ pub fn verify(proof: UncheckedSchnorr) SchnorrError!bool {
     // 8. Compute a' = g^z * h^(-e) = g^z + (-(h^e))
     const a_computed = g_z.add(h_neg_e);
 
-    // 9. Verify a' == a
+    // 9. Verify a' == a (MUST be constant-time to prevent timing attacks)
     // Postcondition: verification result is deterministic
-    return a_computed.eql(a);
+    return a_computed.constantTimeEql(a);
 }
 
 /// Compute expected commitment from response and challenge
@@ -212,8 +213,8 @@ pub fn verifyAndGetCommitment(
 
     const z = response.toScalar();
 
-    // Validate z < n
-    if (cmpLimbs(z, CURVE_ORDER) != .lt) {
+    // Validate z < n - MUST be constant-time to prevent timing attacks
+    if (!timing.constantTimeLtLimbs(z, CURVE_ORDER)) {
         return error.InvalidResponse;
     }
 

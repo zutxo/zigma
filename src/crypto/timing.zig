@@ -157,6 +157,35 @@ pub fn constantTimeEqU64(a: u64, b: u64) u1 {
     return @as(u1, @truncate(~reduced6));
 }
 
+/// Constant-time less-than comparison for 256-bit limb arrays.
+/// Returns true if a < b (unsigned), false otherwise.
+/// CRITICAL: No early exit - always examines all limbs.
+///
+/// Uses subtraction with borrow to determine ordering.
+/// If a < b, subtracting b from a will produce a borrow out.
+pub fn constantTimeLtLimbs(a: [4]u64, b: [4]u64) bool {
+    // Compute a - b with borrow propagation
+    // If a < b, final borrow will be non-zero
+    var borrow: u64 = 0;
+
+    for (0..4) |i| {
+        // Subtract with overflow detection
+        const diff1 = @subWithOverflow(a[i], b[i]);
+        const diff2 = @subWithOverflow(diff1[0], borrow);
+        // Accumulate borrows (overflow flags)
+        borrow = @as(u64, diff1[1]) | @as(u64, diff2[1]);
+    }
+
+    // borrow != 0 means a < b
+    return borrow != 0;
+}
+
+/// Constant-time greater-than-or-equal comparison for 256-bit limb arrays.
+/// Returns true if a >= b (unsigned), false otherwise.
+pub fn constantTimeGeLimbs(a: [4]u64, b: [4]u64) bool {
+    return !constantTimeLtLimbs(a, b);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -263,4 +292,193 @@ test "timing: constantTimeEqU64" {
     try std.testing.expectEqual(@as(u1, 1), constantTimeEqU64(0, 0));
     try std.testing.expectEqual(@as(u1, 0), constantTimeEqU64(0, 1));
     try std.testing.expectEqual(@as(u1, 1), constantTimeEqU64(std.math.maxInt(u64), std.math.maxInt(u64)));
+}
+
+test "timing: constantTimeLtLimbs basic" {
+    const a: [4]u64 = .{ 1, 0, 0, 0 };
+    const b: [4]u64 = .{ 2, 0, 0, 0 };
+    const c: [4]u64 = .{ 0, 1, 0, 0 };
+
+    // a < b (differ in low limb)
+    try std.testing.expect(constantTimeLtLimbs(a, b));
+    try std.testing.expect(!constantTimeLtLimbs(b, a));
+
+    // a < c (c has higher limb set)
+    try std.testing.expect(constantTimeLtLimbs(a, c));
+    try std.testing.expect(constantTimeLtLimbs(b, c));
+
+    // Equal values
+    try std.testing.expect(!constantTimeLtLimbs(a, a));
+}
+
+test "timing: constantTimeLtLimbs edge cases" {
+    const zero: [4]u64 = .{ 0, 0, 0, 0 };
+    const one: [4]u64 = .{ 1, 0, 0, 0 };
+    const max: [4]u64 = .{
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+    };
+    const high_bit: [4]u64 = .{ 0, 0, 0, 0x8000000000000000 };
+
+    // Zero comparisons
+    try std.testing.expect(constantTimeLtLimbs(zero, one));
+    try std.testing.expect(!constantTimeLtLimbs(one, zero));
+    try std.testing.expect(!constantTimeLtLimbs(zero, zero));
+
+    // Max comparisons
+    try std.testing.expect(constantTimeLtLimbs(zero, max));
+    try std.testing.expect(!constantTimeLtLimbs(max, zero));
+    try std.testing.expect(!constantTimeLtLimbs(max, max));
+
+    // High bit comparisons
+    try std.testing.expect(constantTimeLtLimbs(zero, high_bit));
+    try std.testing.expect(!constantTimeLtLimbs(high_bit, zero));
+}
+
+test "timing: constantTimeGeLimbs" {
+    const a: [4]u64 = .{ 5, 0, 0, 0 };
+    const b: [4]u64 = .{ 10, 0, 0, 0 };
+
+    try std.testing.expect(constantTimeGeLimbs(b, a)); // 10 >= 5
+    try std.testing.expect(!constantTimeGeLimbs(a, b)); // 5 < 10
+    try std.testing.expect(constantTimeGeLimbs(a, a)); // 5 >= 5
+}
+
+// ============================================================================
+// Statistical Timing Verification Tests
+// ============================================================================
+// These tests verify that operations execute in constant time regardless of
+// input values. They use statistical analysis to detect timing leaks.
+//
+// Note: These tests only run in ReleaseFast/ReleaseSafe builds where timing
+// measurements are meaningful. Debug builds skip these tests due to noise.
+// Run with: ./zig/zig build test -Doptimize=ReleaseFast
+
+const builtin = @import("builtin");
+
+/// Returns true if timing tests should run (optimized builds only)
+fn shouldRunTimingTests() bool {
+    return builtin.mode != .Debug;
+}
+
+/// Compute mean of timing samples
+fn timingMean(samples: []const u64) f64 {
+    var sum: u64 = 0;
+    for (samples) |s| {
+        sum +|= s;
+    }
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(samples.len));
+}
+
+/// Compute variance of timing samples
+fn timingVariance(samples: []const u64, mean_val: f64) f64 {
+    var sum_sq: f64 = 0;
+    for (samples) |s| {
+        const diff = @as(f64, @floatFromInt(s)) - mean_val;
+        sum_sq += diff * diff;
+    }
+    return sum_sq / @as(f64, @floatFromInt(samples.len - 1));
+}
+
+/// Check if two timing distributions are statistically indistinguishable.
+/// Uses a ratio-based test rather than t-test for more stability.
+/// Returns true if no significant timing difference detected.
+///
+/// The test checks that the ratio of mean times is within acceptable bounds.
+/// A timing leak would show a significant ratio difference (e.g., early-exit
+/// would be 2-10x faster than late-exit for a non-constant-time comparison).
+fn isConstantTimeDist(early_times: []const u64, late_times: []const u64) bool {
+    const early_mean = timingMean(early_times);
+    const late_mean = timingMean(late_times);
+
+    // Avoid division by zero
+    if (late_mean < 1.0 or early_mean < 1.0) return true;
+
+    // Compute ratio of means
+    const ratio = if (early_mean > late_mean)
+        early_mean / late_mean
+    else
+        late_mean / early_mean;
+
+    // Accept up to 50% timing difference as "constant-time enough"
+    // A true timing leak would show 2x-10x difference
+    // This threshold is intentionally generous to avoid flaky tests
+    return ratio < 1.5;
+}
+
+test "timing: constantTimeEql is constant-time (statistical)" {
+    // Skip in Debug builds - timing measurements are too noisy
+    if (!shouldRunTimingTests()) return;
+
+    const iterations = 5000;
+    var timer = std.time.Timer.start() catch return; // Skip if no timer
+
+    // Key that differs in FIRST byte (early exit if not constant-time)
+    const key_a = [_]u8{0x00} ++ [_]u8{0xAA} ** 31;
+    const key_early_diff = [_]u8{0xFF} ++ [_]u8{0xAA} ** 31;
+
+    // Key that differs in LAST byte (late exit if not constant-time)
+    const key_late_diff = [_]u8{0xAA} ** 31 ++ [_]u8{0xFF};
+
+    var early_times: [iterations]u64 = undefined;
+    var late_times: [iterations]u64 = undefined;
+
+    // Warm up
+    for (0..500) |_| {
+        _ = constantTimeEql(&key_a, &key_early_diff);
+        _ = constantTimeEql(&key_a, &key_late_diff);
+    }
+
+    // Interleave measurements to reduce systematic bias
+    for (0..iterations) |i| {
+        timer.reset();
+        _ = constantTimeEql(&key_a, &key_early_diff);
+        early_times[i] = timer.read();
+
+        timer.reset();
+        _ = constantTimeEql(&key_a, &key_late_diff);
+        late_times[i] = timer.read();
+    }
+
+    // Timing distributions should be statistically indistinguishable
+    try std.testing.expect(isConstantTimeDist(&early_times, &late_times));
+}
+
+test "timing: constantTimeLtLimbs is constant-time (statistical)" {
+    // Skip in Debug builds - timing measurements are too noisy
+    if (!shouldRunTimingTests()) return;
+
+    const iterations = 5000;
+    var timer = std.time.Timer.start() catch return;
+
+    // Values that differ in LOW limb (early comparison)
+    const base: [4]u64 = .{ 0x1000, 0x2000, 0x3000, 0x4000 };
+    const early_diff: [4]u64 = .{ 0x1001, 0x2000, 0x3000, 0x4000 };
+
+    // Values that differ in HIGH limb (late comparison for naive impl)
+    const late_diff: [4]u64 = .{ 0x1000, 0x2000, 0x3000, 0x4001 };
+
+    var early_times: [iterations]u64 = undefined;
+    var late_times: [iterations]u64 = undefined;
+
+    // Warm up
+    for (0..500) |_| {
+        _ = constantTimeLtLimbs(base, early_diff);
+        _ = constantTimeLtLimbs(base, late_diff);
+    }
+
+    // Interleave measurements to reduce systematic bias
+    for (0..iterations) |i| {
+        timer.reset();
+        _ = constantTimeLtLimbs(base, early_diff);
+        early_times[i] = timer.read();
+
+        timer.reset();
+        _ = constantTimeLtLimbs(base, late_diff);
+        late_times[i] = timer.read();
+    }
+
+    try std.testing.expect(isConstantTimeDist(&early_times, &late_times));
 }
