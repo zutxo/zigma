@@ -968,10 +968,11 @@ pub const Evaluator = struct {
                     return error.InvalidContext;
                 }
                 // INVARIANT: First header (index 0) is most recent
-                const state_root = self.ctx.headers[0].state_root;
+                // NOTE: Must reference original header memory, not a local copy.
+                // Taking &local_copy creates a dangling pointer after scope ends.
                 try self.addCost(15); // LastBlockUtxoRootHash cost from opcodes.zig
                 // Return as byte collection (44-byte AVL+ digest)
-                try self.pushValue(.{ .coll_byte = &state_root });
+                try self.pushValue(.{ .coll_byte = &self.ctx.headers[0].state_root });
             },
 
             .get_var => {
