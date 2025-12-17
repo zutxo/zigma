@@ -194,6 +194,17 @@ pub const ExprTag = enum(u8) {
     /// Returns: Coll[Byte] with substituted constants
     subst_constants,
 
+    /// DeserializeContext: execute script from context variable (opcode 0xD4/212)
+    /// data: type_idx(16) | var_id(8) | unused(8)
+    /// Returns: T where T is the expected type
+    deserialize_context,
+
+    /// DeserializeRegister: execute script from SELF register (opcode 0xD5/213)
+    /// data: type_idx(16) | reg_id(8) | has_default(8)
+    /// Optional child: default expression if has_default == 1
+    /// Returns: T where T is the expected type
+    deserialize_register,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -554,6 +565,8 @@ fn deserializeWithDepth(
             opcodes.BitShiftRightZeroed => try deserializeBinOp(tree, reader, arena, .bit_shift_right_zeroed, depth),
             // Special operations
             opcodes.SubstConstants => try deserializeSubstConstants(tree, reader, arena, depth),
+            opcodes.DeserializeContext => try deserializeDeserializeContext(tree, reader, depth),
+            opcodes.DeserializeRegister => try deserializeDeserializeRegister(tree, reader, arena, depth),
             else => {
                 // Unsupported opcode - record it but don't fail
                 _ = try tree.addNode(.{
@@ -1547,6 +1560,90 @@ fn deserializeSubstConstants(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
+/// Deserialize DeserializeContext (opcode 0xD4 / 212)
+/// Format: [type T] [id: byte]
+/// Reference: Scala DeserializeContextSerializer.scala
+fn deserializeDeserializeContext(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Read expected type T
+    const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.ExpressionTooComplex,
+            error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
+            error.Overflow => error.InvalidData,
+            error.InvalidTupleLength, error.FuncDomainTooLong, error.FuncTpeParamsTooLong, error.TypeVarNameTooLong => error.InvalidData,
+        };
+    };
+
+    // Read context variable id (single byte)
+    const var_id = reader.readByte() catch return error.UnexpectedEndOfInput;
+
+    // Store var_id in data, type_idx in result_type
+    _ = try tree.addNode(.{
+        .tag = .deserialize_context,
+        .result_type = type_idx,
+        .data = var_id,
+    });
+}
+
+/// Deserialize DeserializeRegister (opcode 0xD5 / 213)
+/// Format: [reg_id: byte] [type T] [default: Option<Expr>]
+/// Reference: Scala DeserializeRegisterSerializer.scala
+fn deserializeDeserializeRegister(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Read register id (0-9 for R0-R9)
+    const reg_id = reader.readByte() catch return error.UnexpectedEndOfInput;
+    if (reg_id > 9) return error.InvalidData;
+
+    // Read expected type T
+    const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        return switch (e) {
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.ExpressionTooComplex,
+            error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
+            error.Overflow => error.InvalidData,
+            error.InvalidTupleLength, error.FuncDomainTooLong, error.FuncTpeParamsTooLong, error.TypeVarNameTooLong => error.InvalidData,
+        };
+    };
+
+    // Read Option<Expr> for default value
+    // Option encoding: 0x00 = None, 0x01 = Some followed by expression
+    const has_default = reader.readByte() catch return error.UnexpectedEndOfInput;
+    if (has_default != 0 and has_default != 1) return error.InvalidData;
+
+    // Pack: reg_id(8 high) | has_default(8 low), type_idx in result_type
+    const data: u16 = (@as(u16, reg_id) << 8) | @as(u16, has_default);
+
+    _ = try tree.addNode(.{
+        .tag = .deserialize_register,
+        .result_type = type_idx,
+        .data = data,
+    });
+
+    // If has default, deserialize the default expression
+    if (has_default == 1) {
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1833,4 +1930,76 @@ test "expr_serializer: deserialize SubstConstants with 3 children" {
     try std.testing.expectEqual(ExprTag.constant, tree.nodes[1].tag);
     try std.testing.expectEqual(ExprTag.constant, tree.nodes[2].tag);
     try std.testing.expectEqual(ExprTag.constant, tree.nodes[3].tag);
+}
+
+test "expr_serializer: deserialize DeserializeContext" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // DeserializeContext opcode = 212 (0xD4)
+    // Format: [opcode] [type T] [id: byte]
+    var reader = vlq.Reader.init(&[_]u8{
+        212, // DeserializeContext opcode
+        0x01, // Type = Boolean (type code 1)
+        0x05, // Context variable id = 5
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    try std.testing.expectEqual(@as(u16, 1), tree.node_count);
+    try std.testing.expectEqual(ExprTag.deserialize_context, tree.nodes[0].tag);
+    try std.testing.expectEqual(TypePool.BOOLEAN, tree.nodes[0].result_type);
+    // var_id stored in data, type in result_type
+    try std.testing.expectEqual(@as(u16, 5), tree.nodes[0].data);
+}
+
+test "expr_serializer: deserialize DeserializeRegister without default" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // DeserializeRegister opcode = 213 (0xD5)
+    // Format: [opcode] [reg_id] [type T] [has_default=0]
+    var reader = vlq.Reader.init(&[_]u8{
+        213, // DeserializeRegister opcode
+        0x04, // Register id = R4
+        0x04, // Type = Int (type code 4)
+        0x00, // No default value
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    try std.testing.expectEqual(@as(u16, 1), tree.node_count);
+    try std.testing.expectEqual(ExprTag.deserialize_register, tree.nodes[0].tag);
+    try std.testing.expectEqual(TypePool.INT, tree.nodes[0].result_type);
+    // Data format: reg_id(8 high) | has_default(8 low)
+    const data = tree.nodes[0].data;
+    const reg_id: u8 = @truncate(data >> 8);
+    const has_default: u8 = @truncate(data);
+    try std.testing.expectEqual(@as(u8, 4), reg_id);
+    try std.testing.expectEqual(@as(u8, 0), has_default);
+}
+
+test "expr_serializer: deserialize DeserializeRegister with default" {
+    var tree = ExprTree.init();
+    var arena = BumpAllocator(256).init();
+
+    // DeserializeRegister opcode = 213 (0xD5)
+    // Format: [opcode] [reg_id] [type T] [has_default=1] [default_expr]
+    var reader = vlq.Reader.init(&[_]u8{
+        213, // DeserializeRegister opcode
+        0x05, // Register id = R5
+        0x01, // Type = Boolean
+        0x01, // Has default value
+        0x7F, // Default expression: TrueLeaf
+    });
+    try deserialize(&tree, &reader, &arena);
+
+    try std.testing.expectEqual(@as(u16, 2), tree.node_count);
+    try std.testing.expectEqual(ExprTag.deserialize_register, tree.nodes[0].tag);
+    try std.testing.expectEqual(TypePool.BOOLEAN, tree.nodes[0].result_type);
+    try std.testing.expectEqual(ExprTag.true_leaf, tree.nodes[1].tag);
+    // Data format: reg_id(8 high) | has_default(8 low)
+    const data = tree.nodes[0].data;
+    const reg_id: u8 = @truncate(data >> 8);
+    const has_default: u8 = @truncate(data);
+    try std.testing.expectEqual(@as(u8, 5), reg_id);
+    try std.testing.expectEqual(@as(u8, 1), has_default);
 }

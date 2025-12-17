@@ -75,6 +75,10 @@ const eval_arena_size: usize = 4096;
 /// Checking every operation is too expensive, so we amortize.
 const timeout_check_interval: u16 = 64;
 
+/// Maximum depth for nested script deserialization (executeFromVar/executeFromSelfReg)
+/// Prevents infinite recursion when scripts reference themselves
+const max_deserialize_depth: u8 = 4;
+
 // Compile-time sanity checks
 comptime {
     assert(max_work_stack >= 64);
@@ -557,6 +561,10 @@ pub const Evaluator = struct {
     /// Optional metrics collector (null = metrics disabled)
     /// When non-null, evaluation stats are recorded atomically
     metrics: ?*Metrics = null,
+
+    /// Deserialize depth counter (prevents infinite recursion in executeFromVar/executeFromSelfReg)
+    /// Incremented when evaluating nested deserialized scripts
+    deserialize_depth: u8 = 0,
 
     /// Memory pools container
     const MemoryPools = struct {
@@ -1372,6 +1380,23 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = script_idx, .phase = .evaluate });
             },
 
+            .deserialize_context => {
+                // DeserializeContext: no children, data packed in node
+                // Will read bytes from context variable and evaluate nested expression
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+            },
+
+            .deserialize_register => {
+                // DeserializeRegister: 0 or 1 child (default expression)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const has_default: u8 = @truncate(node.data);
+                if (has_default == 1) {
+                    // Push default expression for evaluation
+                    const child_idx = node_idx + 1;
+                    try self.pushWork(.{ .node_idx = child_idx, .phase = .evaluate });
+                }
+            },
+
             .unsupported => {
                 // Unknown opcode encountered during deserialization.
                 // Use soft-fork aware handling: returns SoftForkAccepted if
@@ -1552,6 +1577,8 @@ pub const Evaluator = struct {
 
             // Special operations
             .subst_constants => try self.computeSubstConstants(),
+            .deserialize_context => try self.computeDeserializeContext(node),
+            .deserialize_register => try self.computeDeserializeRegister(node),
 
             else => {
                 // Other node types don't need compute phase
@@ -1766,8 +1793,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
-        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
+        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
+        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -1825,8 +1854,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
-        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
+        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
+        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -1868,8 +1899,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @truncate(result_bytes.len) };
-        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
+        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
+        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
+        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -4340,6 +4373,118 @@ pub const Evaluator = struct {
         return result;
     }
 
+    /// Compute DeserializeContext: execute script from context variable
+    /// Reads serialized expression bytes from context_vars[var_id], deserializes,
+    /// evaluates in current context, and returns result.
+    fn computeDeserializeContext(self: *Evaluator, node: ExprNode) EvalError!void {
+        try self.addCost(100); // DeserializeContext base cost
+
+        // var_id stored in data, expected type in result_type
+        const expected_type: TypeIndex = node.result_type;
+        const var_id: u8 = @truncate(node.data);
+
+        // Get bytes from context variable
+        const bytes = self.ctx.context_vars[var_id] orelse {
+            return error.InvalidData; // Context variable not found
+        };
+
+        // Evaluate the nested expression
+        const result = try self.evaluateNestedExpression(bytes, expected_type);
+        try self.pushValue(result);
+    }
+
+    /// Compute DeserializeRegister: execute script from SELF register
+    /// Reads serialized expression bytes from SELF.R[reg_id], deserializes,
+    /// evaluates in current context, and returns result.
+    /// If register is empty and has_default=1, uses the default value from stack.
+    fn computeDeserializeRegister(self: *Evaluator, node: ExprNode) EvalError!void {
+        try self.addCost(100); // DeserializeRegister base cost
+
+        // Data format: reg_id(8 high) | has_default(8 low), expected type in result_type
+        const expected_type: TypeIndex = node.result_type;
+        const reg_id: u8 = @truncate(node.data >> 8);
+        const has_default: u8 = @truncate(node.data);
+
+        // If has_default, pop the default value (was already evaluated)
+        const default_value: ?Value = if (has_default == 1) try self.popValue() else null;
+
+        // Get SELF box
+        const self_box = &self.ctx.inputs[self.ctx.self_index];
+
+        // Get register bytes (R4-R9 are optional, R0-R3 are mandatory)
+        // Register IDs: 0-3 are R0-R3, 4-9 are R4-R9
+        const reg_bytes: ?[]const u8 = blk: {
+            if (reg_id >= 4 and reg_id <= 9) {
+                // Optional registers R4-R9 stored in registers array
+                break :blk self_box.registers[reg_id - 4];
+            } else if (reg_id == 1) {
+                // R1 = proposition_bytes (can be used for executeFromSelfReg)
+                break :blk self_box.proposition_bytes;
+            } else {
+                // R0, R2, R3 cannot be used as script bytes sources
+                break :blk null;
+            }
+        };
+
+        if (reg_bytes) |bytes| {
+            // Register has bytes - deserialize and evaluate
+            const result = try self.evaluateNestedExpression(bytes, expected_type);
+            try self.pushValue(result);
+        } else if (default_value) |default| {
+            // Register empty, use default
+            try self.pushValue(default);
+        } else {
+            // Register empty, no default - error
+            return error.InvalidData;
+        }
+    }
+
+    /// Evaluate a nested expression from serialized bytes.
+    /// Used by DeserializeContext and DeserializeRegister.
+    fn evaluateNestedExpression(self: *Evaluator, bytes: []const u8, expected_type: TypeIndex) EvalError!Value {
+        // Check recursion depth to prevent infinite loops
+        if (self.deserialize_depth >= max_deserialize_depth) {
+            return error.InvalidData; // DeserializeDepthExceeded
+        }
+        self.deserialize_depth += 1;
+        defer self.deserialize_depth -= 1;
+
+        // Deserialize expression bytes into a new tree
+        var reader = vlq.Reader.init(bytes);
+        var nested_tree = ExprTree.init();
+        var nested_arena = BumpAllocator(1024).init();
+
+        expr.deserialize(&nested_tree, &reader, &nested_arena) catch {
+            return error.InvalidData; // DeserializeFailed
+        };
+
+        // Create nested evaluator with same context
+        var nested_eval = Evaluator{
+            .tree = &nested_tree,
+            .ctx = self.ctx,
+            .version_ctx = self.version_ctx,
+            .cost_limit = self.cost_limit - self.cost_used, // Remaining cost budget
+            .deadline_ns = self.deadline_ns,
+            .deserialize_depth = self.deserialize_depth,
+        };
+
+        // Evaluate the nested expression
+        const result = nested_eval.evaluate() catch {
+            return error.InvalidData; // NestedEvalFailed
+        };
+
+        // Add nested cost to our cost
+        self.cost_used += nested_eval.cost_used;
+
+        // Validate result type matches expected type
+        const result_type = self.valueTypeIndex(result);
+        if (!typesCompatible(expected_type, result_type, &self.pools.type_pool)) {
+            return error.TypeMismatch;
+        }
+
+        return result;
+    }
+
     /// Skip over serialized value data without parsing
     fn skipValueData(type_idx: TypeIndex, reader: *vlq.Reader) EvalError!void {
         switch (type_idx) {
@@ -5397,7 +5542,7 @@ pub const Evaluator = struct {
 
         return switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var => 0,
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context => 0,
 
             // Unary operations (1 child)
             .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion => 1,
@@ -5414,6 +5559,9 @@ pub const Evaluator = struct {
 
             // create_avl_tree: 3 or 4 children (data = 1 if value_length present)
             .create_avl_tree => if (node.data == 1) 4 else 3,
+
+            // deserialize_register: 0 or 1 children (has_default in low byte)
+            .deserialize_register => if ((node.data & 0xFF) == 1) 1 else 0,
 
             // method_call: 1, 2, or 3 (obj + args based on method_id)
             .method_call => blk: {
