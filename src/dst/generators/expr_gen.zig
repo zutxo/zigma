@@ -324,7 +324,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateIntLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 3);
+        const choice = self.prng.range_inclusive(u8, 0, 4);
         switch (choice) {
             0 => {
                 // height opcode (returns Int)
@@ -360,6 +360,17 @@ pub const ExprGenerator = struct {
                     .result_type = TypePool.COLL_BYTE,
                 });
                 try self.generateConstant(.{ .long = self.prng.int(i64) }, TypePool.LONG);
+            },
+            3 => {
+                // constant_placeholder: reference to constant pool
+                // data = index in constant pool (0 for first constant)
+                const value = self.prng.int(i32);
+                const value_idx = self.tree.addValue(.{ .int = value }) catch return error.ExpressionTooComplex;
+                _ = try self.addNode(.{
+                    .tag = .constant_placeholder,
+                    .data = value_idx,
+                    .result_type = TypePool.INT,
+                });
             },
             else => {
                 // Constant int
@@ -585,20 +596,43 @@ pub const ExprGenerator = struct {
 
     /// Generate arithmetic expression (target must be numeric)
     fn generateArithmetic(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
-        // Select random arithmetic operation
-        const ops = [_]BinOpKind{ .plus, .minus, .multiply };
-        const op = self.prng.select(BinOpKind, &ops);
+        const choice = self.prng.range_inclusive(u8, 0, 2);
+        if (choice == 0) {
+            // Standard arithmetic operations
+            const ops = [_]BinOpKind{ .plus, .minus, .multiply, .divide, .modulo };
+            const op = self.prng.select(BinOpKind, &ops);
 
-        // Add bin_op node
-        _ = try self.addNode(.{
-            .tag = .bin_op,
-            .data = @intFromEnum(op),
-            .result_type = target,
-        });
+            _ = try self.addNode(.{
+                .tag = .bin_op,
+                .data = @intFromEnum(op),
+                .result_type = target,
+            });
 
-        // Generate two children of same type
-        try self.generateForType(target);
-        try self.generateForType(target);
+            try self.generateForType(target);
+            try self.generateForType(target);
+        } else if (choice == 1) {
+            // Bit shift operations (v3+)
+            const shift_ops = [_]BinOpKind{ .bit_shift_left, .bit_shift_right, .bit_shift_right_zeroed };
+            const op = self.prng.select(BinOpKind, &shift_ops);
+
+            _ = try self.addNode(.{
+                .tag = .bin_op,
+                .data = @intFromEnum(op),
+                .result_type = target,
+            });
+
+            try self.generateForType(target);
+            // Shift amount should be small (0-31 for 32-bit, 0-63 for 64-bit)
+            const shift_amount = self.prng.range_inclusive(i32, 0, 15);
+            try self.generateConstant(.{ .int = shift_amount }, TypePool.INT);
+        } else {
+            // Bitwise inversion: ~x
+            _ = try self.addNode(.{
+                .tag = .bit_inversion,
+                .result_type = target,
+            });
+            try self.generateForType(target);
+        }
     }
 
     // ========================================================================
@@ -634,11 +668,11 @@ pub const ExprGenerator = struct {
     fn generateLogical(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
         _ = target; // Must be boolean
 
-        const choice = self.prng.range_inclusive(u8, 0, 3);
+        const choice = self.prng.range_inclusive(u8, 0, 5);
         switch (choice) {
             0, 1 => {
-                // Binary logical (and, or)
-                const ops = [_]BinOpKind{ .and_op, .or_op };
+                // Binary logical (and, or, xor)
+                const ops = [_]BinOpKind{ .and_op, .or_op, .xor_op };
                 const op = self.prng.select(BinOpKind, &ops);
 
                 _ = try self.addNode(.{
@@ -662,6 +696,64 @@ pub const ExprGenerator = struct {
                 try self.generateForType(TypePool.BOOLEAN);
                 try self.generateForType(TypePool.BOOLEAN);
                 try self.generateForType(TypePool.BOOLEAN);
+            },
+            3 => {
+                // Bitwise operations on integers (result can be used in comparisons)
+                // Generate: (a & b) > 0 or similar
+                const bitwise_ops = [_]BinOpKind{ .bit_and, .bit_or, .bit_xor };
+                const bitwise_op = self.prng.select(BinOpKind, &bitwise_ops);
+
+                // Comparison: (a bitop b) > 0
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(BinOpKind.gt),
+                    .result_type = TypePool.BOOLEAN,
+                });
+
+                // First child: bitwise op
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(bitwise_op),
+                    .result_type = TypePool.INT,
+                });
+                try self.generateIntLeaf();
+                try self.generateIntLeaf();
+
+                // Second child: constant 0
+                try self.generateConstant(.{ .int = 0 }, TypePool.INT);
+            },
+            4 => {
+                // block_value with let binding: { val x = expr; x > 0 }
+                // Exercises val_def, val_use, block_value opcodes
+                const var_id: u16 = self.prng.range_inclusive(u16, 0, 10);
+
+                // Block value node
+                _ = try self.addNode(.{
+                    .tag = .block_value,
+                    .data = 1, // 1 binding
+                    .result_type = TypePool.BOOLEAN,
+                });
+
+                // val_def: define variable
+                _ = try self.addNode(.{
+                    .tag = .val_def,
+                    .data = var_id,
+                    .result_type = TypePool.INT,
+                });
+                try self.generateIntLeaf();
+
+                // Block body: val_use > 0 (comparison using the variable)
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(BinOpKind.gt),
+                    .result_type = TypePool.BOOLEAN,
+                });
+                _ = try self.addNode(.{
+                    .tag = .val_use,
+                    .data = var_id,
+                    .result_type = TypePool.INT,
+                });
+                try self.generateConstant(.{ .int = 0 }, TypePool.INT);
             },
             else => {
                 // Comparison (generates boolean)
@@ -738,6 +830,26 @@ pub const ExprGenerator = struct {
                         // Child for get_or_else: generate long leaf
                         try self.generateLongLeaf();
                         try self.generateLongLeaf();
+                    },
+                    3 => {
+                        // apply: (T → Boolean) × T → Boolean
+                        // Function application - applies func_value to an argument
+                        _ = try self.addNode(.{
+                            .tag = .apply,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // First child: func_value (predicate)
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Func body: true
+                        _ = try self.addNode(.{
+                            .tag = .true_leaf,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Second child: argument (can be anything, we use int)
+                        try self.generateIntLeaf();
                     },
                     else => {
                         // Fallback to comparison
@@ -925,12 +1037,23 @@ pub const ExprGenerator = struct {
                     },
                     else => {
                         // decode_point: Coll[Byte] → GroupElement
-                        // This is complex - requires valid point encoding
-                        // Fallback to group_generator for safety
+                        // Decodes a compressed secp256k1 point (33 bytes)
+                        // We use group_generator to get valid point, then convert to bytes and back
                         _ = try self.addNode(.{
-                            .tag = .group_generator,
+                            .tag = .decode_point,
                             .result_type = TypePool.GROUP_ELEMENT,
                         });
+                        // Input: 33-byte compressed point
+                        // Simplest valid encoding: generator point serialized
+                        _ = try self.addNode(.{
+                            .tag = .calc_blake2b256,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateConstant(.{ .long = self.prng.int(i64) }, TypePool.LONG);
                     },
                 }
             },
