@@ -264,7 +264,7 @@ pub const ExprNode = struct {
 
     pub fn binOpKind(self: ExprNode) ?BinOpKind {
         if (self.tag != .bin_op) return null;
-        return @enumFromInt(self.data & 0xFF);
+        return std.meta.intToEnum(BinOpKind, self.data & 0xFF) catch null;
     }
 };
 

@@ -17,6 +17,8 @@ const expr_gen_mod = @import("generators/expr_gen.zig");
 const context_gen_mod = @import("generators/context_gen.zig");
 const determinism_mod = @import("checkers/determinism.zig");
 const cost_checker_mod = @import("checkers/cost_checker.zig");
+const type_checker_mod = @import("checkers/type_checker.zig");
+const coverage_mod = @import("checkers/coverage.zig");
 const fault_injector_mod = @import("fault_injection/injector.zig");
 const trace_recorder_mod = @import("trace/recorder.zig");
 
@@ -30,6 +32,9 @@ const DeterminismChecker = determinism_mod.DeterminismChecker;
 const DeterminismResult = determinism_mod.DeterminismResult;
 const CostChecker = cost_checker_mod.CostChecker;
 const CostCheckResult = cost_checker_mod.CostCheckResult;
+const TypeChecker = type_checker_mod.TypeChecker;
+const TypeCheckResult = type_checker_mod.TypeCheckResult;
+const CoverageTracker = coverage_mod.CoverageTracker;
 const FaultInjector = fault_injector_mod.FaultInjector;
 const FaultKind = fault_injector_mod.FaultKind;
 const InjectionResult = fault_injector_mod.InjectionResult;
@@ -81,10 +86,12 @@ pub const Options = struct {
     /// Probability of checking cost invariants
     cost_check_probability: Ratio = .{ .numerator = 100, .denominator = 100 },
 
+    /// Probability of checking type invariants
+    type_check_probability: Ratio = .{ .numerator = 100, .denominator = 100 },
+
     /// Probability of injecting faults (negative testing)
-    /// Note: Disabled by default because evaluator doesn't yet handle all corrupt data gracefully
-    /// Enable once evaluator is hardened to return errors instead of panicking on invalid input
-    fault_injection_probability: Ratio = .{ .numerator = 0, .denominator = 100 },
+    /// Enabled by default at 10% - evaluator handles faults gracefully
+    fault_injection_probability: Ratio = .{ .numerator = 10, .denominator = 100 },
 
     /// Enable trace recording (captures pre/post evaluation state for debugging)
     /// Disabled by default due to overhead
@@ -92,6 +99,46 @@ pub const Options = struct {
 
     /// Log progress every N ticks (0 = no logging)
     log_interval: u64 = 1000,
+};
+
+/// Swarm configuration generator
+/// Randomizes simulation parameters based on seed for broader testing coverage
+pub const SwarmConfig = struct {
+    /// Base seed for this swarm run
+    base_seed: u64,
+
+    /// Generate randomized options from seed
+    pub fn generateOptions(self: *const SwarmConfig, ticks_max: u64, log_interval: u64) Options {
+        var prng = PRNG.from_seed(self.base_seed);
+
+        // Randomize expression generation parameters
+        const max_depth = prng.range(u8, 4, 16);
+        const max_nodes = prng.range(u16, 50, 300);
+
+        // Randomize fault injection probability (0-20%)
+        const fault_prob = prng.range(u8, 0, 20);
+
+        // Randomize determinism check probability (50-100%)
+        const det_prob = prng.range(u8, 50, 100);
+
+        return .{
+            .seed = self.base_seed,
+            .ticks_max = ticks_max,
+            .log_interval = log_interval,
+            .expr_gen = .{
+                .max_depth = max_depth,
+                .max_nodes = max_nodes,
+            },
+            .fault_injection_probability = .{
+                .numerator = fault_prob,
+                .denominator = 100,
+            },
+            .determinism_check_probability = .{
+                .numerator = det_prob,
+                .denominator = 100,
+            },
+        };
+    }
 };
 
 /// Simulation result
@@ -106,14 +153,18 @@ pub const SimulationResult = struct {
     determinism_failures: u64,
     cost_checks: u64,
     cost_violations: u64,
+    type_checks: u64,
+    type_violations: u64,
     faults_injected: u64,
     faults_handled: u64,
     traces_recorded: u64,
+    opcode_coverage: f32,
 
     pub const Status = enum {
         success,
         determinism_failure,
         cost_violation,
+        type_violation,
         generation_error,
         fault_not_handled,
     };
@@ -137,6 +188,9 @@ pub const Simulator = struct {
     // Trace recorder (for debugging divergences)
     trace_recorder: TraceRecorder,
 
+    // Coverage tracker
+    coverage: CoverageTracker,
+
     // Shared tree storage
     tree: ExprTree,
 
@@ -148,6 +202,8 @@ pub const Simulator = struct {
     determinism_failures: u64 = 0,
     cost_checks: u64 = 0,
     cost_violations: u64 = 0,
+    type_checks: u64 = 0,
+    type_violations: u64 = 0,
     faults_injected: u64 = 0,
     faults_handled: u64 = 0,
     traces_recorded: u64 = 0,
@@ -165,6 +221,7 @@ pub const Simulator = struct {
             .determinism_checker = .{ .repetitions = options.determinism_repetitions },
             .fault_injector = FaultInjector.init(&prng),
             .trace_recorder = .{},
+            .coverage = .{},
             .tree = tree,
         };
     }
@@ -183,6 +240,27 @@ pub const Simulator = struct {
         self.context_gen.prng = &self.prng;
         const generated_ctx = self.context_gen.generate();
         const ctx = generated_ctx.toContext();
+
+        // 2b. Type check generated tree (if enabled)
+        if (self.prng.chance(self.options.type_check_probability)) {
+            const type_result = TypeChecker.check(&self.tree);
+            self.type_checks += 1;
+
+            switch (type_result) {
+                .valid => {},
+                .violation => |v| {
+                    self.type_violations += 1;
+                    log.err("Type violation at node {}: {s}", .{
+                        v.node_idx,
+                        @tagName(v.kind),
+                    });
+                    return .type_violation;
+                },
+            }
+        }
+
+        // 2c. Record coverage stats
+        self.coverage.record(&self.tree);
 
         // 3. Fault injection (negative testing)
         // When enabled, inject a fault and verify evaluator handles it gracefully
@@ -287,14 +365,16 @@ pub const Simulator = struct {
             if (self.options.log_interval > 0 and tick_num > 0 and tick_num % self.options.log_interval == 0) {
                 const elapsed_ms = std.time.milliTimestamp() - start_time;
                 const ticks_per_sec = if (elapsed_ms > 0) tick_num * 1000 / @as(u64, @intCast(elapsed_ms)) else 0;
-                log.info("tick {}/{} ({} ticks/s) evals={} det={} cost={} faults={}", .{
+                const cov = self.coverage.opcodeCounts();
+                log.info("tick {}/{} ({} ticks/s) evals={} det={} cost={} cov={}/{}", .{
                     tick_num,
                     self.options.ticks_max,
                     ticks_per_sec,
                     self.evaluations_total,
                     self.determinism_checks,
                     self.cost_checks,
-                    self.faults_injected,
+                    cov.covered,
+                    cov.total,
                 });
             }
 
@@ -307,6 +387,9 @@ pub const Simulator = struct {
                 },
                 .cost_violation => {
                     return self.makeResult(.cost_violation, tick_num);
+                },
+                .type_violation => {
+                    return self.makeResult(.type_violation, tick_num);
                 },
                 .generation_error => {
                     return self.makeResult(.generation_error, tick_num);
@@ -332,9 +415,12 @@ pub const Simulator = struct {
             .determinism_failures = self.determinism_failures,
             .cost_checks = self.cost_checks,
             .cost_violations = self.cost_violations,
+            .type_checks = self.type_checks,
+            .type_violations = self.type_violations,
             .faults_injected = self.faults_injected,
             .faults_handled = self.faults_handled,
             .traces_recorded = self.traces_recorded,
+            .opcode_coverage = self.coverage.opcodeCoverage(),
         };
     }
 
@@ -353,6 +439,7 @@ const TickResult = enum {
     success,
     determinism_failure,
     cost_violation,
+    type_violation,
     generation_error,
     fault_not_handled,
 };
@@ -375,7 +462,7 @@ pub fn main() !void {
     var seed: ?u64 = null;
     var ticks_max: u64 = default_ticks_max;
     var lite_mode = false;
-    var enable_fault_injection = false;
+    var swarm_mode = false;
 
     while (args.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
@@ -392,8 +479,8 @@ pub fn main() !void {
             };
         } else if (std.mem.eql(u8, arg, "--lite")) {
             lite_mode = true;
-        } else if (std.mem.eql(u8, arg, "--faults")) {
-            enable_fault_injection = true;
+        } else if (std.mem.eql(u8, arg, "--swarm")) {
+            swarm_mode = true;
         }
     }
 
@@ -401,23 +488,39 @@ pub fn main() !void {
     const final_seed = seed orelse std.crypto.random.int(u64);
 
     // Configure options
-    const options = Options{
+    const actual_ticks = if (lite_mode) @as(u64, 1000) else ticks_max;
+    const actual_log_interval = if (lite_mode) @as(u64, 100) else @as(u64, 1000);
+
+    const options = if (swarm_mode) blk: {
+        const swarm = SwarmConfig{ .base_seed = final_seed };
+        break :blk swarm.generateOptions(actual_ticks, actual_log_interval);
+    } else Options{
         .seed = final_seed,
-        .ticks_max = if (lite_mode) 1000 else ticks_max,
-        .log_interval = if (lite_mode) 100 else 1000,
-        .fault_injection_probability = if (enable_fault_injection)
-            Ratio{ .numerator = 10, .denominator = 100 }
-        else
-            Ratio{ .numerator = 0, .denominator = 100 },
+        .ticks_max = actual_ticks,
+        .log_interval = actual_log_interval,
+        // fault_injection_probability defaults to 10/100
     };
 
     log.info("", .{});
     log.info("========================================", .{});
-    log.info("    ZIGMA Deterministic Simulation Testing", .{});
+    log.info("    ZIGMA Deterministic Simulation", .{});
     log.info("========================================", .{});
     log.info("", .{});
     log.info("SEED={}", .{final_seed});
     log.info("ticks_max={}", .{options.ticks_max});
+    log.info("mode={s}", .{if (swarm_mode) "swarm" else if (lite_mode) "lite" else "full"});
+    log.info("", .{});
+    log.info("Options:", .{});
+    log.info("  max_depth={}", .{options.expr_gen.max_depth});
+    log.info("  max_nodes={}", .{options.expr_gen.max_nodes});
+    log.info("  fault_prob={}/{}", .{
+        options.fault_injection_probability.numerator,
+        options.fault_injection_probability.denominator,
+    });
+    log.info("  det_prob={}/{}", .{
+        options.determinism_check_probability.numerator,
+        options.determinism_check_probability.denominator,
+    });
     log.info("", .{});
 
     // Run simulation
@@ -437,6 +540,10 @@ pub fn main() !void {
         },
         .cost_violation => {
             log.err("FAILED: Cost violation at tick {}", .{result.tick});
+            log.err("Reproduce with: --seed={}", .{result.seed});
+        },
+        .type_violation => {
+            log.err("FAILED: Type violation at tick {}", .{result.tick});
             log.err("Reproduce with: --seed={}", .{result.seed});
         },
         .generation_error => {
@@ -465,10 +572,15 @@ pub fn main() !void {
         result.cost_checks,
         result.cost_violations,
     });
+    log.info("  type_checks: {} ({} violations)", .{
+        result.type_checks,
+        result.type_violations,
+    });
     log.info("  faults_injected: {} ({} handled)", .{
         result.faults_injected,
         result.faults_handled,
     });
+    log.info("  opcode_coverage: {d:.1}%", .{result.opcode_coverage});
     log.info("", .{});
 
     if (result.status != .success) {

@@ -53,9 +53,12 @@ pub const ErgoTreeHeader = struct {
     constant_segregation: bool,
 
     /// Parse from header byte
-    pub fn parse(byte: u8) ErgoTreeHeader {
+    pub fn parse(byte: u8) error{InvalidVersion}!ErgoTreeHeader {
+        const version = std.meta.intToEnum(ErgoTreeVersion, byte & HeaderFlags.version_mask) catch {
+            return error.InvalidVersion;
+        };
         return .{
-            .version = @enumFromInt(byte & HeaderFlags.version_mask),
+            .version = version,
             .has_size = byte & HeaderFlags.has_size != 0,
             .constant_segregation = byte & HeaderFlags.constant_segregation != 0,
         };
@@ -101,6 +104,10 @@ comptime {
 
 /// Maximum number of constants in an ErgoTree
 pub const max_constants: usize = 4096;
+
+/// Maximum size of serialized ErgoTree in bytes (4KB protocol limit)
+/// Reference: Ergo protocol enforces this to prevent DoS via oversized scripts
+pub const max_ergo_tree_size: usize = 4096;
 
 /// Parsed ErgoTree
 pub const ErgoTree = struct {
@@ -167,6 +174,8 @@ pub const DeserializeError = error{
     TooManyConstants,
     InvalidHeader,
     SizeMismatch,
+    /// ErgoTree exceeds maximum allowed size (4KB protocol limit)
+    TreeTooBig,
 };
 
 // ============================================================================
@@ -179,6 +188,12 @@ pub fn deserialize(
     data: []const u8,
     arena: anytype,
 ) DeserializeError!void {
+    // SECURITY: Enforce 4KB size limit to prevent DoS via oversized scripts
+    // Reference: Ergo protocol limit, enforced at deserialization time
+    if (data.len > max_ergo_tree_size) {
+        return error.TreeTooBig;
+    }
+
     var reader = vlq.Reader.init(data);
 
     // Parse header byte
@@ -189,7 +204,7 @@ pub fn deserialize(
         return error.InvalidHeader;
     }
 
-    tree.header = ErgoTreeHeader.parse(header_byte);
+    tree.header = ErgoTreeHeader.parse(header_byte) catch return error.InvalidHeader;
 
     // Parse optional size field
     if (tree.header.has_size) {
@@ -278,45 +293,53 @@ fn mapVlqError(err: vlq.DecodeError) DeserializeError {
 // ============================================================================
 
 test "ergotree: parse header byte v0" {
-    const header = ErgoTreeHeader.parse(0x00);
+    const header = try ErgoTreeHeader.parse(0x00);
     try std.testing.expectEqual(ErgoTreeVersion.v0, header.version);
     try std.testing.expect(!header.has_size);
     try std.testing.expect(!header.constant_segregation);
 }
 
 test "ergotree: parse header byte v1 with size" {
-    const header = ErgoTreeHeader.parse(0x09); // v1 + has_size
+    const header = try ErgoTreeHeader.parse(0x09); // v1 + has_size
     try std.testing.expectEqual(ErgoTreeVersion.v1, header.version);
     try std.testing.expect(header.has_size);
     try std.testing.expect(!header.constant_segregation);
 }
 
 test "ergotree: parse header byte v0 with segregation" {
-    const header = ErgoTreeHeader.parse(0x10); // v0 + constant_segregation
+    const header = try ErgoTreeHeader.parse(0x10); // v0 + constant_segregation
     try std.testing.expectEqual(ErgoTreeVersion.v0, header.version);
     try std.testing.expect(!header.has_size);
     try std.testing.expect(header.constant_segregation);
 }
 
 test "ergotree: parse header byte v1 full" {
-    const header = ErgoTreeHeader.parse(0x19); // v1 + has_size + constant_segregation
+    const header = try ErgoTreeHeader.parse(0x19); // v1 + has_size + constant_segregation
     try std.testing.expectEqual(ErgoTreeVersion.v1, header.version);
     try std.testing.expect(header.has_size);
     try std.testing.expect(header.constant_segregation);
 }
 
+test "ergotree: parse invalid version" {
+    // Version 4-7 are not defined in ErgoTreeVersion enum
+    try std.testing.expectError(error.InvalidVersion, ErgoTreeHeader.parse(0x04));
+    try std.testing.expectError(error.InvalidVersion, ErgoTreeHeader.parse(0x05));
+    try std.testing.expectError(error.InvalidVersion, ErgoTreeHeader.parse(0x06));
+    try std.testing.expectError(error.InvalidVersion, ErgoTreeHeader.parse(0x07));
+}
+
 test "ergotree: header roundtrip" {
     const h1 = ErgoTreeHeader.v0(false);
-    try std.testing.expectEqual(h1, ErgoTreeHeader.parse(h1.toByte()));
+    try std.testing.expectEqual(h1, try ErgoTreeHeader.parse(h1.toByte()));
 
     const h2 = ErgoTreeHeader.v0(true);
-    try std.testing.expectEqual(h2, ErgoTreeHeader.parse(h2.toByte()));
+    try std.testing.expectEqual(h2, try ErgoTreeHeader.parse(h2.toByte()));
 
     const h3 = ErgoTreeHeader.v1(false);
-    try std.testing.expectEqual(h3, ErgoTreeHeader.parse(h3.toByte()));
+    try std.testing.expectEqual(h3, try ErgoTreeHeader.parse(h3.toByte()));
 
     const h4 = ErgoTreeHeader.v1(true);
-    try std.testing.expectEqual(h4, ErgoTreeHeader.parse(h4.toByte()));
+    try std.testing.expectEqual(h4, try ErgoTreeHeader.parse(h4.toByte()));
 }
 
 test "ergotree: deserialize simple TrueLeaf" {
@@ -400,6 +423,53 @@ test "ergotree: error on reserved bits" {
     // Header with reserved bits set
     const data = [_]u8{ 0x20, 0x7F }; // Bit 5 set (reserved)
     try std.testing.expectError(error.InvalidHeader, deserialize(&tree, &data, &arena));
+}
+
+test "ergotree: 4KB size limit - exactly 4096 bytes succeeds" {
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(8192).init();
+
+    // Create a 4096-byte buffer with valid header + TrueLeaf + padding
+    var data: [max_ergo_tree_size]u8 = undefined;
+    data[0] = 0x00; // Header v0
+    data[1] = 0x7F; // TrueLeaf
+    // Rest is padding (will be ignored after TrueLeaf)
+    @memset(data[2..], 0x00);
+
+    // Should succeed - exactly at limit
+    try deserialize(&tree, &data, &arena);
+    try std.testing.expectEqual(expr_serializer.ExprTag.true_leaf, tree.expr_tree.nodes[0].tag);
+}
+
+test "ergotree: 4KB size limit - 4097 bytes fails with TreeTooBig" {
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(8192).init();
+
+    // Create a 4097-byte buffer (one byte over limit)
+    var data: [max_ergo_tree_size + 1]u8 = undefined;
+    data[0] = 0x00; // Header v0
+    data[1] = 0x7F; // TrueLeaf
+    @memset(data[2..], 0x00);
+
+    // Should fail - exceeds limit
+    try std.testing.expectError(error.TreeTooBig, deserialize(&tree, &data, &arena));
+}
+
+test "ergotree: 4KB size limit - large input rejected immediately" {
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    // Create a much larger buffer (8KB)
+    var data: [8192]u8 = undefined;
+    data[0] = 0x00;
+    data[1] = 0x7F;
+    @memset(data[2..], 0x00);
+
+    // Should fail immediately with TreeTooBig (before attempting to parse)
+    try std.testing.expectError(error.TreeTooBig, deserialize(&tree, &data, &arena));
 }
 
 // ============================================================================

@@ -1412,7 +1412,9 @@ pub const Evaluator = struct {
 
         switch (node.tag) {
             .bin_op => {
-                const kind: BinOpKind = @enumFromInt(node.data & 0xFF);
+                const kind: BinOpKind = std.meta.intToEnum(BinOpKind, node.data & 0xFF) catch {
+                    return error.InvalidBinOp;
+                };
                 try self.computeBinOp(kind);
             },
 
@@ -4211,7 +4213,7 @@ pub const Evaluator = struct {
 
         // Step 1: Parse ErgoTree header
         const header_byte = reader.readByte() catch return error.InvalidData;
-        const header = ergotree_serializer.ErgoTreeHeader.parse(header_byte);
+        const header = ergotree_serializer.ErgoTreeHeader.parse(header_byte) catch return error.InvalidData;
 
         // CRITICAL: SubstConstants only works with constant_segregation enabled
         if (!header.constant_segregation) {
