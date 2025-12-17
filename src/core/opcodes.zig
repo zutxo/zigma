@@ -377,8 +377,9 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         TrivialPropTrue => .{ .name = "TrivialPropTrue", .code = TrivialPropTrue, .category = .sigma, .cost = 10 },
 
         // Deserialization (shift 100-101)
-        DeserializeContext => .{ .name = "DeserializeContext", .code = DeserializeContext, .category = .special, .cost = 100 },
-        DeserializeRegister => .{ .name = "DeserializeRegister", .code = DeserializeRegister, .category = .special, .cost = 100 },
+        // PerItemCost: baseCost=1, perChunkCost=10, chunkSize=128
+        DeserializeContext => .{ .name = "DeserializeContext", .code = DeserializeContext, .category = .special, .cost = 1, .per_item_cost = 10 },
+        DeserializeRegister => .{ .name = "DeserializeRegister", .code = DeserializeRegister, .category = .special, .cost = 1, .per_item_cost = 10 },
 
         // Block/Function (shift 102-109)
         ValDef => .{ .name = "ValDef", .code = ValDef, .category = .control, .cost = 10 },
@@ -395,7 +396,7 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         NoneValue => .{ .name = "NoneValue", .code = NoneValue, .category = .collection, .cost = 10 },
 
         // Option operations (shift 115-118)
-        GetVar => .{ .name = "GetVar", .code = GetVar, .category = .context, .cost = 100 },
+        GetVar => .{ .name = "GetVar", .code = GetVar, .category = .context, .cost = 10 },
         OptionGet => .{ .name = "OptionGet", .code = OptionGet, .category = .collection, .cost = 15 },
         OptionGetOrElse => .{ .name = "OptionGetOrElse", .code = OptionGetOrElse, .category = .collection, .cost = 20 },
         OptionIsDefined => .{ .name = "OptionIsDefined", .code = OptionIsDefined, .category = .collection, .cost = 15 },
@@ -417,18 +418,18 @@ pub fn getInfo(code: OpCode) ?OpInfo {
         // Unary operations (shift 127-131)
         LogicalNot => .{ .name = "LogicalNot", .code = LogicalNot, .category = .logical, .cost = 11 },
         Negation => .{ .name = "Negation", .code = Negation, .category = .arithmetic, .cost = 30 },
-        BitInversion => .{ .name = "BitInversion", .code = BitInversion, .category = .bitwise, .cost = 30 },
-        BitOr => .{ .name = "BitOr", .code = BitOr, .category = .bitwise, .cost = 36 },
-        BitAnd => .{ .name = "BitAnd", .code = BitAnd, .category = .bitwise, .cost = 36 },
+        BitInversion => .{ .name = "BitInversion", .code = BitInversion, .category = .bitwise, .cost = 1 }, // v6+
+        BitOr => .{ .name = "BitOr", .code = BitOr, .category = .bitwise, .cost = 1 },
+        BitAnd => .{ .name = "BitAnd", .code = BitAnd, .category = .bitwise, .cost = 1 },
 
         // XOR operations (shift 132-133)
         BinXor => .{ .name = "BinXor", .code = BinXor, .category = .logical, .cost = 36 },
-        BitXor => .{ .name = "BitXor", .code = BitXor, .category = .bitwise, .cost = 36 },
+        BitXor => .{ .name = "BitXor", .code = BitXor, .category = .bitwise, .cost = 1 },
 
         // Bit shifts (shift 134-136)
-        BitShiftRight => .{ .name = "BitShiftRight", .code = BitShiftRight, .category = .bitwise, .cost = 36 },
-        BitShiftLeft => .{ .name = "BitShiftLeft", .code = BitShiftLeft, .category = .bitwise, .cost = 36 },
-        BitShiftRightZeroed => .{ .name = "BitShiftRightZeroed", .code = BitShiftRightZeroed, .category = .bitwise, .cost = 36 },
+        BitShiftRight => .{ .name = "BitShiftRight", .code = BitShiftRight, .category = .bitwise, .cost = 1 },
+        BitShiftLeft => .{ .name = "BitShiftLeft", .code = BitShiftLeft, .category = .bitwise, .cost = 1 },
+        BitShiftRightZeroed => .{ .name = "BitShiftRightZeroed", .code = BitShiftRightZeroed, .category = .bitwise, .cost = 1 },
 
         // Collection shifts (shift 137-141) - deprecated
         CollShiftRight => .{ .name = "CollShiftRight", .code = CollShiftRight, .category = .collection, .cost = 50 },

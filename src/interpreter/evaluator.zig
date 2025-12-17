@@ -4377,8 +4377,6 @@ pub const Evaluator = struct {
     /// Reads serialized expression bytes from context_vars[var_id], deserializes,
     /// evaluates in current context, and returns result.
     fn computeDeserializeContext(self: *Evaluator, node: ExprNode) EvalError!void {
-        try self.addCost(100); // DeserializeContext base cost
-
         // var_id stored in data, expected type in result_type
         const expected_type: TypeIndex = node.result_type;
         const var_id: u8 = @truncate(node.data);
@@ -4387,6 +4385,10 @@ pub const Evaluator = struct {
         const bytes = self.ctx.context_vars[var_id] orelse {
             return error.InvalidData; // Context variable not found
         };
+
+        // PerItemCost: baseCost=1, perChunkCost=10, chunkSize=128
+        const num_chunks: u32 = @intCast((bytes.len + 127) / 128); // ceil division
+        try self.addCost(1 + num_chunks * 10);
 
         // Evaluate the nested expression
         const result = try self.evaluateNestedExpression(bytes, expected_type);
@@ -4398,8 +4400,6 @@ pub const Evaluator = struct {
     /// evaluates in current context, and returns result.
     /// If register is empty and has_default=1, uses the default value from stack.
     fn computeDeserializeRegister(self: *Evaluator, node: ExprNode) EvalError!void {
-        try self.addCost(100); // DeserializeRegister base cost
-
         // Data format: reg_id(8 high) | has_default(8 low), expected type in result_type
         const expected_type: TypeIndex = node.result_type;
         const reg_id: u8 = @truncate(node.data >> 8);
@@ -4427,11 +4427,16 @@ pub const Evaluator = struct {
         };
 
         if (reg_bytes) |bytes| {
+            // PerItemCost: baseCost=1, perChunkCost=10, chunkSize=128
+            const num_chunks: u32 = @intCast((bytes.len + 127) / 128); // ceil division
+            try self.addCost(1 + num_chunks * 10);
+
             // Register has bytes - deserialize and evaluate
             const result = try self.evaluateNestedExpression(bytes, expected_type);
             try self.pushValue(result);
         } else if (default_value) |default| {
-            // Register empty, use default
+            // Register empty, use default (still charge base cost)
+            try self.addCost(1);
             try self.pushValue(default);
         } else {
             // Register empty, no default - error
