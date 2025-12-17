@@ -25,15 +25,17 @@ const null_value_idx = value_pool.null_value_idx;
 // Value Representation
 // ============================================================================
 
-/// Maximum size for BigInt (256 bits = 32 bytes)
-pub const max_bigint_bytes: usize = 32;
+/// Maximum size for BigInt (256 bits + sign byte = 33 bytes)
+/// Values up to q-1 (secp256k1 group order - 1) need 33 bytes when positive
+/// because the MSB is set, requiring a leading 0x00 for two's complement.
+pub const max_bigint_bytes: usize = 33;
 
 /// GroupElement size (33 bytes compressed SEC1)
 pub const group_element_size: usize = 33;
 
 // Compile-time sanity checks
 comptime {
-    assert(max_bigint_bytes == 32);
+    assert(max_bigint_bytes == 33);
     assert(group_element_size == 33);
 }
 
@@ -1133,8 +1135,8 @@ test "data_serializer: error on invalid bigint length" {
     var r1 = vlq.Reader.init(&[_]u8{0x00});
     try std.testing.expectError(error.InvalidData, deserialize(TypePool.BIG_INT, &pool, &r1, &arena, null));
 
-    // BigInt with length > 32
-    var r2 = vlq.Reader.init(&[_]u8{0x21}); // 33
+    // BigInt with length > 33
+    var r2 = vlq.Reader.init(&[_]u8{0x22}); // 34
     try std.testing.expectError(error.InvalidData, deserialize(TypePool.BIG_INT, &pool, &r2, &arena, null));
 }
 

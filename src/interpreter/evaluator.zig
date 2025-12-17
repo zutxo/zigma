@@ -110,7 +110,7 @@ fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
         // Complex value types
         TypePool.BIG_INT => blk: {
             var bi: Value.BigInt = .{
-                .bytes = [_]u8{0} ** 32,
+                .bytes = [_]u8{0} ** data.max_bigint_bytes,
                 .len = pooled.data.big_int.len,
             };
             @memcpy(bi.bytes[0..bi.len], pooled.data.big_int.bytes[0..bi.len]);
@@ -1800,10 +1800,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
-        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
-        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
+        // INVARIANT: modQ result always fits in max_bigint_bytes (33)
+        assert(result_bytes.len <= data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -1861,10 +1861,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
-        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
-        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
+        // INVARIANT: modQ result always fits in max_bigint_bytes (33)
+        assert(result_bytes.len <= data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -1906,10 +1906,10 @@ pub const Evaluator = struct {
         var result_buf: [33]u8 = undefined;
         const result_bytes = result.toBytes(&result_buf);
 
-        // Clamp to max BigInt storage (32 bytes) - truncate leading zeros if needed
-        const copy_len = @min(result_bytes.len, data.max_bigint_bytes);
-        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(copy_len) };
-        @memcpy(output.bytes[0..copy_len], result_bytes[0..copy_len]);
+        // INVARIANT: modQ result always fits in max_bigint_bytes (33)
+        assert(result_bytes.len <= data.max_bigint_bytes);
+        var output: data.Value.BigInt = .{ .bytes = undefined, .len = @intCast(result_bytes.len) };
+        @memcpy(output.bytes[0..result_bytes.len], result_bytes);
 
         try self.pushValue(.{ .big_int = output });
 
@@ -5764,9 +5764,8 @@ fn bigInt256ToValue(bi: BigInt256) Value {
     const slice = bi.toBytes(&temp_buf);
 
     var result: Value.BigInt = undefined;
-    // INVARIANT: BigInt256 minimal encoding is at most 33 bytes, but Value.BigInt has 32
-    // For values within Value.BigInt range, slice.len <= 32
-    assert(slice.len <= 32);
+    // INVARIANT: BigInt256 minimal encoding is at most 33 bytes
+    assert(slice.len <= data.max_bigint_bytes);
     result.len = @intCast(slice.len);
     @memcpy(result.bytes[0..result.len], slice);
     return .{ .big_int = result };

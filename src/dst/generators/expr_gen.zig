@@ -1058,19 +1058,49 @@ pub const ExprGenerator = struct {
                 }
             },
             TypePool.BIG_INT => {
-                // BigInt operations
-                // NOTE: mod_q/plus_mod_q/minus_mod_q have known bugs (DST found them!)
-                // Disabled until crypto/bigint.zig is fixed
-                // For now, only generate simple BigInt conversions
-                _ = try self.addNode(.{
-                    .tag = .byte_array_to_bigint,
-                    .result_type = TypePool.BIG_INT,
-                });
-                _ = try self.addNode(.{
-                    .tag = .long_to_byte_array,
-                    .result_type = TypePool.COLL_BYTE,
-                });
-                try self.generateForType(TypePool.LONG);
+                // BigInt operations including modular arithmetic
+                // Buffer overflow bug fixed - max_bigint_bytes increased to 33
+                const choice = self.prng.range_inclusive(u8, 0, 3);
+                switch (choice) {
+                    0 => {
+                        // mod_q: BigInt → BigInt (reduce mod secp256k1 order)
+                        _ = try self.addNode(.{
+                            .tag = .mod_q,
+                            .result_type = TypePool.BIG_INT,
+                        });
+                        try self.generateBigIntLeaf();
+                    },
+                    1 => {
+                        // plus_mod_q: BigInt × BigInt → BigInt
+                        _ = try self.addNode(.{
+                            .tag = .plus_mod_q,
+                            .result_type = TypePool.BIG_INT,
+                        });
+                        try self.generateBigIntLeaf();
+                        try self.generateBigIntLeaf();
+                    },
+                    2 => {
+                        // minus_mod_q: BigInt × BigInt → BigInt
+                        _ = try self.addNode(.{
+                            .tag = .minus_mod_q,
+                            .result_type = TypePool.BIG_INT,
+                        });
+                        try self.generateBigIntLeaf();
+                        try self.generateBigIntLeaf();
+                    },
+                    else => {
+                        // byte_array_to_bigint: Coll[Byte] → BigInt
+                        _ = try self.addNode(.{
+                            .tag = .byte_array_to_bigint,
+                            .result_type = TypePool.BIG_INT,
+                        });
+                        _ = try self.addNode(.{
+                            .tag = .long_to_byte_array,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        try self.generateForType(TypePool.LONG);
+                    },
+                }
             },
             else => {
                 // Fallback to leaf

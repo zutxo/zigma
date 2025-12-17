@@ -1393,6 +1393,36 @@ test "bigint: modQ result always in valid range" {
     }
 }
 
+test "bigint: modQ result encoding fits in 33 bytes" {
+    // Test edge case: -1 mod q = q - 1, which is a large value with MSB set
+    // This requires 33 bytes in two's complement (leading 0x00 for positive sign)
+    const neg_one = BigInt256.fromInt(-1);
+    const result = try neg_one.modQ();
+
+    // Result should be q - 1
+    const expected = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    try std.testing.expect(result.eql(expected));
+
+    // Verify encoding needs 33 bytes (has leading 0x00)
+    var buf: [33]u8 = undefined;
+    const bytes = result.toBytes(&buf);
+    try std.testing.expectEqual(@as(usize, 33), bytes.len);
+    try std.testing.expectEqual(@as(u8, 0x00), bytes[0]); // Leading zero for positive
+    try std.testing.expect((bytes[1] & 0x80) != 0); // MSB of next byte is set
+}
+
+test "bigint: plusModQ result encoding fits in 33 bytes" {
+    // (q-1) + 0 = q-1, which needs 33 bytes
+    const q_minus_1 = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    const result = try q_minus_1.plusModQ(BigInt256.zero);
+
+    try std.testing.expect(result.eql(q_minus_1));
+
+    var buf: [33]u8 = undefined;
+    const bytes = result.toBytes(&buf);
+    try std.testing.expectEqual(@as(usize, 33), bytes.len);
+}
+
 // ============================================================================
 // UnsignedBigInt256 - 256-bit Unsigned Integer (v6+)
 // ============================================================================
