@@ -70,6 +70,19 @@ pub const BigInt256 = struct {
         .negative = false,
     };
 
+    /// 2^256 - GROUP_ORDER (used for modular reduction when overflow occurs)
+    /// This is the additive inverse of GROUP_ORDER mod 2^256
+    /// Used in plusModQ when sum overflows but limbs < GROUP_ORDER
+    pub const ORDER_COMPLEMENT = BigInt256{
+        .limbs = .{
+            0x402DA1732FC9BEBF, // LSB
+            0x4551231950B75FC4,
+            0x0000000000000001,
+            0x0000000000000000, // MSB
+        },
+        .negative = false,
+    };
+
     /// Maximum positive value: 2^255 - 1
     pub const max_value = BigInt256{
         .limbs = .{
@@ -615,10 +628,19 @@ pub const BigInt256 = struct {
         const sum_result = addLimbs(a_mod.limbs, b_mod.limbs);
 
         if (sum_result.overflow) {
-            // Sum >= 2^256, definitely >= q, so subtract q
-            // sum - q = (sum - q) which fits since sum < 2q
-            const result_limbs = subLimbs(sum_result.limbs, GROUP_ORDER.limbs);
-            return BigInt256{ .limbs = result_limbs, .negative = false };
+            // true_sum = limbs + 2^256, we want (true_sum - q)
+            const cmp = compareMagnitude(sum_result.limbs, GROUP_ORDER.limbs);
+            if (cmp != .lt) {
+                // limbs >= q: subtract directly
+                const result_limbs = subLimbs(sum_result.limbs, GROUP_ORDER.limbs);
+                return BigInt256{ .limbs = result_limbs, .negative = false };
+            } else {
+                // limbs < q: use identity (limbs + 2^256) - q = limbs + (2^256 - q)
+                const add_result = addLimbs(sum_result.limbs, ORDER_COMPLEMENT.limbs);
+                // Result < q < 2^256, so no overflow
+                assert(!add_result.overflow);
+                return BigInt256{ .limbs = add_result.limbs, .negative = false };
+            }
         } else {
             // No overflow, but may still be >= q
             const result = BigInt256{ .limbs = sum_result.limbs, .negative = false };
@@ -1296,6 +1318,38 @@ test "bigint: plusModQ with wrap" {
 
     const result = try q_minus_1.plusModQ(two);
     try std.testing.expect(result.eql(BigInt256.one));
+}
+
+test "bigint: plusModQ overflow with small limbs" {
+    // Test case that triggers overflow where limbs < GROUP_ORDER
+    // (q-1) + (q-1) = 2q - 2, which overflows 256 bits
+    // Result should be (2q - 2) mod q = q - 2
+    const q_minus_1 = try BigInt256.GROUP_ORDER.sub(BigInt256.one);
+    const result = try q_minus_1.plusModQ(q_minus_1);
+
+    const expected = try BigInt256.GROUP_ORDER.sub(BigInt256.fromInt(2));
+    try std.testing.expect(result.eql(expected));
+}
+
+test "bigint: ORDER_COMPLEMENT is correct" {
+    // Verify: GROUP_ORDER + ORDER_COMPLEMENT = 2^256
+    // Since 2^256 can't be represented in 256 bits, verify by computing
+    // the limb-by-limb sum and checking it equals 0 with overflow
+    const q = BigInt256.GROUP_ORDER.limbs;
+    const c = BigInt256.ORDER_COMPLEMENT.limbs;
+
+    // Manual limb addition to verify
+    var carry: u64 = 0;
+    var result: [4]u64 = undefined;
+    for (0..4) |i| {
+        const sum1: u128 = @as(u128, q[i]) + @as(u128, c[i]) + @as(u128, carry);
+        result[i] = @truncate(sum1);
+        carry = @truncate(sum1 >> 64);
+    }
+
+    // All limbs should be 0, with carry out of 1 (meaning result = 2^256)
+    try std.testing.expectEqual([4]u64{ 0, 0, 0, 0 }, result);
+    try std.testing.expectEqual(@as(u64, 1), carry);
 }
 
 test "bigint: minusModQ basic" {
