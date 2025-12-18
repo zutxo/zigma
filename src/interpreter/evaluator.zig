@@ -4205,6 +4205,8 @@ pub const Evaluator = struct {
             switch (method_id) {
                 ContextMethodId.data_inputs => try self.computeDataInputs(),
                 ContextMethodId.headers => try self.computeContextHeaders(),
+                ContextMethodId.pre_header => try self.computeContextPreHeader(),
+                ContextMethodId.self_box_index => try self.computeSelfBoxIndex(),
                 ContextMethodId.get_var_from_input => try self.computeGetVarFromInput(node),
                 else => return self.handleUnsupported(),
             }
@@ -4838,6 +4840,54 @@ pub const Evaluator = struct {
         };
 
         try self.pushValue(.{ .header = header_ref });
+
+        // POSTCONDITION: One value pushed to stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute CONTEXT.preHeader: returns the pre-header for the current block being validated.
+    /// PreHeader is the candidate block header during mining/validation.
+    fn computeContextPreHeader(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+
+        // Pop the context object (not used - we use self.ctx directly)
+        _ = try self.popValue();
+
+        try self.addCost(10); // FixedCost for preheader access
+
+        // Copy pre_header data from context to PreHeaderRef
+        const ctx_ph = &self.ctx.pre_header;
+        const pre_header_ref = data.Value.PreHeaderRef{
+            .version = ctx_ph.version,
+            .parent_id = ctx_ph.parent_id,
+            .timestamp = ctx_ph.timestamp,
+            .n_bits = ctx_ph.n_bits,
+            .height = ctx_ph.height,
+            .miner_pk = ctx_ph.miner_pk,
+            .votes = ctx_ph.votes,
+        };
+
+        try self.pushValue(.{ .pre_header = pre_header_ref });
+
+        // POSTCONDITION: One value pushed to stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute CONTEXT.selfBoxIndex: returns the index of SELF box within INPUTS.
+    fn computeSelfBoxIndex(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+
+        // Pop the context object (not used - we use self.ctx directly)
+        _ = try self.popValue();
+
+        try self.addCost(10); // FixedCost for selfBoxIndex access
+
+        // INVARIANT: self_index is a valid input index
+        assert(self.ctx.self_index < self.ctx.inputs.len);
+
+        try self.pushValue(.{ .int = @intCast(self.ctx.self_index) });
 
         // POSTCONDITION: One value pushed to stack
         assert(self.value_sp > 0);
