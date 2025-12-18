@@ -2891,6 +2891,197 @@ pub const Evaluator = struct {
         assert(self.value_sp == initial_sp);
     }
 
+    /// Compute Header.id: Header → Coll[Byte] (32 byte header hash)
+    fn computeExtractHeaderId(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        // INVARIANT: id is 32 bytes
+        assert(header.id.len == 32);
+
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.id);
+        try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Header.height: Header → Int
+    fn computeExtractHeight(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        try self.pushValue(.{ .int = @intCast(header.height) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Header.extensionRoot: Header → Coll[Byte] (32 bytes)
+    fn computeExtractExtensionRoot(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        // INVARIANT: extension_root is 32 bytes
+        assert(header.extension_root.len == 32);
+
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.extension_root);
+        try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Header.powOnetimePk: Header → GroupElement (33 byte compressed point)
+    fn computeExtractPowOnetimePk(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        // INVARIANT: pow_onetime_pk is 33 bytes with valid SEC1 prefix
+        assert(header.pow_onetime_pk.len == 33);
+        assert(header.pow_onetime_pk[0] == 0x02 or header.pow_onetime_pk[0] == 0x03 or header.pow_onetime_pk[0] == 0x00);
+
+        try self.pushValue(.{ .group_element = header.pow_onetime_pk });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Header.powNonce: Header → Coll[Byte] (8 bytes)
+    fn computeExtractPowNonce(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+        try self.addCost(FixedCost.extract_header_field);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        // INVARIANT: pow_nonce is 8 bytes
+        assert(header.pow_nonce.len == 8);
+
+        const result_slice = self.arena.allocSlice(u8, 8) catch return error.OutOfMemory;
+        @memcpy(result_slice, &header.pow_nonce);
+        try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Header.checkPow: validates Autolykos2 proof-of-work
+    /// Returns true if pow_distance <= target (derived from n_bits)
+    /// Cost: 700 (approx 2×32 Blake2b256 hashes worth)
+    fn computeCheckPow(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has header
+        assert(self.value_sp > 0);
+
+        const initial_sp = self.value_sp;
+
+        // Cost: 700 as specified in Scala SHeader.checkPow (v6)
+        try self.addCost(700);
+
+        const header_val = try self.popValue();
+        if (header_val != .header) return error.TypeMismatch;
+
+        const header = header_val.header;
+
+        // Decode n_bits to get difficulty target (same as decodeNBits)
+        // n_bits format: [exponent: 1 byte][mantissa: 3 bytes]
+        const n_bits_bytes: [8]u8 = @bitCast(std.mem.nativeToBig(u64, header.n_bits));
+        const exponent = n_bits_bytes[4]; // First byte after leading zeros
+        const mantissa_bytes = [3]u8{ n_bits_bytes[5], n_bits_bytes[6], n_bits_bytes[7] };
+        const mantissa: u32 = (@as(u32, mantissa_bytes[0]) << 16) |
+            (@as(u32, mantissa_bytes[1]) << 8) |
+            @as(u32, mantissa_bytes[2]);
+
+        // Target = mantissa * 2^(8*(exponent-3))
+        // For comparison, we work with the BigInt256 representation
+
+        // Build target as BigInt256
+        var target = UnsignedBigInt256.zero;
+
+        if (exponent <= 3) {
+            // Target fits in mantissa itself (shift right)
+            const shift = (3 - exponent) * 8;
+            const shifted_mantissa = if (shift >= 32) 0 else mantissa >> @intCast(shift);
+            target.limbs[0] = @as(u64, shifted_mantissa);
+        } else {
+            // Shift mantissa left by (exponent-3)*8 bits
+            const shift_bits: u32 = (exponent - 3) * 8;
+            const shift_limbs = shift_bits / 64;
+            const shift_rem: u6 = @intCast(shift_bits % 64);
+
+            if (shift_limbs < 4) {
+                target.limbs[shift_limbs] = @as(u64, mantissa) << shift_rem;
+                // Handle high bits spilling to next limb
+                if (shift_rem > 0 and shift_limbs + 1 < 4) {
+                    // shift_rem is 1-63, so 64-shift_rem is 1-63, fits in u6
+                    const right_shift: u6 = @intCast(64 - @as(u32, shift_rem));
+                    target.limbs[shift_limbs + 1] = @as(u64, mantissa) >> right_shift;
+                }
+            }
+            // If shift_limbs >= 4, target overflows - remains very large (implicitly true)
+        }
+
+        // Convert pow_distance (32 bytes big-endian) to UnsignedBigInt256
+        var pow_dist = UnsignedBigInt256.zero;
+        const pow_bytes = &header.pow_distance;
+
+        // pow_distance is 32 bytes big-endian
+        // Convert to 4 x u64 little-endian limbs
+        pow_dist.limbs[3] = std.mem.readInt(u64, pow_bytes[0..8], .big);
+        pow_dist.limbs[2] = std.mem.readInt(u64, pow_bytes[8..16], .big);
+        pow_dist.limbs[1] = std.mem.readInt(u64, pow_bytes[16..24], .big);
+        pow_dist.limbs[0] = std.mem.readInt(u64, pow_bytes[24..32], .big);
+
+        // Check: pow_distance <= target
+        // UnsignedBigInt256 comparison: compare limbs from high to low
+        const cmp = pow_dist.compare(target);
+        const valid = (cmp == .lt or cmp == .eq);
+
+        try self.pushValue(.{ .boolean = valid });
+
+        // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
+    }
+
     // ========================================================================
     // Collection HOF operations
     // ========================================================================
@@ -3437,6 +3628,93 @@ pub const Evaluator = struct {
         }
     };
 
+    /// UnsignedBigInt type code from Scala SUnsignedBigInt (v6+)
+    const UnsignedBigIntTypeCode: u8 = 9; // TYPE_CODE for UnsignedBigInt
+
+    /// UnsignedBigInt method IDs from Scala SUnsignedBigInt (v6+)
+    /// Reference: Scala sigmastate SUnsignedBigInt.scala
+    const UnsignedBigIntMethodId = struct {
+        const mod_method: u8 = 14; // ubi.mod(m) → UnsignedBigInt
+        const mod_inverse: u8 = 15; // ubi.modInverse(m) → UnsignedBigInt
+        const plus_mod: u8 = 16; // ubi.plusMod(other, m) → UnsignedBigInt
+        const subtract_mod: u8 = 17; // ubi.subtractMod(other, m) → UnsignedBigInt
+        const multiply_mod: u8 = 18; // ubi.multiplyMod(other, m) → UnsignedBigInt
+        const to_signed: u8 = 19; // ubi.toSigned → BigInt
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ mod_method, mod_inverse, plus_mod, subtract_mod, multiply_mod, to_signed };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("UnsignedBigIntMethodId collision detected");
+                }
+            }
+        }
+    };
+
+    /// Header object type code from Scala SHeader
+    const HeaderTypeCode: u8 = 104; // TYPE_CODE for Header (0x68)
+
+    /// Header method IDs from Scala SHeader
+    /// Reference: Scala sigmastate SHeader.scala
+    const HeaderMethodId = struct {
+        const id: u8 = 1; // header.id → Coll[Byte] (32 bytes header hash)
+        const version: u8 = 2; // header.version → Byte
+        const parent_id: u8 = 3; // header.parentId → Coll[Byte]
+        const ad_proofs_root: u8 = 4; // header.ADProofsRoot → Coll[Byte]
+        const state_root: u8 = 5; // header.stateRoot → AvlTree
+        const transactions_root: u8 = 6; // header.transactionsRoot → Coll[Byte]
+        const timestamp: u8 = 7; // header.timestamp → Long
+        const n_bits: u8 = 8; // header.nBits → Long
+        const height: u8 = 9; // header.height → Int
+        const extension_root: u8 = 10; // header.extensionRoot → Coll[Byte]
+        const miner_pk: u8 = 11; // header.minerPk → GroupElement
+        const pow_onetime_pk: u8 = 12; // header.powOnetimePk → GroupElement
+        const pow_nonce: u8 = 13; // header.powNonce → Coll[Byte]
+        const pow_distance: u8 = 14; // header.powDistance → BigInt
+        const votes: u8 = 15; // header.votes → Coll[Byte]
+        const check_pow: u8 = 16; // header.checkPow → Boolean (v6+)
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{
+                id,         version,           parent_id, ad_proofs_root,
+                state_root, transactions_root, timestamp, n_bits,
+                height,     extension_root,    miner_pk,  pow_onetime_pk,
+                pow_nonce,  pow_distance,      votes,     check_pow,
+            };
+            for (ids, 0..) |mid, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (mid == other) @compileError("HeaderMethodId collision detected");
+                }
+            }
+        }
+    };
+
+    /// Global object type code from Scala SGlobal (v6+)
+    const GlobalTypeCode: u8 = 106; // TYPE_CODE for Global (0x6A)
+
+    /// Global method IDs from Scala SGlobal (v6+)
+    /// Reference: Scala sigmastate SGlobal.scala
+    const GlobalMethodId = struct {
+        const group_generator: u8 = 1; // Global.groupGenerator → GroupElement
+        const xor: u8 = 2; // Global.xor(left, right) → Coll[Byte]
+        const serialize: u8 = 3; // Global.serialize[T](value) → Coll[Byte]
+        const from_big_endian_bytes: u8 = 5; // Global.fromBigEndianBytes[T](bytes) → T
+        const encode_nbits: u8 = 6; // Global.encodeNBits(n: BigInt) → Long
+        const decode_nbits: u8 = 7; // Global.decodeNBits(nBits: Long) → BigInt
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ group_generator, xor, serialize, from_big_endian_bytes, encode_nbits, decode_nbits };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("GlobalMethodId collision detected");
+                }
+            }
+        }
+    };
+
     /// Compute method call: dispatch based on type_code and method_id
     fn computeMethodCall(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
@@ -3465,12 +3743,12 @@ pub const Evaluator = struct {
                 CollMethodId.ends_with => try self.computeEndsWith(),
                 CollMethodId.index_of => try self.computeIndexOf(),
                 CollMethodId.get => try self.computeCollGet(),
-                // Complex methods that need function/tuple support
-                CollMethodId.flatmap,
-                CollMethodId.patch,
-                CollMethodId.updated,
-                CollMethodId.update_many,
-                => return self.handleUnsupported(),
+                // Collection modification methods
+                CollMethodId.patch => try self.computePatch(),
+                CollMethodId.updated => try self.computeUpdated(),
+                CollMethodId.update_many => try self.computeUpdateMany(),
+                // Complex methods that need higher-order function support
+                CollMethodId.flatmap => return self.handleUnsupported(),
                 else => return self.handleUnsupported(),
             }
         } else if (type_code == AvlTreeTypeCode) {
@@ -3505,6 +3783,70 @@ pub const Evaluator = struct {
             switch (method_id) {
                 ContextMethodId.data_inputs => try self.computeDataInputs(),
                 ContextMethodId.get_var_from_input => try self.computeGetVarFromInput(node),
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == UnsignedBigIntTypeCode) {
+            // UnsignedBigInt methods (v6+)
+            // VERSION GATE: All UnsignedBigInt methods are v6 features
+            if (!self.version_ctx.isV6Activated()) {
+                return error.SoftForkAccepted;
+            }
+
+            switch (method_id) {
+                UnsignedBigIntMethodId.mod_method => try self.computeUBIMod(),
+                UnsignedBigIntMethodId.mod_inverse => try self.computeUBIModInverse(),
+                UnsignedBigIntMethodId.plus_mod => try self.computeUBIPlusMod(),
+                UnsignedBigIntMethodId.subtract_mod => try self.computeUBISubtractMod(),
+                UnsignedBigIntMethodId.multiply_mod => try self.computeUBIMultiplyMod(),
+                UnsignedBigIntMethodId.to_signed => try self.computeUBIToSigned(),
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == GlobalTypeCode) {
+            // Global methods (v6+)
+            // VERSION GATE: Global.serialize, fromBigEndianBytes, encodeNBits, decodeNBits are v6
+            if (!self.version_ctx.isV6Activated()) {
+                return error.SoftForkAccepted;
+            }
+
+            switch (method_id) {
+                GlobalMethodId.group_generator => try self.computeGroupGenerator(),
+                GlobalMethodId.xor => try self.computeGlobalXor(),
+                GlobalMethodId.encode_nbits => try self.computeEncodeNBits(),
+                GlobalMethodId.decode_nbits => try self.computeDecodeNBits(),
+                // Complex methods requiring type parameter support
+                GlobalMethodId.serialize,
+                GlobalMethodId.from_big_endian_bytes,
+                => return self.handleUnsupported(),
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == HeaderTypeCode) {
+            // Header methods
+            // Most header property methods available since v1
+            // VERSION GATE: Only Header.checkPow is v6+
+            switch (method_id) {
+                // Property access methods (available since v1)
+                HeaderMethodId.id => try self.computeExtractHeaderId(),
+                HeaderMethodId.version => try self.computeExtractVersion(),
+                HeaderMethodId.parent_id => try self.computeExtractParentId(),
+                HeaderMethodId.ad_proofs_root => try self.computeExtractAdProofsRoot(),
+                HeaderMethodId.state_root => try self.computeExtractStateRoot(),
+                HeaderMethodId.transactions_root => try self.computeExtractTxsRoot(),
+                HeaderMethodId.timestamp => try self.computeExtractTimestamp(),
+                HeaderMethodId.n_bits => try self.computeExtractNBits(),
+                HeaderMethodId.height => try self.computeExtractHeight(),
+                HeaderMethodId.extension_root => try self.computeExtractExtensionRoot(),
+                HeaderMethodId.miner_pk => try self.computeExtractMinerRewards(),
+                HeaderMethodId.pow_onetime_pk => try self.computeExtractPowOnetimePk(),
+                HeaderMethodId.pow_nonce => try self.computeExtractPowNonce(),
+                HeaderMethodId.pow_distance => try self.computeExtractDifficulty(),
+                HeaderMethodId.votes => try self.computeExtractVotes(),
+                // v6 method
+                HeaderMethodId.check_pow => {
+                    if (!self.version_ctx.isV6Activated()) {
+                        return error.SoftForkAccepted;
+                    }
+                    try self.computeCheckPow();
+                },
                 else => return self.handleUnsupported(),
             }
         } else {
@@ -3786,6 +4128,204 @@ pub const Evaluator = struct {
 
         // POSTCONDITIONS
         assert(self.value_sp == initial_sp - 1); // Popped 2, pushed 1
+    }
+
+    /// Compute patch: Coll[T].patch(from, patch, replaced) → Coll[T]
+    /// Produces a new collection where `replaced` elements starting at `from`
+    /// are replaced by elements from `patch`.
+    /// Result: coll[0..from] ++ patch ++ coll[from+replaced..]
+    /// Reference: Scala Coll.patch
+    fn computePatch(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 4 values on stack (coll, from, patch_coll, replaced)
+        assert(self.value_sp >= 4);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        // Cost: per-item based on result size
+        // Pop in reverse order: replaced, patch_coll, from, coll
+        const replaced_val = try self.popValue();
+        const patch_val = try self.popValue();
+        const from_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        // Get 'from' index (clamp negative to 0)
+        const from_raw: i64 = switch (from_val) {
+            .int => |i| @as(i64, i),
+            .long => |i| i,
+            else => return error.TypeMismatch,
+        };
+        const from: usize = if (from_raw < 0) 0 else @intCast(@min(from_raw, std.math.maxInt(u32)));
+
+        // Get 'replaced' count (clamp negative to 0)
+        const replaced_raw: i64 = switch (replaced_val) {
+            .int => |i| @as(i64, i),
+            .long => |i| i,
+            else => return error.TypeMismatch,
+        };
+        const replaced: usize = if (replaced_raw < 0) 0 else @intCast(@min(replaced_raw, std.math.maxInt(u32)));
+
+        switch (coll_val) {
+            .coll_byte => |coll| {
+                const patch_bytes = switch (patch_val) {
+                    .coll_byte => |p| p,
+                    else => return error.TypeMismatch,
+                };
+
+                // Clamp 'from' to collection length
+                const actual_from = @min(from, coll.len);
+                // Clamp 'replaced' to available elements after 'from'
+                const actual_replaced = @min(replaced, coll.len - actual_from);
+
+                // Calculate result length
+                const result_len = coll.len - actual_replaced + patch_bytes.len;
+
+                // INVARIANT: result_len is reasonable
+                if (result_len > 65536) return error.CollectionTooLarge;
+
+                // Add per-item cost
+                try self.addCost(@intCast(result_len * 2));
+
+                // Allocate result
+                const result = self.arena.allocSlice(u8, result_len) catch return error.OutOfMemory;
+
+                // Build result: coll[0..from] ++ patch ++ coll[from+replaced..]
+                var dst: usize = 0;
+
+                // Copy prefix: coll[0..actual_from]
+                @memcpy(result[dst..][0..actual_from], coll[0..actual_from]);
+                dst += actual_from;
+
+                // Copy patch
+                @memcpy(result[dst..][0..patch_bytes.len], patch_bytes);
+                dst += patch_bytes.len;
+
+                // Copy suffix: coll[actual_from+actual_replaced..]
+                const suffix_start = actual_from + actual_replaced;
+                const suffix_len = coll.len - suffix_start;
+                @memcpy(result[dst..][0..suffix_len], coll[suffix_start..]);
+
+                // POSTCONDITION: Result is correctly sized
+                assert(result.len == result_len);
+
+                try self.pushValue(.{ .coll_byte = result });
+            },
+            else => return error.TypeMismatch,
+        }
+
+        // POSTCONDITION: Popped 4, pushed 1
+        assert(self.value_sp == initial_sp - 3);
+    }
+
+    /// Compute updated: Coll[T].updated(idx, elem) → Coll[T]
+    /// Returns new collection with element at idx replaced with elem.
+    /// Reference: Scala Coll.updated
+    fn computeUpdated(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (coll, idx, elem)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order: elem, idx, coll
+        const elem_val = try self.popValue();
+        const idx_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        // Get index
+        const idx: i64 = switch (idx_val) {
+            .int => |i| @as(i64, i),
+            .long => |i| i,
+            else => return error.TypeMismatch,
+        };
+
+        switch (coll_val) {
+            .coll_byte => |coll| {
+                // Bounds check
+                if (idx < 0 or idx >= @as(i64, @intCast(coll.len))) {
+                    return error.IndexOutOfBounds;
+                }
+
+                // Get element to insert
+                const elem: u8 = switch (elem_val) {
+                    .int => |i| if (i < 0 or i > 255) return error.ArithmeticOverflow else @intCast(i),
+                    .byte => |b| @bitCast(b),
+                    else => return error.TypeMismatch,
+                };
+
+                // Cost: copy entire collection
+                try self.addCost(@intCast(coll.len));
+
+                // Allocate and copy
+                const result = self.arena.allocSlice(u8, coll.len) catch return error.OutOfMemory;
+                @memcpy(result, coll);
+
+                // Update the element
+                result[@intCast(@as(u64, @bitCast(idx)))] = elem;
+
+                try self.pushValue(.{ .coll_byte = result });
+            },
+            else => return error.TypeMismatch,
+        }
+
+        // POSTCONDITION: Popped 3, pushed 1
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute updateMany: Coll[T].updateMany(indexes, values) → Coll[T]
+    /// Returns new collection with elements at indexes replaced with corresponding values.
+    /// Reference: Scala Coll.updateMany
+    fn computeUpdateMany(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (coll, indexes, values)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order: values, indexes, coll
+        const values_val = try self.popValue();
+        const indexes_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        switch (coll_val) {
+            .coll_byte => |coll| {
+                // Get indexes collection
+                const indexes = switch (indexes_val) {
+                    .coll_byte => |c| c, // Treat bytes as indexes
+                    else => return error.TypeMismatch,
+                };
+
+                // Get values collection
+                const values = switch (values_val) {
+                    .coll_byte => |c| c,
+                    else => return error.TypeMismatch,
+                };
+
+                // Indexes and values must have same length
+                if (indexes.len != values.len) {
+                    return error.TypeMismatch;
+                }
+
+                // Cost: copy entire collection + per update
+                try self.addCost(@intCast(coll.len + indexes.len));
+
+                // Allocate and copy
+                const result = self.arena.allocSlice(u8, coll.len) catch return error.OutOfMemory;
+                @memcpy(result, coll);
+
+                // Apply updates
+                for (indexes, values) |idx_byte, value| {
+                    const idx: usize = idx_byte;
+                    if (idx >= result.len) {
+                        return error.IndexOutOfBounds;
+                    }
+                    result[idx] = value;
+                }
+
+                try self.pushValue(.{ .coll_byte = result });
+            },
+            else => return error.TypeMismatch,
+        }
+
+        // POSTCONDITION: Popped 3, pushed 1
+        assert(self.value_sp == initial_sp - 2);
     }
 
     // ========================================================================
@@ -4667,6 +5207,450 @@ pub const Evaluator = struct {
             return val;
         }
         return error.InvalidData;
+    }
+
+    // ========================================================================
+    // UnsignedBigInt Method Operations (v6+)
+    // ========================================================================
+
+    /// Cost constants for UnsignedBigInt operations (from Scala)
+    const UBICost = struct {
+        const mod_cost: u32 = 20; // ubi.mod(m)
+        const mod_inverse_cost: u32 = 150; // ubi.modInverse(m) - expensive (Extended Euclidean)
+        const plus_mod_cost: u32 = 30; // ubi.plusMod(other, m)
+        const subtract_mod_cost: u32 = 30; // ubi.subtractMod(other, m)
+        const multiply_mod_cost: u32 = 40; // ubi.multiplyMod(other, m)
+        const to_signed_cost: u32 = 10; // ubi.toSigned
+    };
+
+    /// Compute ubi.mod(m) → UnsignedBigInt
+    /// Returns self % m
+    fn computeUBIMod(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // ubi and m on stack
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.mod_cost);
+
+        // Pop in reverse order (m, ubi)
+        const m_val = try self.popValue();
+        const ubi_val = try self.popValue();
+
+        // Both must be unsigned_big_int
+        if (m_val != .unsigned_big_int or ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+        const m = try valueToUnsignedBigInt256(m_val.unsigned_big_int);
+
+        // Compute mod
+        const result = ubi.mod(m) catch return error.DivisionByZero;
+
+        // POSTCONDITIONS
+        try self.pushValue(unsignedBigInt256ToValue(result));
+        assert(self.value_sp == initial_sp - 1); // Popped 2, pushed 1
+    }
+
+    /// Compute ubi.modInverse(m) → UnsignedBigInt
+    /// Returns modular multiplicative inverse using Extended Euclidean Algorithm
+    fn computeUBIModInverse(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.mod_inverse_cost);
+
+        const m_val = try self.popValue();
+        const ubi_val = try self.popValue();
+
+        if (m_val != .unsigned_big_int or ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+        const m = try valueToUnsignedBigInt256(m_val.unsigned_big_int);
+
+        // Compute modular inverse
+        const result = ubi.modInverse(m) catch return error.DivisionByZero;
+
+        try self.pushValue(unsignedBigInt256ToValue(result));
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Compute ubi.plusMod(other, m) → UnsignedBigInt
+    /// Returns (self + other) % m
+    fn computeUBIPlusMod(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3); // ubi, other, m on stack
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.plus_mod_cost);
+
+        // Pop in reverse order (m, other, ubi)
+        const m_val = try self.popValue();
+        const other_val = try self.popValue();
+        const ubi_val = try self.popValue();
+
+        if (m_val != .unsigned_big_int or other_val != .unsigned_big_int or ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+        const other = try valueToUnsignedBigInt256(other_val.unsigned_big_int);
+        const m = try valueToUnsignedBigInt256(m_val.unsigned_big_int);
+
+        // Compute (ubi + other) mod m
+        const result = ubi.plusMod(other, m) catch return error.DivisionByZero;
+
+        try self.pushValue(unsignedBigInt256ToValue(result));
+        assert(self.value_sp == initial_sp - 2); // Popped 3, pushed 1
+    }
+
+    /// Compute ubi.subtractMod(other, m) → UnsignedBigInt
+    /// Returns (self - other) % m (always non-negative)
+    fn computeUBISubtractMod(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.subtract_mod_cost);
+
+        const m_val = try self.popValue();
+        const other_val = try self.popValue();
+        const ubi_val = try self.popValue();
+
+        if (m_val != .unsigned_big_int or other_val != .unsigned_big_int or ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+        const other = try valueToUnsignedBigInt256(other_val.unsigned_big_int);
+        const m = try valueToUnsignedBigInt256(m_val.unsigned_big_int);
+
+        // Compute (ubi - other) mod m
+        const result = ubi.subtractMod(other, m) catch return error.DivisionByZero;
+
+        try self.pushValue(unsignedBigInt256ToValue(result));
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute ubi.multiplyMod(other, m) → UnsignedBigInt
+    /// Returns (self * other) % m
+    fn computeUBIMultiplyMod(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.multiply_mod_cost);
+
+        const m_val = try self.popValue();
+        const other_val = try self.popValue();
+        const ubi_val = try self.popValue();
+
+        if (m_val != .unsigned_big_int or other_val != .unsigned_big_int or ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+        const other = try valueToUnsignedBigInt256(other_val.unsigned_big_int);
+        const m = try valueToUnsignedBigInt256(m_val.unsigned_big_int);
+
+        // Compute (ubi * other) mod m
+        const result = ubi.multiplyMod(other, m) catch return error.DivisionByZero;
+
+        try self.pushValue(unsignedBigInt256ToValue(result));
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute ubi.toSigned → BigInt
+    /// Converts UnsignedBigInt to signed BigInt (error if >= 2^255)
+    fn computeUBIToSigned(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+        assert(self.value_sp <= max_value_stack);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(UBICost.to_signed_cost);
+
+        const ubi_val = try self.popValue();
+
+        if (ubi_val != .unsigned_big_int) {
+            return error.TypeMismatch;
+        }
+
+        const ubi = try valueToUnsignedBigInt256(ubi_val.unsigned_big_int);
+
+        // Convert to signed (errors if value >= 2^255)
+        const signed = ubi.toSigned() catch return error.ArithmeticOverflow;
+
+        try self.pushValue(bigInt256ToValue(signed));
+        assert(self.value_sp == initial_sp); // Popped 1, pushed 1
+    }
+
+    // ========================================================================
+    // Global Method Operations (v6+)
+    // ========================================================================
+
+    /// Cost constants for Global operations (from Scala)
+    const GlobalCost = struct {
+        const group_generator: u32 = 10; // Global.groupGenerator
+        const xor: u32 = 20; // Global.xor (per byte)
+        const encode_nbits: u32 = 25; // Global.encodeNBits
+        const decode_nbits: u32 = 50; // Global.decodeNBits
+    };
+
+    /// Compute Global.groupGenerator → GroupElement
+    /// Returns the generator point G of secp256k1
+    fn computeGroupGenerator(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1); // Global object on stack
+        const initial_sp = self.value_sp;
+
+        try self.addCost(GlobalCost.group_generator);
+
+        // Pop Global object (we don't use it)
+        _ = try self.popValue();
+
+        // Return generator point G (33-byte compressed SEC1 format)
+        // secp256k1 generator: 02 79BE667E F9DCBBAC 55A06295 CE870B07 029BFCDB 2DCE28D9 59F2815B 16F81798
+        const generator = [_]u8{
+            0x02, // Compressed point prefix (even y)
+            0x79,
+            0xBE,
+            0x66,
+            0x7E,
+            0xF9,
+            0xDC,
+            0xBB,
+            0xAC,
+            0x55,
+            0xA0,
+            0x62,
+            0x95,
+            0xCE,
+            0x87,
+            0x0B,
+            0x07,
+            0x02,
+            0x9B,
+            0xFC,
+            0xDB,
+            0x2D,
+            0xCE,
+            0x28,
+            0xD9,
+            0x59,
+            0xF2,
+            0x81,
+            0x5B,
+            0x16,
+            0xF8,
+            0x17,
+            0x98,
+        };
+
+        try self.pushValue(.{ .group_element = generator });
+
+        // POSTCONDITION: Stack unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Global.xor(left, right) → Coll[Byte]
+    /// XOR two byte collections element-wise
+    fn computeGlobalXor(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3); // Global, left, right on stack
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order: right, left, global
+        const right_val = try self.popValue();
+        const left_val = try self.popValue();
+        _ = try self.popValue(); // Global object (unused)
+
+        // Both must be coll_byte
+        const left = switch (left_val) {
+            .coll_byte => |c| c,
+            else => return error.TypeMismatch,
+        };
+        const right = switch (right_val) {
+            .coll_byte => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        // Must have same length
+        if (left.len != right.len) {
+            return error.TypeMismatch;
+        }
+
+        // Cost: per byte
+        try self.addCost(GlobalCost.xor + @as(u32, @intCast(left.len)));
+
+        // Allocate result
+        const result = self.arena.allocSlice(u8, left.len) catch return error.OutOfMemory;
+
+        // XOR element-wise
+        for (result, left, right) |*dst, l, r| {
+            dst.* = l ^ r;
+        }
+
+        try self.pushValue(.{ .coll_byte = result });
+
+        // POSTCONDITION: Popped 3, pushed 1
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute Global.encodeNBits(n: BigInt) → Long
+    /// Encodes a BigInt difficulty target to compact nBits representation
+    /// Reference: Bitcoin's compact format (4 bytes: 1 exp + 3 mantissa)
+    fn computeEncodeNBits(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // Global, n on stack
+        const initial_sp = self.value_sp;
+
+        try self.addCost(GlobalCost.encode_nbits);
+
+        // Pop in reverse order: n, global
+        const n_val = try self.popValue();
+        _ = try self.popValue(); // Global object
+
+        // n must be BigInt
+        if (n_val != .big_int) {
+            return error.TypeMismatch;
+        }
+
+        const bigint = try valueToBigInt256(n_val.big_int);
+
+        // Get bytes of BigInt (big-endian, minimal encoding)
+        var temp_buf: [33]u8 = undefined;
+        const bytes = bigint.toBytes(&temp_buf);
+
+        // nBits format: [exponent (1 byte)] [mantissa (3 bytes)]
+        // exponent = number of bytes in target
+        // mantissa = first 3 significant bytes
+        var nbits: u32 = 0;
+
+        if (bytes.len == 0 or (bytes.len == 1 and bytes[0] == 0)) {
+            // Zero target
+            nbits = 0;
+        } else {
+            // Skip sign byte if present for positive numbers
+            var target_bytes = bytes;
+            if (bytes[0] == 0x00 and bytes.len > 1) {
+                target_bytes = bytes[1..];
+            }
+
+            const size: u32 = @intCast(target_bytes.len);
+            var word: u32 = 0;
+
+            // Get first 3 bytes as mantissa
+            if (target_bytes.len >= 3) {
+                word = (@as(u32, target_bytes[0]) << 16) | (@as(u32, target_bytes[1]) << 8) | @as(u32, target_bytes[2]);
+            } else if (target_bytes.len == 2) {
+                word = (@as(u32, target_bytes[0]) << 8) | @as(u32, target_bytes[1]);
+            } else if (target_bytes.len == 1) {
+                word = @as(u32, target_bytes[0]);
+            }
+
+            // If mantissa MSB is set, increment size and shift right
+            if ((word & 0x00800000) != 0) {
+                word >>= 8;
+                nbits = ((size + 1) << 24) | word;
+            } else {
+                nbits = (size << 24) | word;
+            }
+        }
+
+        try self.pushValue(.{ .long = @as(i64, nbits) });
+
+        // POSTCONDITION: Popped 2, pushed 1
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Compute Global.decodeNBits(nBits: Long) → BigInt
+    /// Decodes compact nBits representation to BigInt difficulty target
+    fn computeDecodeNBits(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // Global, nBits on stack
+        const initial_sp = self.value_sp;
+
+        try self.addCost(GlobalCost.decode_nbits);
+
+        // Pop in reverse order: nBits, global
+        const nbits_val = try self.popValue();
+        _ = try self.popValue(); // Global object
+
+        // nBits must be Long
+        const nbits: u32 = switch (nbits_val) {
+            .long => |l| if (l < 0) return error.ArithmeticOverflow else @intCast(@as(u64, @bitCast(l)) & 0xFFFFFFFF),
+            .int => |i| if (i < 0) return error.ArithmeticOverflow else @intCast(i),
+            else => return error.TypeMismatch,
+        };
+
+        // nBits format: [exponent (1 byte)] [mantissa (3 bytes)]
+        const size = (nbits >> 24) & 0xFF;
+        var word = nbits & 0x007FFFFF;
+
+        // Handle special cases
+        if (size == 0) {
+            try self.pushValue(bigInt256ToValue(BigInt256.zero));
+            assert(self.value_sp == initial_sp - 1);
+            return;
+        }
+
+        // Build the target number
+        // target = mantissa * 256^(exponent-3)
+        var result_bytes: [33]u8 = [_]u8{0} ** 33;
+        var result_len: usize = 0;
+
+        if (size <= 3) {
+            // Right shift mantissa
+            const shift: u5 = @intCast((3 - size) * 8);
+            word >>= shift;
+            if (word != 0) {
+                result_bytes[0] = 0; // Sign byte for positive
+                result_bytes[1] = @truncate((word >> 16) & 0xFF);
+                result_bytes[2] = @truncate((word >> 8) & 0xFF);
+                result_bytes[3] = @truncate(word & 0xFF);
+                // Find minimal encoding
+                var start: usize = 1;
+                while (start < 4 and result_bytes[start] == 0) : (start += 1) {}
+                // Add sign byte if needed
+                if (result_bytes[start] & 0x80 != 0) {
+                    start -= 1;
+                    result_bytes[start] = 0;
+                }
+                result_len = 4 - start;
+                @memcpy(result_bytes[0..result_len], result_bytes[start..4]);
+            }
+        } else {
+            // Build big number with leading zeros
+            result_bytes[0] = 0; // Sign byte
+            result_bytes[1] = @truncate((word >> 16) & 0xFF);
+            result_bytes[2] = @truncate((word >> 8) & 0xFF);
+            result_bytes[3] = @truncate(word & 0xFF);
+
+            // Pad with zeros
+            const extra_bytes = size - 3;
+            result_len = 4 + @min(extra_bytes, 29);
+            @memset(result_bytes[4..result_len], 0);
+        }
+
+        if (result_len == 0) {
+            try self.pushValue(bigInt256ToValue(BigInt256.zero));
+        } else {
+            const bigint = BigInt256.fromBytes(result_bytes[0..result_len]) catch
+                return error.InvalidBigInt;
+            try self.pushValue(bigInt256ToValue(bigint));
+        }
+
+        // POSTCONDITION: Popped 2, pushed 1
+        assert(self.value_sp == initial_sp - 1);
     }
 
     // ========================================================================

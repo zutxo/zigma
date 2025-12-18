@@ -1015,8 +1015,7 @@ pub const ExprGenerator = struct {
     fn generateCryptoOp(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
         switch (target) {
             TypePool.COLL_BYTE => {
-                // Hash operations: calc_blake2b256 or calc_sha256
-                // They take Coll[Byte] and return Coll[Byte]
+                // Hash operations and type conversions
                 const choice = self.prng.range_inclusive(u8, 0, 2);
                 switch (choice) {
                     0 => {
@@ -1132,7 +1131,6 @@ pub const ExprGenerator = struct {
             },
             TypePool.BIG_INT => {
                 // BigInt operations including modular arithmetic
-                // Buffer overflow bug fixed - max_bigint_bytes increased to 33
                 const choice = self.prng.range_inclusive(u8, 0, 3);
                 switch (choice) {
                     0 => {
