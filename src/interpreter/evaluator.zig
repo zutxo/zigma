@@ -848,7 +848,13 @@ pub const Evaluator = struct {
         }
 
         // POSTCONDITION: Exactly one result
-        assert(self.value_sp == 1);
+        // Use error instead of assert to handle malformed trees gracefully
+        if (self.value_sp != 1) {
+            // Malformed tree left extra values on stack
+            // METRICS: Record error
+            if (self.metrics) |m| m.incErrors();
+            return error.InvalidState;
+        }
 
         // METRICS: Record success and cost
         if (self.metrics) |m| {
@@ -1040,6 +1046,11 @@ pub const Evaluator = struct {
                 // We want: ValDef0, ValDef1, ..., Result (in execution order)
                 // So push: Result, then ValDefs in reverse order
                 const item_count = node.data;
+
+                // PRECONDITION: item_count must fit in indices array
+                if (item_count > max_var_bindings) {
+                    return error.InvalidData;
+                }
 
                 // First, find all indices
                 var indices: [max_var_bindings + 1]u16 = undefined;
