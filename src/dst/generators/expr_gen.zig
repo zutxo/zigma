@@ -668,7 +668,7 @@ pub const ExprGenerator = struct {
     fn generateLogical(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
         _ = target; // Must be boolean
 
-        const choice = self.prng.range_inclusive(u8, 0, 5);
+        const choice = self.prng.range_inclusive(u8, 0, 7);
         switch (choice) {
             0, 1 => {
                 // Binary logical (and, or, xor)
@@ -753,6 +753,79 @@ pub const ExprGenerator = struct {
                     .data = var_id,
                     .result_type = TypePool.INT,
                 });
+                try self.generateConstant(.{ .int = 0 }, TypePool.INT);
+            },
+            5 => {
+                // Tuple operations: pair_construct + select_field
+                // Exercises pair_construct, select_field opcodes
+                // Pattern: (pair._1 > pair._2) - constructs pair then compares fields
+
+                // Comparison: select_field(pair, 0) > select_field(pair, 1)
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(BinOpKind.gt),
+                    .result_type = TypePool.BOOLEAN,
+                });
+
+                // First child: select_field(pair, 0)
+                _ = try self.addNode(.{
+                    .tag = .select_field,
+                    .data = 0, // field index 0 (_1)
+                    .result_type = TypePool.INT,
+                });
+                // pair_construct for first select_field
+                _ = try self.addNode(.{
+                    .tag = .pair_construct,
+                    .data = 2,
+                    .result_type = TypePool.ANY, // Pair type
+                });
+                try self.generateIntLeaf();
+                try self.generateIntLeaf();
+
+                // Second child: select_field(pair, 1)
+                _ = try self.addNode(.{
+                    .tag = .select_field,
+                    .data = 1, // field index 1 (_2)
+                    .result_type = TypePool.INT,
+                });
+                // pair_construct for second select_field
+                _ = try self.addNode(.{
+                    .tag = .pair_construct,
+                    .data = 2,
+                    .result_type = TypePool.ANY, // Pair type
+                });
+                try self.generateIntLeaf();
+                try self.generateIntLeaf();
+            },
+            6 => {
+                // Triple construct with select_field
+                // Exercises triple_construct, select_field opcodes
+                // Pattern: triple._2 > 0
+
+                // Comparison: select_field(triple, 1) > 0
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(BinOpKind.gt),
+                    .result_type = TypePool.BOOLEAN,
+                });
+
+                // First child: select_field(triple, 1) - middle element
+                _ = try self.addNode(.{
+                    .tag = .select_field,
+                    .data = 1, // field index 1 (_2)
+                    .result_type = TypePool.INT,
+                });
+                // triple_construct
+                _ = try self.addNode(.{
+                    .tag = .triple_construct,
+                    .data = 3,
+                    .result_type = TypePool.ANY, // Triple type
+                });
+                try self.generateIntLeaf();
+                try self.generateIntLeaf();
+                try self.generateIntLeaf();
+
+                // Second child: constant 0
                 try self.generateConstant(.{ .int = 0 }, TypePool.INT);
             },
             else => {
