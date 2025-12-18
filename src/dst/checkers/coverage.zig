@@ -61,9 +61,44 @@ pub const CoverageTracker = struct {
         return @as(f32, @floatFromInt(covered)) / @as(f32, @floatFromInt(max_types)) * 100.0;
     }
 
+    /// Get list of uncovered opcodes
+    /// Returns array of ExprTag values that have 0 hits
+    pub fn getMissingOpcodes(self: *const CoverageTracker) MissingOpcodes {
+        var result = MissingOpcodes{};
+        const fields = @typeInfo(ExprTag).@"enum".fields;
+        inline for (fields, 0..) |field, i| {
+            if (self.opcode_hits[i] == 0) {
+                if (result.count < MissingOpcodes.max_missing) {
+                    result.tags[result.count] = @enumFromInt(field.value);
+                    result.count += 1;
+                }
+            }
+        }
+        return result;
+    }
+
     /// Reset coverage stats
     pub fn reset(self: *CoverageTracker) void {
         self.* = .{};
+    }
+};
+
+/// Container for missing opcodes result
+pub const MissingOpcodes = struct {
+    pub const max_missing: usize = 32;
+    tags: [max_missing]ExprTag = undefined,
+    count: usize = 0,
+
+    /// Format missing opcodes for logging
+    pub fn format(self: *const MissingOpcodes, writer: anytype) !void {
+        if (self.count == 0) {
+            try writer.writeAll("(none)");
+            return;
+        }
+        for (self.tags[0..self.count], 0..) |tag, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.writeAll(@tagName(tag));
+        }
     }
 };
 
@@ -124,4 +159,27 @@ test "coverage: reset" {
     try std.testing.expectEqual(@as(u64, 0), tracker.opcode_hits[@intFromEnum(ExprTag.true_leaf)]);
     try std.testing.expectEqual(@as(u64, 0), tracker.type_hits[0]);
     try std.testing.expectEqual(@as(u64, 0), tracker.size_hits[1]);
+}
+
+test "coverage: getMissingOpcodes" {
+    var tracker = CoverageTracker{};
+
+    // Mark some opcodes as hit
+    tracker.opcode_hits[@intFromEnum(ExprTag.true_leaf)] = 1;
+    tracker.opcode_hits[@intFromEnum(ExprTag.false_leaf)] = 1;
+    tracker.opcode_hits[@intFromEnum(ExprTag.height)] = 1;
+
+    // Get missing opcodes
+    const missing = tracker.getMissingOpcodes();
+
+    // Should have most opcodes missing (only 3 were hit)
+    const total_opcodes = @typeInfo(ExprTag).@"enum".fields.len;
+    try std.testing.expectEqual(total_opcodes - 3, missing.count);
+
+    // true_leaf, false_leaf, height should NOT be in missing list
+    for (missing.tags[0..missing.count]) |tag| {
+        try std.testing.expect(tag != .true_leaf);
+        try std.testing.expect(tag != .false_leaf);
+        try std.testing.expect(tag != .height);
+    }
 }

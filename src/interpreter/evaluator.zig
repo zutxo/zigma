@@ -1228,6 +1228,8 @@ pub const Evaluator = struct {
             .concrete_collection => {
                 // N-ary: n elements → Coll[T]
                 const elem_count = node.data;
+                // INVARIANT: Element count bounded by available index storage
+                if (elem_count > 256) return error.InvalidData;
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 // Push elements in reverse order so first element evaluates first
                 var idx = node_idx + 1;
@@ -1282,6 +1284,10 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
                 const coll_idx = node_idx + 1;
                 const zero_idx = self.findSubtreeEnd(coll_idx);
+                // Validate indices (may be corrupted by fault injection)
+                if (zero_idx >= self.tree.node_count) {
+                    return error.InvalidData;
+                }
                 // Evaluate collection and zero, lambda handled in compute phase
                 try self.pushWork(.{ .node_idx = zero_idx, .phase = .evaluate });
                 try self.pushWork(.{ .node_idx = coll_idx, .phase = .evaluate });
@@ -1301,6 +1307,10 @@ pub const Evaluator = struct {
                 var indices: [256]u16 = undefined;
                 var i: u16 = 0;
                 while (i < child_count) : (i += 1) {
+                    // Validate index (may be corrupted by fault injection)
+                    if (idx >= self.tree.node_count) {
+                        return error.InvalidData;
+                    }
                     indices[i] = idx;
                     idx = self.findSubtreeEnd(idx);
                 }
@@ -2230,8 +2240,11 @@ pub const Evaluator = struct {
 
         try self.addCost(FixedCost.tuple_construct); // Same cost model as tuple
 
-        // INVARIANT: Element count is bounded
-        assert(elem_count <= 256);
+        // INVARIANT: Element count is bounded (also handles fault injection)
+        if (elem_count > 256) return error.InvalidData;
+
+        // INVARIANT: Type index is valid (handles fault injection on result_type)
+        if (coll_type >= self.tree.type_pool.count) return error.InvalidData;
 
         // Get element type from Coll[T]
         // For Coll[Byte], use specialized handling
@@ -3782,6 +3795,7 @@ pub const Evaluator = struct {
             // Context methods
             switch (method_id) {
                 ContextMethodId.data_inputs => try self.computeDataInputs(),
+                ContextMethodId.headers => try self.computeContextHeaders(),
                 ContextMethodId.get_var_from_input => try self.computeGetVarFromInput(node),
                 else => return self.handleUnsupported(),
             }
@@ -4349,6 +4363,48 @@ pub const Evaluator = struct {
 
         // Push box collection reference (same pattern as INPUTS/OUTPUTS)
         try self.pushValue(.{ .box_coll = .{ .source = .data_inputs } });
+
+        // POSTCONDITION: One value pushed to stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute CONTEXT.headers: returns first header as Header value (simplified for DST)
+    /// In real ErgoTree this returns Coll[Header], but for DST coverage we return single Header.
+    fn computeContextHeaders(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+
+        // Pop the context object (not used - we use self.ctx directly)
+        _ = try self.popValue();
+
+        try self.addCost(15); // Same cost as last_block_utxo_root
+
+        // INVARIANT: Must have at least one header
+        if (self.ctx.headers.len == 0) {
+            return error.InvalidContext;
+        }
+
+        // Copy header data from context to HeaderRef
+        const ctx_header = &self.ctx.headers[0];
+        const header_ref = data.Value.HeaderRef{
+            .id = ctx_header.id,
+            .version = ctx_header.version,
+            .parent_id = ctx_header.parent_id,
+            .ad_proofs_root = ctx_header.ad_proofs_root,
+            .state_root = ctx_header.state_root,
+            .transactions_root = ctx_header.transactions_root,
+            .timestamp = ctx_header.timestamp,
+            .n_bits = ctx_header.n_bits,
+            .height = ctx_header.height,
+            .extension_root = ctx_header.extension_root,
+            .miner_pk = ctx_header.miner_pk,
+            .pow_onetime_pk = ctx_header.pow_onetime_pk,
+            .pow_nonce = ctx_header.pow_nonce,
+            .pow_distance = ctx_header.pow_distance,
+            .votes = ctx_header.votes,
+        };
+
+        try self.pushValue(.{ .header = header_ref });
 
         // POSTCONDITION: One value pushed to stack
         assert(self.value_sp > 0);

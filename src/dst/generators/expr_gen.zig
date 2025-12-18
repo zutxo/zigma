@@ -30,6 +30,37 @@ const TypePool = types_mod.TypePool;
 const TypeIndex = types_mod.TypeIndex;
 
 // ============================================================================
+// Method Call Type Codes and Method IDs (mirrored from evaluator.zig)
+// ============================================================================
+
+/// Type codes for method_call dispatch
+const TypeCode = struct {
+    const coll: u8 = 12; // Collection type
+    const context: u8 = 101; // Context singleton
+    const global: u8 = 106; // Global singleton
+    const header: u8 = 104; // Header type
+};
+
+/// Collection method IDs (from evaluator.zig CollMethodId)
+const CollMethodId = struct {
+    const indices: u8 = 14; // coll.indices → Coll[Int]
+    const reverse: u8 = 30; // coll.reverse → Coll[A]
+    const starts_with: u8 = 31; // coll.startsWith(other) → Boolean
+    const ends_with: u8 = 32; // coll.endsWith(other) → Boolean
+};
+
+/// Context method IDs (from evaluator.zig ContextMethodId)
+const ContextMethodId = struct {
+    const headers: u8 = 2; // CONTEXT.headers → Header (simplified)
+};
+
+/// Global method IDs (from evaluator.zig GlobalMethodId)
+const GlobalMethodId = struct {
+    const group_generator: u8 = 1; // Global.groupGenerator → GroupElement
+    const xor: u8 = 2; // Global.xor(left, right) → Coll[Byte]
+};
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -211,10 +242,16 @@ pub const ExprGenerator = struct {
                 }
             },
             TypePool.COLL_BYTE => {
-                // Byte collection: allow crypto (hash functions return Coll[Byte])
+                // Byte collection: allow crypto and collection operations
                 if (self.options.crypto_weight > 0) {
                     categories[count] = .crypto;
                     weights[count] = self.options.crypto_weight;
+                    count += 1;
+                }
+                // Also allow collection ops (filter, flat_map, etc.)
+                if (self.options.collection_weight > 0) {
+                    categories[count] = .collection;
+                    weights[count] = self.options.collection_weight;
                     count += 1;
                 }
             },
@@ -324,7 +361,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateIntLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 4);
+        const choice = self.prng.range_inclusive(u8, 0, 8);
         switch (choice) {
             0 => {
                 // height opcode (returns Int)
@@ -372,6 +409,101 @@ pub const ExprGenerator = struct {
                     .result_type = TypePool.INT,
                 });
             },
+            4 => {
+                // option_get(get_var): unwrap Option[Int] from context variable
+                // Exercises get_var and option_get opcodes
+                _ = try self.addNode(.{
+                    .tag = .option_get,
+                    .result_type = TypePool.INT,
+                });
+                // get_var produces Option[Int]
+                // data = (type_idx << 8) | var_id
+                const var_id: u8 = self.prng.range_inclusive(u8, 0, 5);
+                _ = try self.addNode(.{
+                    .tag = .get_var,
+                    .data = (@as(u16, TypePool.INT) << 8) | var_id,
+                    .result_type = TypePool.OPTION_INT,
+                });
+            },
+            5 => {
+                // get_var alone (returns Option[Int] which may be None)
+                // The result can be used with option_get_or_else or option_is_defined
+                // We use option_get_or_else to get a definite value
+                _ = try self.addNode(.{
+                    .tag = .option_get_or_else,
+                    .result_type = TypePool.INT,
+                });
+                // First child: get_var produces Option[Int]
+                const var_id: u8 = self.prng.range_inclusive(u8, 0, 5);
+                _ = try self.addNode(.{
+                    .tag = .get_var,
+                    .data = (@as(u16, TypePool.INT) << 8) | var_id,
+                    .result_type = TypePool.OPTION_INT,
+                });
+                // Second child: default value
+                try self.generateConstant(.{ .int = 0 }, TypePool.INT);
+            },
+            6 => {
+                // fold: Coll[Byte] × Int × ((Int, Byte) → Int) → Int
+                // Tree: [fold] [collection] [zero] [func_value data=2] [body]
+                // Sum all bytes in collection
+                _ = try self.addNode(.{
+                    .tag = .fold,
+                    .result_type = TypePool.INT,
+                });
+                // First child: collection
+                try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+                // Second child: zero (initial accumulator)
+                try self.generateConstant(.{ .int = 0 }, TypePool.INT);
+                // Third child: lambda with 2 args (acc, elem)
+                _ = try self.addNode(.{
+                    .tag = .func_value,
+                    .data = 2, // 2 arguments
+                    .result_type = TypePool.INT,
+                });
+                // Lambda body: acc + upcast(elem)
+                // Use val_use with id 1 for acc, id 2 for elem
+                _ = try self.addNode(.{
+                    .tag = .bin_op,
+                    .data = @intFromEnum(BinOpKind.plus),
+                    .result_type = TypePool.INT,
+                });
+                // acc (var 1)
+                _ = try self.addNode(.{
+                    .tag = .val_use,
+                    .data = 1,
+                    .result_type = TypePool.INT,
+                });
+                // upcast(elem) (var 2) from Byte to Int
+                _ = try self.addNode(.{
+                    .tag = .upcast,
+                    .data = TypePool.INT,
+                    .result_type = TypePool.INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .val_use,
+                    .data = 2,
+                    .result_type = TypePool.BYTE,
+                });
+            },
+            7 => {
+                // select_field from tuple_construct: (Int, Int)._1
+                // Tree: [select_field data=1] [tuple_construct data=2] [int1] [int2]
+                _ = try self.addNode(.{
+                    .tag = .select_field,
+                    .data = 1, // field index 1 (0-based)
+                    .result_type = TypePool.INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .tuple_construct,
+                    .data = 2, // 2 elements
+                    .result_type = TypePool.ANY, // Tuple type
+                });
+                // First element
+                try self.generateConstant(.{ .int = self.prng.int(i32) }, TypePool.INT);
+                // Second element
+                try self.generateConstant(.{ .int = self.prng.int(i32) }, TypePool.INT);
+            },
             else => {
                 // Constant int
                 const value = self.prng.int(i32);
@@ -381,7 +513,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateLongLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 2);
+        const choice = self.prng.range_inclusive(u8, 0, 3);
         switch (choice) {
             0 => {
                 // Constant long
@@ -397,6 +529,29 @@ pub const ExprGenerator = struct {
                     .result_type = TypePool.LONG,
                 });
                 try self.generateIntLeaf();
+            },
+            2 => {
+                // Header field extraction: extract_timestamp or extract_n_bits
+                // Tree: [extract_<field>] [method_call(CONTEXT.headers)] [unit]
+                const extract_tag = self.prng.select(ExprTag, &[_]ExprTag{
+                    .extract_timestamp,
+                    .extract_n_bits,
+                });
+                _ = try self.addNode(.{
+                    .tag = extract_tag,
+                    .result_type = TypePool.LONG,
+                });
+                // method_call: CONTEXT.headers → Header
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, ContextMethodId.headers) << 8) | TypeCode.context,
+                    .result_type = TypePool.ANY, // Header type placeholder
+                });
+                // unit as placeholder for CONTEXT object
+                _ = try self.addNode(.{
+                    .tag = .unit,
+                    .result_type = TypePool.UNIT,
+                });
             },
             else => {
                 // byte_array_to_long: Coll[Byte] → Long (8 bytes big-endian)
@@ -419,8 +574,31 @@ pub const ExprGenerator = struct {
     }
 
     fn generateByteLeaf(self: *ExprGenerator) GenerateError!void {
-        const value = self.prng.int(i8);
-        try self.generateConstant(.{ .byte = value }, TypePool.BYTE);
+        const choice = self.prng.range_inclusive(u8, 0, 1);
+        switch (choice) {
+            0 => {
+                // Constant byte
+                const value = self.prng.int(i8);
+                try self.generateConstant(.{ .byte = value }, TypePool.BYTE);
+            },
+            else => {
+                // extract_version: Header → Byte
+                _ = try self.addNode(.{
+                    .tag = .extract_version,
+                    .result_type = TypePool.BYTE,
+                });
+                // method_call: CONTEXT.headers → Header
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, ContextMethodId.headers) << 8) | TypeCode.context,
+                    .result_type = TypePool.ANY,
+                });
+                _ = try self.addNode(.{
+                    .tag = .unit,
+                    .result_type = TypePool.UNIT,
+                });
+            },
+        }
     }
 
     fn generateUnitLeaf(self: *ExprGenerator) GenerateError!void {
@@ -431,7 +609,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateCollByteLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 3);
+        const choice = self.prng.range_inclusive(u8, 0, 4);
         switch (choice) {
             0 => {
                 // long_to_byte_array: Long → Coll[Byte] (8 bytes)
@@ -458,6 +636,33 @@ pub const ExprGenerator = struct {
                     .result_type = TypePool.COLL_BYTE,
                 });
             },
+            3 => {
+                // Header field extraction returning Coll[Byte]
+                // extract_parent_id, extract_ad_proofs_root, extract_state_root,
+                // extract_txs_root, extract_votes, extract_miner_rewards
+                const extract_tag = self.prng.select(ExprTag, &[_]ExprTag{
+                    .extract_parent_id, // 32 bytes
+                    .extract_ad_proofs_root, // 32 bytes
+                    .extract_state_root, // 44 bytes
+                    .extract_txs_root, // 32 bytes
+                    .extract_votes, // 3 bytes
+                    .extract_miner_rewards, // 33 bytes
+                });
+                _ = try self.addNode(.{
+                    .tag = extract_tag,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                // method_call: CONTEXT.headers → Header
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, ContextMethodId.headers) << 8) | TypeCode.context,
+                    .result_type = TypePool.ANY,
+                });
+                _ = try self.addNode(.{
+                    .tag = .unit,
+                    .result_type = TypePool.UNIT,
+                });
+            },
             else => {
                 // calc_blake2b256 on a small input
                 _ = try self.addNode(.{
@@ -482,17 +687,39 @@ pub const ExprGenerator = struct {
     }
 
     fn generateBigIntLeaf(self: *ExprGenerator) GenerateError!void {
-        // Generate BigInt from a long: byte_array_to_bigint(long_to_byte_array(constant))
-        _ = try self.addNode(.{
-            .tag = .byte_array_to_bigint,
-            .result_type = TypePool.BIG_INT,
-        });
-        _ = try self.addNode(.{
-            .tag = .long_to_byte_array,
-            .result_type = TypePool.COLL_BYTE,
-        });
-        const value = self.prng.int(i64);
-        try self.generateConstant(.{ .long = value }, TypePool.LONG);
+        const choice = self.prng.range_inclusive(u8, 0, 1);
+        switch (choice) {
+            0 => {
+                // Generate BigInt from a long: byte_array_to_bigint(long_to_byte_array(constant))
+                _ = try self.addNode(.{
+                    .tag = .byte_array_to_bigint,
+                    .result_type = TypePool.BIG_INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .long_to_byte_array,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                const value = self.prng.int(i64);
+                try self.generateConstant(.{ .long = value }, TypePool.LONG);
+            },
+            else => {
+                // extract_difficulty: Header → BigInt
+                _ = try self.addNode(.{
+                    .tag = .extract_difficulty,
+                    .result_type = TypePool.BIG_INT,
+                });
+                // method_call: CONTEXT.headers → Header
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, ContextMethodId.headers) << 8) | TypeCode.context,
+                    .result_type = TypePool.ANY,
+                });
+                _ = try self.addNode(.{
+                    .tag = .unit,
+                    .result_type = TypePool.UNIT,
+                });
+            },
+        }
     }
 
     fn generateBoxLeaf(self: *ExprGenerator) GenerateError!void {
@@ -952,7 +1179,7 @@ pub const ExprGenerator = struct {
             },
             TypePool.COLL_BYTE => {
                 // Byte collection operations
-                const choice = self.prng.range_inclusive(u8, 0, 1);
+                const choice = self.prng.range_inclusive(u8, 0, 4);
                 switch (choice) {
                     0 => {
                         // long_to_byte_array: Long → Coll[Byte]
@@ -961,6 +1188,73 @@ pub const ExprGenerator = struct {
                             .result_type = TypePool.COLL_BYTE,
                         });
                         try self.generateForType(TypePool.LONG);
+                    },
+                    1 => {
+                        // coll.reverse via method_call
+                        try self.generateCollectionMethodCall(TypePool.COLL_BYTE);
+                    },
+                    2 => {
+                        // filter: Coll[Byte] × (Byte → Boolean) → Coll[Byte]
+                        // Tree structure: [filter] [collection] [func_value] [body]
+                        _ = try self.addNode(.{
+                            .tag = .filter,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // First child: input collection
+                        try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+                        // Second child: predicate function
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Predicate body: simple comparison (elem > 0)
+                        // Uses val_use to reference the lambda argument
+                        _ = try self.addNode(.{
+                            .tag = .bin_op,
+                            .data = @intFromEnum(BinOpKind.gt),
+                            .result_type = TypePool.BOOLEAN,
+                        });
+                        // Lambda arg accessed via val_use with id 1 (default lambda arg)
+                        _ = try self.addNode(.{
+                            .tag = .val_use,
+                            .data = 1,
+                            .result_type = TypePool.BYTE,
+                        });
+                        try self.generateConstant(.{ .byte = 0 }, TypePool.BYTE);
+                    },
+                    3 => {
+                        // flat_map: Coll[Byte] × (Byte → Coll[Byte]) → Coll[Byte]
+                        // Tree: [flat_map] [collection] [func_value] [body returning Coll[Byte]]
+                        _ = try self.addNode(.{
+                            .tag = .flat_map,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // First child: input collection
+                        try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+                        // Second child: function returning Coll[Byte]
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // Body: concrete_collection with the element duplicated
+                        // Coll(elem, elem) - doubles each byte
+                        _ = try self.addNode(.{
+                            .tag = .concrete_collection,
+                            .data = 2, // 2 elements
+                            .result_type = TypePool.COLL_BYTE,
+                        });
+                        // First copy of element
+                        _ = try self.addNode(.{
+                            .tag = .val_use,
+                            .data = 1,
+                            .result_type = TypePool.BYTE,
+                        });
+                        // Second copy of element
+                        _ = try self.addNode(.{
+                            .tag = .val_use,
+                            .data = 1,
+                            .result_type = TypePool.BYTE,
+                        });
                     },
                     else => {
                         // concrete_collection of bytes
@@ -977,15 +1271,51 @@ pub const ExprGenerator = struct {
                 }
             },
             TypePool.COLL_INT => {
-                // Int collection
-                const num_items: u16 = self.prng.range_inclusive(u16, 1, 3);
-                _ = try self.addNode(.{
-                    .tag = .concrete_collection,
-                    .data = num_items,
-                    .result_type = TypePool.COLL_INT,
-                });
-                for (0..num_items) |_| {
-                    try self.generateIntLeaf();
+                // Int collection: literal, coll.indices, or map_collection
+                const choice = self.prng.range_inclusive(u8, 0, 2);
+                switch (choice) {
+                    0 => {
+                        // Use coll.indices method call
+                        try self.generateCollectionMethodCall(TypePool.COLL_INT);
+                    },
+                    1 => {
+                        // map_collection: Coll[Byte].map(b => upcast(b)) → Coll[Int]
+                        // Tree: [map_collection] [coll] [func_value] [body]
+                        _ = try self.addNode(.{
+                            .tag = .map_collection,
+                            .result_type = TypePool.COLL_INT,
+                        });
+                        // Input collection (Coll[Byte])
+                        try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+                        // Lambda: Byte → Int via upcast
+                        _ = try self.addNode(.{
+                            .tag = .func_value,
+                            .result_type = TypePool.INT,
+                        });
+                        // Body: upcast(val_use(1))
+                        _ = try self.addNode(.{
+                            .tag = .upcast,
+                            .data = TypePool.INT,
+                            .result_type = TypePool.INT,
+                        });
+                        _ = try self.addNode(.{
+                            .tag = .val_use,
+                            .data = 1, // Lambda arg
+                            .result_type = TypePool.BYTE,
+                        });
+                    },
+                    else => {
+                        // Generate literal
+                        const num_items: u16 = self.prng.range_inclusive(u16, 1, 3);
+                        _ = try self.addNode(.{
+                            .tag = .concrete_collection,
+                            .data = num_items,
+                            .result_type = TypePool.COLL_INT,
+                        });
+                        for (0..num_items) |_| {
+                            try self.generateIntLeaf();
+                        }
+                    },
                 }
             },
             TypePool.COLL_LONG => {
@@ -1181,6 +1511,138 @@ pub const ExprGenerator = struct {
     }
 
     // ========================================================================
+    // Method Call Generation
+    // ========================================================================
+
+    /// Generate method_call for collection methods (indices, reverse)
+    /// Tree structure: [method_call] [obj]
+    /// where data = (method_id << 8) | type_code
+    fn generateCollectionMethodCall(self: *ExprGenerator, target: TypeIndex) GenerateError!void {
+        // Choose method based on target type
+        switch (target) {
+            TypePool.COLL_INT => {
+                // coll.indices returns Coll[Int]
+                const coll_type = self.prng.select(TypeIndex, &[_]TypeIndex{
+                    TypePool.COLL_BYTE,
+                    TypePool.COLL_INT,
+                    TypePool.COLL_LONG,
+                });
+
+                // method_call node: data = (method_id << 8) | type_code
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, CollMethodId.indices) << 8) | TypeCode.coll,
+                    .result_type = TypePool.COLL_INT,
+                });
+
+                // obj: generate a collection
+                try self.generateCollectionLiteral(coll_type);
+            },
+            TypePool.COLL_BYTE => {
+                // coll.reverse returns Coll[Byte]
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, CollMethodId.reverse) << 8) | TypeCode.coll,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+
+                // obj: generate a byte collection
+                try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+            },
+            TypePool.BOOLEAN => {
+                // coll.startsWith or coll.endsWith
+                const method_id = self.prng.select(u8, &[_]u8{
+                    CollMethodId.starts_with,
+                    CollMethodId.ends_with,
+                });
+
+                _ = try self.addNode(.{
+                    .tag = .method_call,
+                    .data = (@as(u16, method_id) << 8) | TypeCode.coll,
+                    .result_type = TypePool.BOOLEAN,
+                });
+
+                // obj: collection
+                try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+
+                // arg: prefix/suffix to check
+                try self.generateCollectionLiteral(TypePool.COLL_BYTE);
+            },
+            else => {
+                // Fallback to regular collection ops
+                try self.generateCollectionOp(target);
+            },
+        }
+    }
+
+    /// Generate method_call for Global methods (groupGenerator)
+    /// Tree structure: [method_call] [global_obj]
+    fn generateGlobalMethodCall(self: *ExprGenerator) GenerateError!void {
+        // Global.groupGenerator → GroupElement
+        _ = try self.addNode(.{
+            .tag = .method_call,
+            .data = (@as(u16, GlobalMethodId.group_generator) << 8) | TypeCode.global,
+            .result_type = TypePool.GROUP_ELEMENT,
+        });
+
+        // obj: Global singleton - represented as unit value in ErgoTree
+        // The evaluator pops a value but ignores it for Global methods
+        _ = try self.addNode(.{
+            .tag = .unit,
+            .result_type = TypePool.UNIT,
+        });
+    }
+
+    /// Generate a collection literal of given type
+    fn generateCollectionLiteral(self: *ExprGenerator, coll_type: TypeIndex) GenerateError!void {
+        const num_items: u16 = self.prng.range_inclusive(u16, 1, 4);
+
+        switch (coll_type) {
+            TypePool.COLL_BYTE => {
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                for (0..num_items) |_| {
+                    try self.generateByteLeaf();
+                }
+            },
+            TypePool.COLL_INT => {
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_INT,
+                });
+                for (0..num_items) |_| {
+                    try self.generateIntLeaf();
+                }
+            },
+            TypePool.COLL_LONG => {
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_LONG,
+                });
+                for (0..num_items) |_| {
+                    try self.generateLongLeaf();
+                }
+            },
+            else => {
+                // Default to byte collection
+                _ = try self.addNode(.{
+                    .tag = .concrete_collection,
+                    .data = num_items,
+                    .result_type = TypePool.COLL_BYTE,
+                });
+                for (0..num_items) |_| {
+                    try self.generateByteLeaf();
+                }
+            },
+        }
+    }
+
+    // ========================================================================
     // Utilities
     // ========================================================================
 
@@ -1191,7 +1653,7 @@ pub const ExprGenerator = struct {
 
     /// Select random primitive type (includes crypto/collection types with lower probability)
     fn randomPrimitiveType(self: *ExprGenerator) TypeIndex {
-        const choice = self.prng.range_inclusive(u8, 0, 11);
+        const choice = self.prng.range_inclusive(u8, 0, 12);
         return switch (choice) {
             0, 1, 2 => TypePool.BOOLEAN,
             3, 4 => TypePool.INT,
@@ -1200,6 +1662,7 @@ pub const ExprGenerator = struct {
             8 => TypePool.GROUP_ELEMENT,
             9 => TypePool.BIG_INT,
             10 => TypePool.SIGMA_PROP, // SigmaProp for sigma connectives
+            11 => TypePool.COLL_INT, // Coll[Int] for collection method_call testing
             else => TypePool.BOX, // Box for self_box/inputs/outputs
         };
     }

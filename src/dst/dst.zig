@@ -581,6 +581,15 @@ pub fn main() !void {
         result.faults_handled,
     });
     log.info("  opcode_coverage: {d:.1}%", .{result.opcode_coverage});
+
+    // Report missing opcodes if any
+    const missing = sim.coverage.getMissingOpcodes();
+    if (missing.count > 0) {
+        log.info("  missing_opcodes: {}", .{missing.count});
+        for (missing.tags[0..missing.count]) |tag| {
+            log.info("    - {s}", .{@tagName(tag)});
+        }
+    }
     log.info("", .{});
 
     if (result.status != .success) {
