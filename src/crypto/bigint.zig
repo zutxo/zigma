@@ -1758,6 +1758,48 @@ pub const UnsignedBigInt256 = struct {
 
         return .{ .limbs = inv_signed.limbs };
     }
+
+    // ========================================================================
+    // Conversion
+    // ========================================================================
+
+    /// Convert to signed BigInt256.
+    /// Returns error.Overflow if value >= 2^255 (won't fit in signed range).
+    /// Reference: UnsignedBigInt.toSigned in Scala sigmastate
+    pub fn toSigned(self: UnsignedBigInt256) BigIntError!BigInt256 {
+        // PRECONDITION: Value must fit in signed BigInt256 range [0, 2^255-1]
+        // If MSB (bit 255) is set, value >= 2^255, which is too large for signed
+        if ((self.limbs[3] >> 63) != 0) {
+            return error.Overflow;
+        }
+
+        // POSTCONDITION: Result is non-negative with same magnitude
+        const result = BigInt256{ .limbs = self.limbs, .negative = false };
+        assert(!result.negative);
+        assert(result.limbs[0] == self.limbs[0] and result.limbs[1] == self.limbs[1] and
+            result.limbs[2] == self.limbs[2] and result.limbs[3] == self.limbs[3]);
+        return result;
+    }
+
+    /// Create from signed BigInt256.
+    /// Returns error.Overflow if value is negative.
+    pub fn fromSigned(val: BigInt256) BigIntError!UnsignedBigInt256 {
+        if (val.isNegative()) return error.Overflow;
+        return .{ .limbs = val.limbs };
+    }
+
+    // ========================================================================
+    // Method Aliases (for Scala/ErgoTree compatibility)
+    // ========================================================================
+
+    /// Alias for addMod - matches Scala UnsignedBigInt.plusMod
+    pub const plusMod = addMod;
+
+    /// Alias for subMod - matches Scala UnsignedBigInt.subtractMod
+    pub const subtractMod = subMod;
+
+    /// Alias for mulMod - matches Scala UnsignedBigInt.multiplyMod
+    pub const multiplyMod = mulMod;
 };
 
 // ============================================================================
@@ -1858,4 +1900,63 @@ test "unsigned_bigint: modInverse" {
     const inv = try a.modInverse(m);
     // 3 * inv mod 7 = 1, inv = 5 (since 3*5=15, 15 mod 7 = 1)
     try std.testing.expect(inv.eql(UnsignedBigInt256.fromUint(5)));
+}
+
+test "unsigned_bigint: toSigned basic" {
+    const a = UnsignedBigInt256.fromUint(12345);
+    const signed = try a.toSigned();
+    try std.testing.expect(signed.eql(BigInt256.fromInt(12345)));
+    try std.testing.expect(!signed.negative);
+}
+
+test "unsigned_bigint: toSigned max valid" {
+    // Max valid value for toSigned is 2^255 - 1 (BigInt256.max_value)
+    const max_signed = BigInt256.max_value;
+    const unsigned = UnsignedBigInt256{ .limbs = max_signed.limbs };
+    const signed = try unsigned.toSigned();
+    try std.testing.expect(signed.eql(max_signed));
+}
+
+test "unsigned_bigint: toSigned overflow" {
+    // Value >= 2^255 should overflow (bit 255 set)
+    const too_large = UnsignedBigInt256{
+        .limbs = .{ 0, 0, 0, @as(u64, 1) << 63 }, // 2^255
+    };
+    try std.testing.expectError(error.Overflow, too_large.toSigned());
+}
+
+test "unsigned_bigint: fromSigned basic" {
+    const signed = BigInt256.fromInt(12345);
+    const unsigned = try UnsignedBigInt256.fromSigned(signed);
+    try std.testing.expect(unsigned.eql(UnsignedBigInt256.fromUint(12345)));
+}
+
+test "unsigned_bigint: fromSigned negative error" {
+    const neg = BigInt256.fromInt(-1);
+    try std.testing.expectError(error.Overflow, UnsignedBigInt256.fromSigned(neg));
+}
+
+test "unsigned_bigint: plusMod alias" {
+    const a = UnsignedBigInt256.fromUint(7);
+    const b = UnsignedBigInt256.fromUint(5);
+    const m = UnsignedBigInt256.fromUint(10);
+    // Test via alias
+    const result = try a.plusMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(2)));
+}
+
+test "unsigned_bigint: subtractMod alias" {
+    const a = UnsignedBigInt256.fromUint(3);
+    const b = UnsignedBigInt256.fromUint(7);
+    const m = UnsignedBigInt256.fromUint(10);
+    const result = try a.subtractMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(6)));
+}
+
+test "unsigned_bigint: multiplyMod alias" {
+    const a = UnsignedBigInt256.fromUint(7);
+    const b = UnsignedBigInt256.fromUint(8);
+    const m = UnsignedBigInt256.fromUint(10);
+    const result = try a.multiplyMod(b, m);
+    try std.testing.expect(result.eql(UnsignedBigInt256.fromUint(6)));
 }
