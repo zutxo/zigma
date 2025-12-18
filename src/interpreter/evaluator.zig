@@ -3096,6 +3096,361 @@ pub const Evaluator = struct {
     }
 
     // ========================================================================
+    // Box Methods (type code 99)
+    // Reference: sigmastate-interpreter SBox.scala
+    // ========================================================================
+
+    /// Convert Value.BoxRef.BoxSource to register_cache.BoxSource
+    /// Required because the two enums are structurally identical but distinct types.
+    inline fn convertBoxSource(box_source: Value.BoxRef.BoxSource) BoxSource {
+        return switch (box_source) {
+            .inputs => .inputs,
+            .outputs => .outputs,
+            .data_inputs => .data_inputs,
+        };
+    }
+
+    /// Compute Box.value: Box → Long (nanoERGs)
+    fn computeBoxValue(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10); // FixedCost for box property access
+
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        // Convert BoxSource type (Value.BoxRef.BoxSource → register_cache.BoxSource)
+        const source = convertBoxSource(box_val.box.source);
+        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // INVARIANT: Box values are non-negative
+        assert(box.value >= 0);
+
+        try self.pushValue(.{ .long = box.value });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Box.propositionBytes: Box → Coll[Byte]
+    fn computeBoxPropositionBytes(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10); // FixedCost for box property access
+
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        const source = convertBoxSource(box_val.box.source);
+        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // INVARIANT: Proposition bytes should be non-empty
+        assert(box.proposition_bytes.len > 0);
+
+        try self.pushValue(.{ .coll_byte = box.proposition_bytes });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Box.bytes: Box → Coll[Byte] (full serialized box)
+    fn computeBoxBytes(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+
+        try self.addCost(10); // Base cost, actual serialization adds PerItemCost
+
+        _ = try self.popValue(); // Pop box value (unused - placeholder implementation)
+
+        // Full box serialization is complex - return placeholder for now
+        // Real implementation would serialize: value, script, creation_info, tokens, registers
+        return self.handleUnsupported();
+    }
+
+    /// Compute Box.bytesWithoutRef: Box → Coll[Byte] (serialized without tx reference)
+    fn computeBoxBytesWithoutRef(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+
+        try self.addCost(10); // Base cost
+
+        _ = try self.popValue(); // Pop box value (unused - placeholder implementation)
+
+        // Serialization without txId/index is complex - return placeholder for now
+        return self.handleUnsupported();
+    }
+
+    /// Compute Box.id: Box → Coll[Byte] (32-byte box ID)
+    fn computeBoxId(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10); // FixedCost for box property access
+
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        const source = convertBoxSource(box_val.box.source);
+        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // Allocate copy of box ID (32 bytes)
+        const id_copy = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(id_copy, &box.id);
+
+        try self.pushValue(.{ .coll_byte = id_copy });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Box.creationInfo: Box → (Int, Coll[Byte])
+    /// Returns tuple of (creation height, transaction ID)
+    fn computeBoxCreationInfo(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10); // FixedCost for box property access
+
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        const source = convertBoxSource(box_val.box.source);
+        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // Allocate copy of tx_id (32 bytes)
+        const tx_id_copy = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(tx_id_copy, &box.tx_id);
+
+        // Create tuple (Int, Coll[Byte]) using external storage
+        // Store tuple elements in the values array
+        const start: u16 = @truncate(self.values_sp);
+        if (start + 2 > self.values.len) return error.OutOfMemory;
+
+        self.values[start] = .{ .int = @intCast(box.creation_height) };
+        self.values[start + 1] = .{ .coll_byte = tx_id_copy };
+        self.values_sp = start + 2;
+
+        try self.pushValue(.{
+            .tuple = .{
+                .start = start,
+                .len = 2,
+                .types = .{ 0, 0, 0, 0 }, // External storage
+                .values = .{ 0, 0, 0, 0 }, // External storage
+            },
+        });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute Box.tokens: Box → Coll[(Coll[Byte], Long)]
+    /// Returns collection of (tokenId, amount) tuples
+    fn computeBoxTokens(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(15); // FixedCost for tokens access
+
+        const box_val = try self.popValue();
+        if (box_val != .box) return error.TypeMismatch;
+
+        const source = convertBoxSource(box_val.box.source);
+        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
+            return error.InvalidNodeIndex;
+        };
+
+        // INVARIANT: Token count is bounded (Ergo protocol limit)
+        assert(box.tokens.len <= 255);
+
+        // Return empty collection if no tokens (common case)
+        // Empty collection represented as generic Coll with 0 elements
+        if (box.tokens.len == 0) {
+            try self.pushValue(.{
+                .coll = .{
+                    .elem_type = TypePool.ANY, // Tuple type placeholder
+                    .start = 0,
+                    .len = 0,
+                },
+            });
+            assert(self.value_sp == initial_sp);
+            return;
+        }
+
+        // For now, return soft-fork placeholder for non-empty tokens
+        // Full implementation requires proper tuple collection serialization
+        // TODO: Implement proper Coll[(Coll[Byte], Long)] construction
+        return self.handleUnsupported();
+    }
+
+    // ========================================================================
+    // PreHeader Methods (type code 105)
+    // Reference: sigmastate-interpreter SPreHeader.scala
+    // ========================================================================
+
+    /// Compute PreHeader.version: PreHeader → Byte
+    fn computePreHeaderVersion(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10); // FixedCost for preheader property access
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        try self.pushValue(.{ .byte = @bitCast(pre_header.version) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.parentId: PreHeader → Coll[Byte] (32 bytes)
+    fn computePreHeaderParentId(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        // INVARIANT: parent_id is 32 bytes
+        assert(pre_header.parent_id.len == 32);
+
+        const result_slice = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+        @memcpy(result_slice, &pre_header.parent_id);
+
+        try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.timestamp: PreHeader → Long
+    fn computePreHeaderTimestamp(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        try self.pushValue(.{ .long = @intCast(pre_header.timestamp) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.nBits: PreHeader → Long
+    fn computePreHeaderNBits(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        try self.pushValue(.{ .long = @bitCast(pre_header.n_bits) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.height: PreHeader → Int
+    fn computePreHeaderHeight(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        try self.pushValue(.{ .int = @intCast(pre_header.height) });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.minerPk: PreHeader → GroupElement (33 bytes compressed)
+    fn computePreHeaderMinerPk(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        // INVARIANT: miner_pk is 33 bytes (compressed public key)
+        assert(pre_header.miner_pk.len == 33);
+
+        try self.pushValue(.{ .group_element = pre_header.miner_pk });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    /// Compute PreHeader.votes: PreHeader → Coll[Byte] (3 bytes)
+    fn computePreHeaderVotes(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp > 0);
+        const initial_sp = self.value_sp;
+
+        try self.addCost(10);
+
+        const ph_val = try self.popValue();
+        if (ph_val != .pre_header) return error.TypeMismatch;
+
+        const pre_header = ph_val.pre_header;
+
+        // INVARIANT: votes is 3 bytes
+        assert(pre_header.votes.len == 3);
+
+        const result_slice = self.arena.allocSlice(u8, 3) catch return error.OutOfMemory;
+        @memcpy(result_slice, &pre_header.votes);
+
+        try self.pushValue(.{ .coll_byte = result_slice });
+
+        // POSTCONDITION: Stack depth unchanged
+        assert(self.value_sp == initial_sp);
+    }
+
+    // ========================================================================
     // Collection HOF operations
     // ========================================================================
 
@@ -3728,6 +4083,60 @@ pub const Evaluator = struct {
         }
     };
 
+    /// Box type code from Scala SBox
+    /// Reference: sigmastate-interpreter SBox.scala
+    const BoxTypeCode: u8 = 99; // TYPE_CODE for Box (0x63)
+
+    /// Box method IDs from Scala SBox
+    /// Reference: sigmastate-interpreter SBox.scala, SBoxMethods object
+    const BoxMethodId = struct {
+        const value_method: u8 = 1; // box.value → Long
+        const proposition_bytes: u8 = 2; // box.propositionBytes → Coll[Byte]
+        const bytes: u8 = 3; // box.bytes → Coll[Byte]
+        const bytes_without_ref: u8 = 4; // box.bytesWithoutRef → Coll[Byte]
+        const id_method: u8 = 5; // box.id → Coll[Byte]
+        const creation_info: u8 = 6; // box.creationInfo → (Int, Coll[Byte])
+        const tokens_method: u8 = 8; // box.tokens → Coll[(Coll[Byte], Long)]
+        // Registers R4-R9 are accessed via getReg method (method ID 7)
+        // but more commonly via extract_register_as opcode
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ value_method, proposition_bytes, bytes, bytes_without_ref, id_method, creation_info, tokens_method };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("BoxMethodId collision detected");
+                }
+            }
+        }
+    };
+
+    /// PreHeader type code from Scala SPreHeader
+    /// Reference: sigmastate-interpreter SPreHeader.scala
+    const PreHeaderTypeCode: u8 = 105; // TYPE_CODE for PreHeader (0x69)
+
+    /// PreHeader method IDs from Scala SPreHeader
+    /// Reference: sigmastate-interpreter SPreHeader.scala
+    const PreHeaderMethodId = struct {
+        const version: u8 = 1; // preHeader.version → Byte
+        const parent_id: u8 = 2; // preHeader.parentId → Coll[Byte]
+        const timestamp: u8 = 3; // preHeader.timestamp → Long
+        const n_bits: u8 = 4; // preHeader.nBits → Long
+        const height: u8 = 5; // preHeader.height → Int
+        const miner_pk: u8 = 6; // preHeader.minerPk → GroupElement
+        const votes: u8 = 7; // preHeader.votes → Coll[Byte]
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ version, parent_id, timestamp, n_bits, height, miner_pk, votes };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("PreHeaderMethodId collision detected");
+                }
+            }
+        }
+    };
+
     /// Compute method call: dispatch based on type_code and method_id
     fn computeMethodCall(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
@@ -3861,6 +4270,30 @@ pub const Evaluator = struct {
                     }
                     try self.computeCheckPow();
                 },
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == BoxTypeCode) {
+            // Box methods
+            switch (method_id) {
+                BoxMethodId.value_method => try self.computeBoxValue(),
+                BoxMethodId.proposition_bytes => try self.computeBoxPropositionBytes(),
+                BoxMethodId.bytes => try self.computeBoxBytes(),
+                BoxMethodId.bytes_without_ref => try self.computeBoxBytesWithoutRef(),
+                BoxMethodId.id_method => try self.computeBoxId(),
+                BoxMethodId.creation_info => try self.computeBoxCreationInfo(),
+                BoxMethodId.tokens_method => try self.computeBoxTokens(),
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == PreHeaderTypeCode) {
+            // PreHeader methods
+            switch (method_id) {
+                PreHeaderMethodId.version => try self.computePreHeaderVersion(),
+                PreHeaderMethodId.parent_id => try self.computePreHeaderParentId(),
+                PreHeaderMethodId.timestamp => try self.computePreHeaderTimestamp(),
+                PreHeaderMethodId.n_bits => try self.computePreHeaderNBits(),
+                PreHeaderMethodId.height => try self.computePreHeaderHeight(),
+                PreHeaderMethodId.miner_pk => try self.computePreHeaderMinerPk(),
+                PreHeaderMethodId.votes => try self.computePreHeaderVotes(),
                 else => return self.handleUnsupported(),
             }
         } else {

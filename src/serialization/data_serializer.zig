@@ -87,6 +87,9 @@ pub const Value = union(enum) {
     /// Header value (reference to block header)
     header: HeaderRef,
 
+    /// PreHeader value (stores pre-header data inline)
+    pre_header: PreHeaderRef,
+
     /// Single box reference (index into context array)
     box: BoxRef,
 
@@ -213,6 +216,31 @@ pub const Value = union(enum) {
             assert(@sizeOf([44]u8) == 44); // AVL+ digest
             assert(@sizeOf([3]u8) == 3); // Votes
             assert(@sizeOf([8]u8) == 8); // PoW nonce
+        }
+    };
+
+    /// Reference to pre-header (inline copy of PreHeaderView fields for evaluation)
+    /// This mirrors context.PreHeaderView but is stored inline in Value.
+    /// PreHeader is the proposed next block header (used during mining/validation).
+    pub const PreHeaderRef = struct {
+        version: u8,
+        parent_id: [32]u8,
+        timestamp: u64,
+        n_bits: u64,
+        height: u32,
+        miner_pk: [33]u8,
+        votes: [3]u8,
+
+        // Compile-time assertions (ZIGMA_STYLE requirement)
+        comptime {
+            // PreHeaderRef must be reasonably sized for stack allocation
+            assert(@sizeOf(PreHeaderRef) <= 128);
+            assert(@sizeOf(PreHeaderRef) >= 64);
+
+            // Verify field sizes match Ergo protocol
+            assert(@sizeOf([32]u8) == 32); // Parent ID
+            assert(@sizeOf([33]u8) == 33); // Compressed EC point (miner PK)
+            assert(@sizeOf([3]u8) == 3); // Votes
         }
     };
 
@@ -549,7 +577,7 @@ fn storeValueInPool(
             .data = .{ .hash32 = h },
         },
         // Types not yet supported in pool storage
-        .tuple, .header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {
+        .tuple, .header, .pre_header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {
             return error.NotSupported;
         },
         // Soft-fork placeholder should not be stored in pool (internal-only)
