@@ -608,6 +608,9 @@ fn deserializeColl(
     // Generic collection - store elements in ValuePool
     const vpool = values orelse return error.NotSupported;
 
+    // Validate length (max 255 per protocol, may be corrupted by fault injection)
+    if (len > 255) return error.InvalidData;
+
     // Allocate slots for elements
     const start_idx = vpool.allocN(len) catch return error.OutOfMemory;
 
