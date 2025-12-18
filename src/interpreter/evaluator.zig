@@ -454,6 +454,12 @@ const AvlTreeCost = struct {
 
     // updateOperations: fixed cost 45
     pub const update_operations: u32 = 45;
+
+    // Insert/Update/Remove mutations: base 60, per entry 20, per proof byte 1
+    // These costs account for proof parsing + tree reconstruction + hashing
+    pub const insert = PerItemCost{ .base_cost = 60, .per_chunk_cost = 20, .chunk_size = 1 };
+    pub const update = PerItemCost{ .base_cost = 60, .per_chunk_cost = 20, .chunk_size = 1 };
+    pub const remove = PerItemCost{ .base_cost = 60, .per_chunk_cost = 20, .chunk_size = 1 };
 };
 
 // Compile-time tests for AvlTreeCost
@@ -4191,13 +4197,11 @@ pub const Evaluator = struct {
                 // Tree modification
                 AvlTreeMethodId.update_digest => try self.computeAvlTreeUpdateDigest(),
                 AvlTreeMethodId.update_operations => try self.computeAvlTreeUpdateOperations(),
-                // Complex methods (insert/update/remove) require Coll[(Coll[Byte], Coll[Byte])]
-                // which needs full tuple collection support - stub for now
-                AvlTreeMethodId.insert,
-                AvlTreeMethodId.update,
-                AvlTreeMethodId.remove,
-                AvlTreeMethodId.insert_or_update,
-                => return self.handleUnsupported(),
+                // Tree mutations: insert/update/remove/insertOrUpdate
+                AvlTreeMethodId.insert => try self.computeAvlTreeInsert(),
+                AvlTreeMethodId.update => try self.computeAvlTreeUpdate(),
+                AvlTreeMethodId.remove => try self.computeAvlTreeRemove(),
+                AvlTreeMethodId.insert_or_update => try self.computeAvlTreeInsertOrUpdate(),
                 else => return self.handleUnsupported(),
             }
         } else if (type_code == ContextTypeCode) {
@@ -6625,6 +6629,484 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: Stack reduced by 1 (popped 2, pushed 1)
         assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Compute tree.insert(entries, proof) → Option[AvlTree]
+    /// entries: Coll[(Coll[Byte], Coll[Byte])] - key-value pairs to insert
+    /// proof: Coll[Byte] - serialized proof
+    fn computeAvlTreeInsert(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, entries, proof)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, entries, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
+
+        const entries_val = try self.popValue();
+        const entries_coll = switch (entries_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
+        // Check if insert is allowed
+        if (!tree_data.isInsertAllowed()) {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        }
+
+        // Cost: per-item based on entry count + proof size
+        const entry_count: u32 = entries_coll.len;
+        try self.addCost(AvlTreeCost.insert.cost(entry_count + @as(u32, @intCast(proof.len))));
+
+        // Create verifier
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        // Process each entry tuple
+        var i: u16 = 0;
+        while (i < entries_coll.len) : (i += 1) {
+            const entry = self.getCollectionElementFromRef(entries_coll, i) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+
+            // Entry should be a tuple (Coll[Byte], Coll[Byte])
+            if (entry != .tuple) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            const tuple = entry.tuple;
+            if (tuple.len != 2) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            // Get key and value from tuple
+            const key_elem = self.values[tuple.start];
+            const value_elem = self.values[tuple.start + 1];
+
+            const key = switch (key_elem) {
+                .coll_byte => |kb| kb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            const value = switch (value_elem) {
+                .coll_byte => |vb| vb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            // Perform insert
+            verifier.insert(key, value) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+        }
+
+        // Create new tree with updated digest
+        const new_tree = tree_data.withDigest(verifier.current_digest);
+        try self.pushOptionSomeAvlTree(new_tree);
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.update(entries, proof) → Option[AvlTree]
+    /// entries: Coll[(Coll[Byte], Coll[Byte])] - key-value pairs to update
+    /// proof: Coll[Byte] - serialized proof
+    fn computeAvlTreeUpdate(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, entries, proof)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, entries, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
+
+        const entries_val = try self.popValue();
+        const entries_coll = switch (entries_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
+        // Check if update is allowed
+        if (!tree_data.isUpdateAllowed()) {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        }
+
+        // Cost: per-item based on entry count + proof size
+        const entry_count: u32 = entries_coll.len;
+        try self.addCost(AvlTreeCost.update.cost(entry_count + @as(u32, @intCast(proof.len))));
+
+        // Create verifier
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        // Process each entry tuple
+        var i: u16 = 0;
+        while (i < entries_coll.len) : (i += 1) {
+            const entry = self.getCollectionElementFromRef(entries_coll, i) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+
+            // Entry should be a tuple (Coll[Byte], Coll[Byte])
+            if (entry != .tuple) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            const tuple = entry.tuple;
+            if (tuple.len != 2) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            // Get key and value from tuple
+            const key_elem = self.values[tuple.start];
+            const value_elem = self.values[tuple.start + 1];
+
+            const key = switch (key_elem) {
+                .coll_byte => |kb| kb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            const value = switch (value_elem) {
+                .coll_byte => |vb| vb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            // Perform update
+            verifier.update(key, value) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+        }
+
+        // Create new tree with updated digest
+        const new_tree = tree_data.withDigest(verifier.current_digest);
+        try self.pushOptionSomeAvlTree(new_tree);
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.remove(keys, proof) → Option[AvlTree]
+    /// keys: Coll[Coll[Byte]] - keys to remove
+    /// proof: Coll[Byte] - serialized proof
+    fn computeAvlTreeRemove(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, keys, proof)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, keys, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
+
+        const keys_val = try self.popValue();
+        const keys_coll = switch (keys_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
+        // Check if remove is allowed
+        if (!tree_data.isRemoveAllowed()) {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        }
+
+        // Cost: per-item based on key count + proof size
+        const key_count: u32 = keys_coll.len;
+        try self.addCost(AvlTreeCost.remove.cost(key_count + @as(u32, @intCast(proof.len))));
+
+        // Create verifier
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        // Process each key
+        var i: u16 = 0;
+        while (i < keys_coll.len) : (i += 1) {
+            const key_elem = self.getCollectionElementFromRef(keys_coll, i) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+
+            const key = switch (key_elem) {
+                .coll_byte => |kb| kb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            // Perform remove
+            verifier.remove(key) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+        }
+
+        // Create new tree with updated digest
+        const new_tree = tree_data.withDigest(verifier.current_digest);
+        try self.pushOptionSomeAvlTree(new_tree);
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Compute tree.insertOrUpdate(entries, proof) → Option[AvlTree]
+    /// entries: Coll[(Coll[Byte], Coll[Byte])] - key-value pairs to insert or update
+    /// proof: Coll[Byte] - serialized proof
+    /// Note: Requires both insert AND update flags to be allowed
+    fn computeAvlTreeInsertOrUpdate(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS: 3 values on stack (tree, entries, proof)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, entries, tree)
+        const proof_val = try self.popValue();
+        if (proof_val != .coll_byte) return error.TypeMismatch;
+        const proof = proof_val.coll_byte;
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
+
+        const entries_val = try self.popValue();
+        const entries_coll = switch (entries_val) {
+            .coll => |c| c,
+            else => return error.TypeMismatch,
+        };
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
+        // Check if both insert and update are allowed
+        if (!tree_data.isInsertAllowed() or !tree_data.isUpdateAllowed()) {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        }
+
+        // Cost: per-item based on entry count + proof size (use insert cost)
+        const entry_count: u32 = entries_coll.len;
+        try self.addCost(AvlTreeCost.insert.cost(entry_count + @as(u32, @intCast(proof.len))));
+
+        // Create verifier
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            try self.pushOptionNone(TypePool.AVL_TREE);
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        // Process each entry tuple - try update first, then insert if key doesn't exist
+        // The BatchAVLVerifier will handle this logic based on the proof
+        var i: u16 = 0;
+        while (i < entries_coll.len) : (i += 1) {
+            const entry = self.getCollectionElementFromRef(entries_coll, i) catch {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            };
+
+            // Entry should be a tuple (Coll[Byte], Coll[Byte])
+            if (entry != .tuple) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            const tuple = entry.tuple;
+            if (tuple.len != 2) {
+                try self.pushOptionNone(TypePool.AVL_TREE);
+                assert(self.value_sp == initial_sp - 2);
+                return;
+            }
+
+            // Get key and value from tuple
+            const key_elem = self.values[tuple.start];
+            const value_elem = self.values[tuple.start + 1];
+
+            const key = switch (key_elem) {
+                .coll_byte => |kb| kb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            const value = switch (value_elem) {
+                .coll_byte => |vb| vb,
+                else => {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                },
+            };
+
+            // Try update first - if key exists, this succeeds
+            // If key doesn't exist, fall back to insert
+            verifier.update(key, value) catch {
+                // Update failed (key not found), try insert
+                verifier.insert(key, value) catch {
+                    try self.pushOptionNone(TypePool.AVL_TREE);
+                    assert(self.value_sp == initial_sp - 2);
+                    return;
+                };
+            };
+        }
+
+        // Create new tree with updated digest
+        const new_tree = tree_data.withDigest(verifier.current_digest);
+        try self.pushOptionSomeAvlTree(new_tree);
+
+        // POSTCONDITION: Stack reduced by 2 (popped 3, pushed 1)
+        assert(self.value_sp == initial_sp - 2);
+    }
+
+    /// Push Some(AvlTree) option onto value stack
+    fn pushOptionSomeAvlTree(self: *Evaluator, tree: avl_tree.AvlTreeData) EvalError!void {
+        // Allocate slot in pool
+        const idx = self.pools.values.alloc() catch return error.OutOfMemory;
+
+        // Store avl_tree in pool
+        const pooled = value_pool.PooledValue{
+            .type_idx = TypePool.AVL_TREE,
+            .data = .{ .avl_tree = tree },
+        };
+        self.pools.values.set(idx, pooled);
+
+        // Push option referencing the pooled value
+        try self.pushValue(.{ .option = .{
+            .inner_type = TypePool.AVL_TREE,
+            .value_idx = idx,
+        } });
     }
 
     /// Push None option onto value stack

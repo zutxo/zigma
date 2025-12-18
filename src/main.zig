@@ -182,6 +182,7 @@ fn printValueJson(value: Value, writer: anytype) !void {
         },
         .box => try writer.print("\"<Box>\"", .{}),
         .header => try writer.print("\"<Header>\"", .{}),
+        .pre_header => try writer.print("\"<PreHeader>\"", .{}),
         .avl_tree => try writer.print("\"<AvlTree>\"", .{}),
         .tuple => try writer.print("\"<Tuple>\"", .{}),
         .unsigned_big_int => try writer.print("\"<UnsignedBigInt>\"", .{}),

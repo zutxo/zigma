@@ -10,6 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const types = @import("../core/types.zig");
+const avl_tree = @import("../crypto/avl_tree.zig");
 
 const TypeIndex = types.TypeIndex;
 
@@ -82,6 +83,9 @@ pub const PooledValue = struct {
 
         /// 32-byte hash result (Blake2b256 or SHA256), stored inline
         hash32: [32]u8,
+
+        /// AVL tree data (digest + metadata, stored inline)
+        avl_tree: avl_tree.AvlTreeData,
     };
 
     /// BigInt storage (32 bytes max)
@@ -341,6 +345,16 @@ pub const ValuePool = struct {
         self.values[idx] = .{
             .type_idx = type_idx,
             .data = .{ .hash32 = hash },
+        };
+        return idx;
+    }
+
+    /// Store AVL tree data (inline, no arena needed)
+    pub fn storeAvlTree(self: *Self, type_idx: TypeIndex, tree: avl_tree.AvlTreeData) error{PoolExhausted}!u16 {
+        const idx = try self.alloc();
+        self.values[idx] = .{
+            .type_idx = type_idx,
+            .data = .{ .avl_tree = tree },
         };
         return idx;
     }
