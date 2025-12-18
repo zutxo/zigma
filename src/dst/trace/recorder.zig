@@ -342,6 +342,12 @@ fn hashValue(value: Value) u32 {
                 hash = hash *% 31 +% b;
             }
         },
+        .pre_header => |v| {
+            for (v.parent_id) |b| {
+                hash = hash *% 31 +% b;
+            }
+            hash = hash *% 31 +% v.height;
+        },
         .avl_tree => |v| {
             for (v.digest) |b| {
                 hash = hash *% 31 +% b;

@@ -230,6 +230,12 @@ fn valuesEqual(a: Value, b: Value) bool {
             // Compare by ID (header hash)
             break :blk std.mem.eql(u8, &v.id, &b.header.id);
         },
+        .pre_header => |v| blk: {
+            if (b != .pre_header) break :blk false;
+            // Compare by parent_id and height
+            break :blk std.mem.eql(u8, &v.parent_id, &b.pre_header.parent_id) and
+                v.height == b.pre_header.height;
+        },
         .avl_tree => |v| blk: {
             if (b != .avl_tree) break :blk false;
             break :blk std.mem.eql(u8, &v.digest, &b.avl_tree.digest) and
