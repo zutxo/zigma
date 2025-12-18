@@ -361,7 +361,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateIntLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 8);
+        const choice = self.prng.range_inclusive(u8, 0, 9);
         switch (choice) {
             0 => {
                 // height opcode (returns Int)
@@ -504,6 +504,26 @@ pub const ExprGenerator = struct {
                 // Second element
                 try self.generateConstant(.{ .int = self.prng.int(i32) }, TypePool.INT);
             },
+            8 => {
+                // extract_register_as: Box.R4 → Option[Int] → Int
+                // DST context uses testBoxWithRegisters() which has R4=Int(42)
+                // Tree: [option_get] [extract_register_as] [self_box]
+                _ = try self.addNode(.{
+                    .tag = .option_get,
+                    .result_type = TypePool.INT,
+                });
+                // extract_register_as: data = (type_idx << 4) | register_id
+                // R4 = 4, INT type = TypePool.INT
+                _ = try self.addNode(.{
+                    .tag = .extract_register_as,
+                    .data = (@as(u16, TypePool.INT) << 4) | 4, // R4 with Int type
+                    .result_type = TypePool.OPTION_INT,
+                });
+                _ = try self.addNode(.{
+                    .tag = .self_box,
+                    .result_type = TypePool.BOX,
+                });
+            },
             else => {
                 // Constant int
                 const value = self.prng.int(i32);
@@ -513,7 +533,7 @@ pub const ExprGenerator = struct {
     }
 
     fn generateLongLeaf(self: *ExprGenerator) GenerateError!void {
-        const choice = self.prng.range_inclusive(u8, 0, 3);
+        const choice = self.prng.range_inclusive(u8, 0, 4);
         switch (choice) {
             0 => {
                 // Constant long
@@ -551,6 +571,26 @@ pub const ExprGenerator = struct {
                 _ = try self.addNode(.{
                     .tag = .unit,
                     .result_type = TypePool.UNIT,
+                });
+            },
+            3 => {
+                // extract_register_as: Box.R5 → Option[Long] → Long
+                // DST context uses testBoxWithRegisters() which has R5=Long(50)
+                // Tree: [option_get] [extract_register_as] [self_box]
+                _ = try self.addNode(.{
+                    .tag = .option_get,
+                    .result_type = TypePool.LONG,
+                });
+                // extract_register_as: data = (type_idx << 4) | register_id
+                // R5 = 5, LONG type = TypePool.LONG
+                _ = try self.addNode(.{
+                    .tag = .extract_register_as,
+                    .data = (@as(u16, TypePool.LONG) << 4) | 5, // R5 with Long type
+                    .result_type = TypePool.OPTION_LONG,
+                });
+                _ = try self.addNode(.{
+                    .tag = .self_box,
+                    .result_type = TypePool.BOX,
                 });
             },
             else => {

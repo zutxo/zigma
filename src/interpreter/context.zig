@@ -490,6 +490,35 @@ pub fn testBox() BoxView {
     };
 }
 
+// Register fixture data for DST testing
+// R4: Int value 42 - format: [type_code=0x04, zigzag_vlq(42)=0x54]
+pub const r4_int_fixture: []const u8 = &[_]u8{ 0x04, 0x54 };
+// R5: Long value 50 - format: [type_code=0x05, zigzag_vlq(50)=0x64]
+pub const r5_long_fixture: []const u8 = &[_]u8{ 0x05, 0x64 };
+
+/// Create a box with populated registers for DST testing.
+/// R4 contains Int(42), R5 contains Long(50).
+/// This enables extract_register_as opcode coverage.
+pub fn testBoxWithRegisters() BoxView {
+    return .{
+        .id = [_]u8{0} ** 32,
+        .value = 1000000, // 1 ERG in nanoERGs
+        .proposition_bytes = &[_]u8{ 0x00, 0x7F }, // TrueLeaf
+        .creation_height = 1,
+        .tx_id = [_]u8{0} ** 32,
+        .index = 0,
+        .tokens = &[_]Token{},
+        .registers = .{
+            r4_int_fixture, // R4: Int(42)
+            r5_long_fixture, // R5: Long(50)
+            null, // R6
+            null, // R7
+            null, // R8
+            null, // R9
+        },
+    };
+}
+
 /// Create a minimal header for testing
 pub fn testHeader() HeaderView {
     return .{
@@ -768,4 +797,22 @@ test "version_context: allowsSoftForkPlaceholder" {
     // Future script on v2 mainnet
     const vc5 = VersionContext.init(2, 3);
     try std.testing.expect(vc5.allowsSoftForkPlaceholder());
+}
+
+test "context: testBoxWithRegisters has R4 and R5" {
+    const box = testBoxWithRegisters();
+
+    // R4 should be present with Int fixture data
+    try std.testing.expect(box.hasRegister(.R4));
+    try std.testing.expectEqualSlices(u8, r4_int_fixture, box.getRegister(.R4).?);
+
+    // R5 should be present with Long fixture data
+    try std.testing.expect(box.hasRegister(.R5));
+    try std.testing.expectEqualSlices(u8, r5_long_fixture, box.getRegister(.R5).?);
+
+    // R6-R9 should not be present
+    try std.testing.expect(!box.hasRegister(.R6));
+    try std.testing.expect(!box.hasRegister(.R7));
+    try std.testing.expect(!box.hasRegister(.R8));
+    try std.testing.expect(!box.hasRegister(.R9));
 }

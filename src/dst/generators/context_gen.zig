@@ -26,6 +26,10 @@ const PreHeaderView = context_mod.PreHeaderView;
 const Token = context_mod.Token;
 const VersionContext = context_mod.VersionContext;
 
+// Import register fixtures for valid extract_register_as testing
+const r4_int_fixture = context_mod.r4_int_fixture;
+const r5_long_fixture = context_mod.r5_long_fixture;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -205,9 +209,21 @@ pub const ContextGenerator = struct {
         }
 
         // Generate registers R4-R9
+        // R4 and R5 use fixture data to enable extract_register_as testing
+        // R6-R9 are randomly populated or null
         for (0..6) |r| {
-            if (self.prng.chance(self.options.register_fill_probability)) {
-                // Generate random register data (small bytes)
+            if (r == 0) {
+                // R4: Always set with valid Int fixture (enables extract_register_as coverage)
+                var reg_data: [64]u8 = undefined;
+                @memcpy(reg_data[0..r4_int_fixture.len], r4_int_fixture);
+                self.register_storage[idx][0] = reg_data;
+            } else if (r == 1) {
+                // R5: Always set with valid Long fixture
+                var reg_data: [64]u8 = undefined;
+                @memcpy(reg_data[0..r5_long_fixture.len], r5_long_fixture);
+                self.register_storage[idx][1] = reg_data;
+            } else if (self.prng.chance(self.options.register_fill_probability)) {
+                // R6-R9: Random data (may not deserialize correctly, but tests robustness)
                 const reg_len = self.prng.range_inclusive(u8, 1, 32);
                 var reg_data: [64]u8 = undefined;
                 self.prng.fill(reg_data[0..reg_len]);
@@ -229,7 +245,14 @@ pub const ContextGenerator = struct {
                 var regs: [6]?[]const u8 = [_]?[]const u8{null} ** 6;
                 for (0..6) |r| {
                     if (self.register_storage[idx][r]) |*reg| {
-                        regs[r] = reg[0..32]; // First 32 bytes
+                        // R4 and R5 use fixture lengths, others use 32 bytes
+                        const slice_len: usize = if (r == 0)
+                            r4_int_fixture.len
+                        else if (r == 1)
+                            r5_long_fixture.len
+                        else
+                            32;
+                        regs[r] = reg[0..slice_len];
                     }
                 }
                 break :blk regs;
