@@ -4242,10 +4242,8 @@ pub const Evaluator = struct {
                 GlobalMethodId.xor => try self.computeGlobalXor(),
                 GlobalMethodId.encode_nbits => try self.computeEncodeNBits(),
                 GlobalMethodId.decode_nbits => try self.computeDecodeNBits(),
-                // Complex methods requiring type parameter support
-                GlobalMethodId.serialize,
-                GlobalMethodId.from_big_endian_bytes,
-                => return self.handleUnsupported(),
+                GlobalMethodId.serialize => try self.computeGlobalSerialize(node.result_type),
+                GlobalMethodId.from_big_endian_bytes => try self.computeGlobalFromBigEndianBytes(node.result_type),
                 else => return self.handleUnsupported(),
             }
         } else if (type_code == HeaderTypeCode) {
@@ -5946,6 +5944,9 @@ pub const Evaluator = struct {
         const xor: u32 = 20; // Global.xor (per byte)
         const encode_nbits: u32 = 25; // Global.encodeNBits
         const decode_nbits: u32 = 50; // Global.decodeNBits
+        const serialize_base: u32 = 10; // Global.serialize (base)
+        const serialize_per_byte: u32 = 2; // Global.serialize (per output byte)
+        const from_big_endian: u32 = 30; // Global.fromBigEndianBytes
     };
 
     /// Compute Global.groupGenerator → GroupElement
@@ -6191,6 +6192,159 @@ pub const Evaluator = struct {
                 return error.InvalidBigInt;
             try self.pushValue(bigInt256ToValue(bigint));
         }
+
+        // POSTCONDITION: Popped 2, pushed 1
+        assert(self.value_sp == initial_sp - 1);
+    }
+
+    /// Map a Value discriminant to its corresponding TypeIndex
+    /// Used for serialize[T] where type T must be inferred from the value
+    /// Note: For collections/options, returns the best matching pre-defined type
+    fn valueToTypeIndex(value: Value) TypeIndex {
+        return switch (value) {
+            .unit => TypePool.UNIT,
+            .boolean => TypePool.BOOLEAN,
+            .byte => TypePool.BYTE,
+            .short => TypePool.SHORT,
+            .int => TypePool.INT,
+            .long => TypePool.LONG,
+            .big_int => TypePool.BIG_INT,
+            .unsigned_big_int => TypePool.UNSIGNED_BIG_INT,
+            .group_element => TypePool.GROUP_ELEMENT,
+            .sigma_prop => TypePool.SIGMA_PROP,
+            .coll_byte => TypePool.COLL_BYTE,
+            .coll => |c| switch (c.elem_type) {
+                TypePool.BYTE => TypePool.COLL_BYTE,
+                TypePool.INT => TypePool.COLL_INT,
+                TypePool.LONG => TypePool.COLL_LONG,
+                TypePool.COLL_BYTE => TypePool.COLL_COLL_BYTE,
+                else => TypePool.COLL_BYTE, // Fallback
+            },
+            .option => |o| switch (o.inner_type) {
+                TypePool.INT => TypePool.OPTION_INT,
+                TypePool.LONG => TypePool.OPTION_LONG,
+                TypePool.COLL_BYTE => TypePool.OPTION_COLL_BYTE,
+                else => TypePool.OPTION_INT, // Fallback
+            },
+            .box => TypePool.BOX,
+            .header => TypePool.HEADER,
+            .pre_header => TypePool.PRE_HEADER,
+            .avl_tree => TypePool.AVL_TREE,
+            // Tuples require dynamic type construction; fallback to unit
+            .tuple => TypePool.UNIT,
+            .hash32 => TypePool.COLL_BYTE, // Hash32 is Coll[Byte] semantically
+            // Box collections need dynamic type; fallback to unit
+            .box_coll => TypePool.UNIT,
+            .soft_fork_placeholder => TypePool.UNIT, // Placeholder
+        };
+    }
+
+    /// Compute Global.serialize[T](value: T) → Coll[Byte]
+    /// Serializes any value to bytes using ErgoTree data format
+    fn computeGlobalSerialize(self: *Evaluator, result_type: TypeIndex) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // Global, value on stack
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order: value, global
+        const value = try self.popValue();
+        _ = try self.popValue(); // Global object (unused)
+
+        // Get type of the value for serialization
+        const value_type = valueToTypeIndex(value);
+
+        // Allocate output buffer (max 4KB for typical values)
+        const max_size: usize = 4096;
+        var buf: [max_size]u8 = undefined;
+
+        // Serialize value
+        const serialized_len = data.serialize(value_type, &self.pools.type_pool, value, &buf) catch {
+            return error.InvalidData;
+        };
+
+        // Cost: base + per output byte
+        try self.addCost(GlobalCost.serialize_base + GlobalCost.serialize_per_byte * @as(u32, @intCast(serialized_len)));
+
+        // Copy to arena
+        const result = self.arena.allocSlice(u8, serialized_len) catch return error.OutOfMemory;
+        @memcpy(result, buf[0..serialized_len]);
+
+        try self.pushValue(.{ .coll_byte = result });
+
+        // POSTCONDITION: Popped 2, pushed 1
+        assert(self.value_sp == initial_sp - 1);
+        _ = result_type;
+    }
+
+    /// Compute Global.fromBigEndianBytes[T](bytes: Coll[Byte]) → T
+    /// Interprets bytes as big-endian representation of numeric type T
+    fn computeGlobalFromBigEndianBytes(self: *Evaluator, target_type: TypeIndex) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 2); // Global, bytes on stack
+        const initial_sp = self.value_sp;
+
+        try self.addCost(GlobalCost.from_big_endian);
+
+        // Pop in reverse order: bytes, global
+        const bytes_val = try self.popValue();
+        _ = try self.popValue(); // Global object
+
+        // Must be byte collection
+        const bytes = switch (bytes_val) {
+            .coll_byte => |b| b,
+            else => return error.TypeMismatch,
+        };
+
+        // Convert based on target type
+        const result: Value = switch (target_type) {
+            TypePool.BYTE => blk: {
+                if (bytes.len != 1) return error.InvalidData;
+                break :blk .{ .byte = @bitCast(bytes[0]) };
+            },
+            TypePool.SHORT => blk: {
+                if (bytes.len > 2) return error.InvalidData;
+                var padded: [2]u8 = [_]u8{0} ** 2;
+                const offset = 2 - bytes.len;
+                @memcpy(padded[offset..], bytes);
+                break :blk .{ .short = @bitCast(padded) };
+            },
+            TypePool.INT => blk: {
+                if (bytes.len > 4) return error.InvalidData;
+                var padded: [4]u8 = [_]u8{0} ** 4;
+                const offset = 4 - bytes.len;
+                @memcpy(padded[offset..], bytes);
+                break :blk .{ .int = std.mem.readInt(i32, &padded, .big) };
+            },
+            TypePool.LONG => blk: {
+                if (bytes.len > 8) return error.InvalidData;
+                var padded: [8]u8 = [_]u8{0} ** 8;
+                const offset = 8 - bytes.len;
+                @memcpy(padded[offset..], bytes);
+                break :blk .{ .long = std.mem.readInt(i64, &padded, .big) };
+            },
+            TypePool.BIG_INT => blk: {
+                if (bytes.len > 32) return error.InvalidData;
+                // BigInt is stored as-is (already big-endian)
+                var bigint: Value.BigInt = .{
+                    .bytes = [_]u8{0} ** 33,
+                    .len = @intCast(bytes.len),
+                };
+                @memcpy(bigint.bytes[0..bytes.len], bytes);
+                break :blk .{ .big_int = bigint };
+            },
+            TypePool.UNSIGNED_BIG_INT => blk: {
+                if (bytes.len > 32) return error.InvalidData;
+                var ubigint: Value.UnsignedBigInt = .{
+                    .bytes = [_]u8{0} ** 33,
+                    .len = @intCast(bytes.len),
+                };
+                @memcpy(ubigint.bytes[0..bytes.len], bytes);
+                break :blk .{ .unsigned_big_int = ubigint };
+            },
+            else => return error.UnsupportedExpression, // Only numeric types supported
+        };
+
+        try self.pushValue(result);
 
         // POSTCONDITION: Popped 2, pushed 1
         assert(self.value_sp == initial_sp - 1);
