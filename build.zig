@@ -67,6 +67,23 @@ pub fn build(b: *std.Build) void {
     // Include property tests in main test step
     test_step.dependOn(&run_property_tests.step);
 
+    // CLI executable
+    const cli_exe = b.addExecutable(.{
+        .name = "zigma",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(cli_exe);
+
+    // CLI run step
+    const run_cli = b.addRunArtifact(cli_exe);
+    if (b.args) |args| {
+        run_cli.addArgs(args);
+    }
+    const cli_step = b.step("cli", "Run zigma CLI");
+    cli_step.dependOn(&run_cli.step);
+
     // Documentation
     const lib_docs = lib.getEmittedDocs();
     const install_docs = b.addInstallDirectory(.{
