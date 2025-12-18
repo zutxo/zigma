@@ -94,9 +94,22 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Generate documentation");
     docs_step.dependOn(&install_docs.step);
 
-    // Benchmarks (placeholder for future)
+    // Benchmarks
+    const bench_exe = b.addExecutable(.{
+        .name = "zigma-bench",
+        .root_source_file = b.path("benchmarks/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_exe.root_module.addImport("zigma", lib.root_module);
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
     const bench_step = b.step("bench", "Run benchmarks");
-    _ = bench_step;
+    bench_step.dependOn(&run_bench.step);
 
     // DST (Deterministic Simulation Testing) - Unit tests
     const dst_tests = b.addTest(.{
