@@ -124,6 +124,9 @@ fn evalCommand(hex: []const u8, extra_args: []const []const u8) !void {
     var eval = Evaluator.init(&tree.expr_tree, &ctx);
     const eval_result = eval.evaluate();
 
+    // Convert JitCost to BlockCost (divide by 10) to match Scala output
+    const block_cost = eval.cost_used / 10;
+
     if (eval_result) |raw_value| {
         // Reduce trivial SigmaProps to booleans for script result
         const value = reduceSigmaPropIfTrivial(raw_value);
@@ -131,9 +134,9 @@ fn evalCommand(hex: []const u8, extra_args: []const []const u8) !void {
         try stdout.print("\n    \"type\": \"{s}\",", .{valueTypeName(value)});
         try stdout.print("\n    \"value\": ", .{});
         try printValueJson(value, stdout);
-        try stdout.print("\n  }},\n  \"cost\": {}\n}}\n", .{eval.cost_used});
+        try stdout.print("\n  }},\n  \"cost\": {}\n}}\n", .{block_cost});
     } else |err| {
-        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"{s}\",\n  \"cost\": {}\n}}\n", .{ @errorName(err), eval.cost_used });
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"{s}\",\n  \"cost\": {}\n}}\n", .{ @errorName(err), block_cost });
     }
 }
 
