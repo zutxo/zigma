@@ -233,6 +233,7 @@ pub const CostOp = enum(u8) {
     logical,
     height,
     constant,
+    constant_placeholder,
     self_box,
     inputs,
     outputs,
@@ -269,6 +270,7 @@ const JIT_COSTS = [_]u32{
     20, // logical (BinAnd, BinOr, BinXor - from trees.scala)
     26, // height (from values.scala line 1453)
     5, // constant (from values.scala line 380)
+    1, // constant_placeholder (from values.scala line 421)
     5, // self_box (GlobalVars.SelfBox - from values.scala line 971)
     10, // inputs (from values.scala line 1480)
     10, // outputs (from values.scala line 1466)
@@ -305,6 +307,7 @@ const AOT_COSTS = [_]u32{
     40, // logical
     10, // height
     10, // constant
+    5, // constant_placeholder (lower than constant in AOT too)
     15, // self_box
     15, // inputs
     15, // outputs
@@ -361,6 +364,7 @@ const FixedCost = struct {
     pub const logical: u32 = JIT_COSTS[@intFromEnum(CostOp.logical)];
     pub const height: u32 = JIT_COSTS[@intFromEnum(CostOp.height)];
     pub const constant: u32 = JIT_COSTS[@intFromEnum(CostOp.constant)];
+    pub const constant_placeholder: u32 = JIT_COSTS[@intFromEnum(CostOp.constant_placeholder)];
     pub const self_box: u32 = JIT_COSTS[@intFromEnum(CostOp.self_box)];
     pub const inputs: u32 = JIT_COSTS[@intFromEnum(CostOp.inputs)];
     pub const outputs: u32 = JIT_COSTS[@intFromEnum(CostOp.outputs)];
@@ -912,7 +916,7 @@ pub const Evaluator = struct {
             },
 
             .constant_placeholder => {
-                try self.addCost(FixedCost.constant);
+                try self.addCost(FixedCost.constant_placeholder);
                 const const_idx = node.data;
                 if (const_idx >= self.tree.constant_count) {
                     return error.InvalidConstantIndex;
