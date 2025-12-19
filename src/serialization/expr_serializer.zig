@@ -205,6 +205,12 @@ pub const ExprTag = enum(u8) {
     /// Returns: T where T is the expected type
     deserialize_register,
 
+    /// BoolToSigmaProp: convert boolean to SigmaProp (opcode 0xD1/209)
+    /// Wraps a Boolean expression as a SigmaProp (trivial proposition)
+    /// 1 child: Boolean expression
+    /// Returns: SigmaProp
+    bool_to_sigma_prop,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -542,6 +548,8 @@ fn deserializeWithDepth(
             // Sigma proposition connectives
             opcodes.SigmaAnd => try deserializeSigmaConnective(tree, reader, arena, .sigma_and, depth),
             opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
+            // BoolToSigmaProp: wrap Boolean as SigmaProp (trivial proposition)
+            opcodes.BoolToSigmaProp => try deserializeUnaryOp(tree, reader, arena, .bool_to_sigma_prop, depth),
             // Method call (collection methods like zip, indices, etc.)
             opcodes.MethodCall => try deserializeMethodCall(tree, reader, arena, depth),
             // AVL tree operations
@@ -690,7 +698,8 @@ fn deserializeUnaryOp(
         tag == .option_get or tag == .option_is_defined or
         tag == .long_to_byte_array or tag == .byte_array_to_bigint or
         tag == .byte_array_to_long or tag == .decode_point or
-        tag == .mod_q);
+        tag == .mod_q or tag == .bool_to_sigma_prop or
+        tag == .bit_inversion);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {
@@ -700,6 +709,7 @@ fn deserializeUnaryOp(
         .byte_array_to_long => TypePool.LONG,
         .byte_array_to_bigint, .mod_q => TypePool.BIG_INT,
         .decode_point => TypePool.GROUP_ELEMENT,
+        .bool_to_sigma_prop => TypePool.SIGMA_PROP, // Boolean -> SigmaProp
         else => TypePool.ANY,
     };
 

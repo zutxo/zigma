@@ -9,6 +9,7 @@ const ergotree = zigma.ergotree_serializer;
 const Value = zigma.data_serializer.Value;
 const TypePool = zigma.TypePool;
 const BumpAllocator = zigma.memory.BumpAllocator;
+const hash = zigma.hash;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -41,6 +42,13 @@ pub fn main() !void {
             return;
         }
         try deserializeCommand(args[2], args[3..], allocator);
+    } else if (std.mem.eql(u8, command, "hash")) {
+        if (args.len < 4) {
+            std.debug.print("Error: hash requires <algorithm> <hex> arguments\n", .{});
+            printUsage();
+            return;
+        }
+        try hashCommand(args[2], args[3]);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
     } else {
@@ -65,12 +73,14 @@ fn printUsage() void {
         \\  eval <hex>         Evaluate ErgoTree (hex-encoded)
         \\    --height=<n>     Block height for context (default: 1000000)
         \\  deserialize <hex>  Deserialize and display ErgoTree
+        \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
         \\  help               Show this help message
         \\
         \\Examples:
         \\  zigma version
         \\  zigma eval 00d191a37300 --height=500000
         \\  zigma deserialize 00d191a37300
+        \\  zigma hash blake2b256 616263
         \\
     , .{}) catch {};
 }
@@ -114,10 +124,14 @@ fn evalCommand(hex: []const u8, extra_args: []const []const u8) !void {
     var eval = Evaluator.init(&tree.expr_tree, &ctx);
     const eval_result = eval.evaluate();
 
-    if (eval_result) |value| {
-        try stdout.print("{{\n  \"success\": true,\n  \"result\": ", .{});
+    if (eval_result) |raw_value| {
+        // Reduce trivial SigmaProps to booleans for script result
+        const value = reduceSigmaPropIfTrivial(raw_value);
+        try stdout.print("{{\n  \"success\": true,\n  \"result\": {{", .{});
+        try stdout.print("\n    \"type\": \"{s}\",", .{valueTypeName(value)});
+        try stdout.print("\n    \"value\": ", .{});
         try printValueJson(value, stdout);
-        try stdout.print(",\n  \"cost\": {}\n}}\n", .{eval.cost_used});
+        try stdout.print("\n  }},\n  \"cost\": {}\n}}\n", .{eval.cost_used});
     } else |err| {
         try stdout.print("{{\n  \"success\": false,\n  \"error\": \"{s}\",\n  \"cost\": {}\n}}\n", .{ @errorName(err), eval.cost_used });
     }
@@ -151,6 +165,79 @@ fn deserializeCommand(hex: []const u8, _: []const []const u8, _: std.mem.Allocat
     try stdout.print("  \"node_count\": {},\n", .{tree.expr_tree.node_count});
     try stdout.print("  \"constant_count\": {}\n", .{tree.constant_count});
     try stdout.print("}}\n", .{});
+}
+
+fn valueTypeName(value: Value) []const u8 {
+    return switch (value) {
+        .unit => "SUnit",
+        .boolean => "SBoolean",
+        .byte => "SByte",
+        .short => "SShort",
+        .int => "SInt",
+        .long => "SLong",
+        .big_int => "SBigInt",
+        .unsigned_big_int => "SUnsignedBigInt",
+        .group_element => "SGroupElement",
+        .sigma_prop => "SSigmaProp",
+        .coll_byte => "Coll[Byte]",
+        .coll => "Coll[_]",
+        .option => "Option[_]",
+        .box => "SBox",
+        .header => "SHeader",
+        .pre_header => "SPreHeader",
+        .avl_tree => "SAvlTree",
+        .tuple => "Tuple",
+        .box_coll => "Coll[Box]",
+        .hash32 => "Coll[Byte]",
+        .soft_fork_placeholder => "SoftForkPlaceholder",
+    };
+}
+
+fn hashCommand(algorithm: []const u8, hex: []const u8) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Decode hex input
+    var input_bytes: [4096]u8 = undefined;
+    const decoded = std.fmt.hexToBytes(&input_bytes, hex) catch {
+        try stdout.print("{{\"error\": \"invalid_hex\"}}\n", .{});
+        return;
+    };
+
+    if (std.mem.eql(u8, algorithm, "blake2b256")) {
+        const result = hash.blake2b256(decoded);
+        try stdout.print("{{\"success\": true, \"result\": \"", .{});
+        for (result) |b| {
+            try stdout.print("{x:0>2}", .{b});
+        }
+        try stdout.print("\"}}\n", .{});
+    } else if (std.mem.eql(u8, algorithm, "sha256")) {
+        const result = hash.sha256(decoded);
+        try stdout.print("{{\"success\": true, \"result\": \"", .{});
+        for (result) |b| {
+            try stdout.print("{x:0>2}", .{b});
+        }
+        try stdout.print("\"}}\n", .{});
+    } else {
+        try stdout.print("{{\"error\": \"unknown_algorithm\", \"message\": \"{s}\"}}\n", .{algorithm});
+    }
+}
+
+/// Reduce SigmaProp to boolean if trivial.
+/// Returns the reduced value (boolean) or original (non-trivial SigmaProp).
+fn reduceSigmaPropIfTrivial(value: Value) Value {
+    switch (value) {
+        .sigma_prop => |sp| {
+            if (sp.data.len >= 1) {
+                // Trivial proposition markers:
+                // From BoolToSigmaProp result: 0x01 = true, 0x00 = false
+                // From constant serialization: 0xD3 (211) = TrivialPropTrue, 0xD2 (210) = TrivialPropFalse
+                if (sp.data[0] == 0x01 or sp.data[0] == 0xD3) return .{ .boolean = true };
+                if (sp.data[0] == 0x00 or sp.data[0] == 0xD2) return .{ .boolean = false };
+            }
+            return value; // Non-trivial, keep as SigmaProp
+        },
+        else => return value,
+    }
 }
 
 fn printValueJson(value: Value, writer: anytype) !void {

@@ -1030,6 +1030,12 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
             },
 
+            .bool_to_sigma_prop => {
+                // BoolToSigmaProp: wrap boolean as SigmaProp (trivial proposition)
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
             .val_use => {
                 // Variable reference: look up value from bindings
                 try self.addCost(FixedCost.constant);
@@ -1535,6 +1541,11 @@ pub const Evaluator = struct {
                 try self.computeBitInversion();
             },
 
+            .bool_to_sigma_prop => {
+                // Convert boolean to SigmaProp (trivial proposition)
+                try self.computeBoolToSigmaProp();
+            },
+
             .plus_mod_q => {
                 try self.computePlusModQ();
             },
@@ -1849,6 +1860,30 @@ pub const Evaluator = struct {
         const result = try bitInvertInt(input);
 
         try self.pushValue(result);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute BoolToSigmaProp - wrap boolean as SigmaProp (trivial proposition)
+    fn computeBoolToSigmaProp(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(15); // BoolToSigmaProp cost from opcodes
+
+        const input = try self.popValue();
+        if (input != .boolean) return error.TypeMismatch;
+
+        // Convert boolean to trivial proposition using internal serialization format:
+        // 0x01 = trivial_true, 0x00 = trivial_false
+        const opcode: u8 = if (input.boolean) 0x01 else 0x00;
+
+        // Allocate from arena for proper lifetime
+        const sigma_bytes = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
+        sigma_bytes[0] = opcode;
+
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -7733,7 +7768,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop => 1,
 
             // Binary operations (2 children)
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
