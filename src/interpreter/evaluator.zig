@@ -261,38 +261,39 @@ pub const CostOp = enum(u8) {
 };
 
 /// JIT cost table (v2+ mainnet, current default).
-/// Source: sigmastate/JitCost.scala
+/// Source: sigmastate/data/shared/src/main/scala/sigma/ast/trees.scala,
+///         sigmastate/data/shared/src/main/scala/sigma/ast/values.scala
 const JIT_COSTS = [_]u32{
-    36, // comparison
-    36, // arithmetic
-    36, // logical
-    5, // height
-    5, // constant
-    10, // self_box
-    10, // inputs
-    10, // outputs
-    10, // data_inputs
-    59, // blake2b256_base
-    64, // sha256_base
-    1, // hash_per_byte
-    1100, // decode_point
-    10, // group_generator
-    5100, // exponentiate
-    250, // multiply_group
-    10, // select_field
-    10, // tuple_construct
-    10, // upcast
-    10, // downcast
+    20, // comparison (GT, GE, LT, LE - from SimpleRelation costKind)
+    15, // arithmetic (Plus, Minus, etc. - 15 for primitives, 20-25 for BigInt)
+    20, // logical (BinAnd, BinOr, BinXor - from trees.scala)
+    26, // height (from values.scala line 1453)
+    5, // constant (from values.scala line 380)
+    5, // self_box (GlobalVars.SelfBox - from values.scala line 971)
+    10, // inputs (from values.scala line 1480)
+    10, // outputs (from values.scala line 1466)
+    15, // data_inputs (from values.scala line 1495)
+    20, // blake2b256_base (HashCost.blake2b256 used for actual costing)
+    80, // sha256_base (HashCost.sha256 used for actual costing)
+    7, // hash_per_chunk (blake2b256 per 128B chunk)
+    300, // decode_point (from trees.scala line 530)
+    10, // group_generator (from values.scala line 1509)
+    900, // exponentiate (from trees.scala line 1046)
+    40, // multiply_group (from trees.scala line 1067)
+    10, // select_field (from transformers.scala line 314)
+    10, // tuple_construct (from transformers.scala line 314)
+    10, // upcast (10 for primitives, 30 for BigInt)
+    10, // downcast (10 for primitives, 30 for BigInt)
     10, // extract_header_field
     20, // collection_base
     5, // collection_per_item
-    20, // func_apply
+    5, // func_apply (AddToEnvironmentDesc - from values.scala line 1064)
     10, // method_call
-    20, // sigma_and
-    20, // sigma_or
+    20, // sigma_and (from trees.scala line 1257)
+    20, // sigma_or (from trees.scala line 1280)
     100, // create_avl_tree
     800, // tree_lookup
-    50, // extract_register
+    50, // extract_register (from transformers.scala line 500)
 };
 
 /// AOT cost table (pre-v2, legacy).
