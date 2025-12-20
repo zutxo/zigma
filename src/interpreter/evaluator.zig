@@ -1495,6 +1495,9 @@ pub const Evaluator = struct {
             .prove_dh_tuple,
             .sigma_prop_bytes,
             .slice,
+            // Logical AND/OR on collections - unary: Coll[Boolean] → Boolean
+            .logical_and,
+            .logical_or,
             => {
                 // These operations are deserialized but not yet evaluated.
                 // TODO: Implement evaluation for each of these.
@@ -8003,7 +8006,7 @@ pub const Evaluator = struct {
             .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context, .trivial_prop_true, .trivial_prop_false, .context, .global => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop, .size_of, .negation, .logical_not, .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info, .prove_dlog, .sigma_prop_bytes => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop, .size_of, .negation, .logical_not, .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info, .prove_dlog, .sigma_prop_bytes, .logical_and, .logical_or => 1,
 
             // Binary operations (2 children)
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,

@@ -132,6 +132,12 @@ pub const ExprTag = enum(u8) {
     /// FlatMap: Coll[A] × (A → Coll[B]) → Coll[B] (opcode 0xB8)
     flat_map,
 
+    // Logical operations on collections of booleans (unary: Coll[Boolean] → Boolean)
+    /// AND: all elements in collection are true (opcode 0x96)
+    logical_and,
+    /// OR: at least one element in collection is true (opcode 0x97)
+    logical_or,
+
     // Sigma proposition connectives (opcodes 0xEA-0xEB after shift)
     /// SigmaAnd: all child propositions must be proven (opcode 0xEA)
     sigma_and,
@@ -553,8 +559,10 @@ fn deserializeWithDepth(
             opcodes.Division => try deserializeBinOp(tree, reader, arena, .divide, depth),
             opcodes.Modulo => try deserializeBinOp(tree, reader, arena, .modulo, depth),
             // Logical operations
-            opcodes.AND => try deserializeBinOp(tree, reader, arena, .and_op, depth),
-            opcodes.OR => try deserializeBinOp(tree, reader, arena, .or_op, depth),
+            // Note: AND/OR (0x96/0x97) take a SINGLE collection input (unary),
+            // not two expressions like binary operators. Reference: Rust and.rs, or.rs
+            opcodes.AND => try deserializeUnaryOp(tree, reader, arena, .logical_and, depth),
+            opcodes.OR => try deserializeUnaryOp(tree, reader, arena, .logical_or, depth),
             // If-then-else
             opcodes.If => try deserializeIf(tree, reader, arena, depth),
             // Crypto hash operations (unary: input -> Coll[Byte])
@@ -897,13 +905,15 @@ fn deserializeUnaryOp(
         tag == .extract_id or tag == .extract_creation_info or
         // Additional unary operations
         tag == .size_of or tag == .negation or tag == .logical_not or
+        // Logical AND/OR on collections (unary: Coll[Boolean] → Boolean)
+        tag == .logical_and or tag == .logical_or or
         // Sigma proposition operations
         tag == .prove_dlog or tag == .sigma_prop_bytes);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {
         .calc_blake2b256, .calc_sha256, .long_to_byte_array => TypePool.COLL_BYTE,
-        .option_is_defined => TypePool.BOOLEAN,
+        .option_is_defined, .logical_and, .logical_or => TypePool.BOOLEAN,
         .option_get => TypePool.ANY, // Will be inner type of option at runtime
         .byte_array_to_long => TypePool.LONG,
         .byte_array_to_bigint, .mod_q => TypePool.BIG_INT,
@@ -1989,21 +1999,21 @@ test "expr_serializer: deserialize nested binary ops" {
     var tree = ExprTree.init();
     var arena = BumpAllocator(256).init();
 
-    // AND(GT(HEIGHT, 100), TRUE):
-    // 0x96 (AND = 150 = 112 + 38)
+    // EQ(GT(HEIGHT, 100), TRUE):
+    // 0x93 (EQ = 147 = 112 + 35)
     //   0x91 (GT = 145 = 112 + 33)
     //     0xA3 (HEIGHT = 163 = 112 + 51)
     //     0x04 0xC8 0x01 (Int 100)
     //   0x7F (TRUE = 127 = 112 + 15)
-    var reader = vlq.Reader.init(&[_]u8{ 0x96, 0x91, 0xA3, 0x04, 0xC8, 0x01, 0x7F });
+    var reader = vlq.Reader.init(&[_]u8{ 0x93, 0x91, 0xA3, 0x04, 0xC8, 0x01, 0x7F });
     try deserialize(&tree, &reader, &arena);
 
-    // Should have 5 nodes: AND, GT, HEIGHT, constant, TRUE
+    // Should have 5 nodes: EQ, GT, HEIGHT, constant, TRUE
     try std.testing.expectEqual(@as(u16, 5), tree.node_count);
 
-    // Root is AND
+    // Root is EQ
     try std.testing.expectEqual(ExprTag.bin_op, tree.nodes[0].tag);
-    try std.testing.expectEqual(BinOpKind.and_op, tree.nodes[0].binOpKind().?);
+    try std.testing.expectEqual(BinOpKind.eq, tree.nodes[0].binOpKind().?);
 
     // Second node is GT
     try std.testing.expectEqual(ExprTag.bin_op, tree.nodes[1].tag);
