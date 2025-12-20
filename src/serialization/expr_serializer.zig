@@ -1527,9 +1527,20 @@ fn deserializeUpcast(
     arena: anytype,
     depth: u8,
 ) DeserializeError!void {
-    // Upcast format: target type + input expression
-    // Reads target type code, then the expression to upcast
+    // Upcast format (from Rust): input expression + target type
+    // Reference: sigma-rust/ergotree-ir/src/mir/upcast.rs
 
+    // Add the upcast node first (pre-order) with placeholder type
+    const node_idx = try tree.addNode(.{
+        .tag = .upcast,
+        .data = 0,
+        .result_type = TypePool.ANY,
+    });
+
+    // Parse the input expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Now read the target type
     const target_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
         return switch (e) {
             error.InvalidTypeCode => error.InvalidTypeCode,
@@ -1540,15 +1551,9 @@ fn deserializeUpcast(
         };
     };
 
-    // Store target type in data field (u16 index)
-    _ = try tree.addNode(.{
-        .tag = .upcast,
-        .data = target_type,
-        .result_type = target_type,
-    });
-
-    // Parse the input expression
-    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    // Update the node with the actual target type
+    tree.nodes[node_idx].data = target_type;
+    tree.nodes[node_idx].result_type = target_type;
 }
 
 fn deserializeDowncast(
@@ -1557,9 +1562,20 @@ fn deserializeDowncast(
     arena: anytype,
     depth: u8,
 ) DeserializeError!void {
-    // Downcast format: target type + input expression
-    // Reads target type code, then the expression to downcast
+    // Downcast format (from Rust): input expression + target type
+    // Reference: sigma-rust/ergotree-ir/src/mir/downcast.rs
 
+    // Add the downcast node first (pre-order) with placeholder type
+    const node_idx = try tree.addNode(.{
+        .tag = .downcast,
+        .data = 0,
+        .result_type = TypePool.ANY,
+    });
+
+    // Parse the input expression
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Now read the target type
     const target_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
         return switch (e) {
             error.InvalidTypeCode => error.InvalidTypeCode,
@@ -1570,15 +1586,9 @@ fn deserializeDowncast(
         };
     };
 
-    // Store target type in data field (u16 index)
-    _ = try tree.addNode(.{
-        .tag = .downcast,
-        .data = target_type,
-        .result_type = target_type,
-    });
-
-    // Parse the input expression
-    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    // Update the node with the actual target type
+    tree.nodes[node_idx].data = target_type;
+    tree.nodes[node_idx].result_type = target_type;
 }
 
 fn deserializeConcreteCollection(
