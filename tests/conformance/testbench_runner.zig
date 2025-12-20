@@ -138,12 +138,24 @@ fn runScenario(
     var arena = BumpAllocator(arena_size).init();
 
     ergotree_serializer.deserialize(&tree, ergotree_bytes, &arena) catch |e| {
+        if (e == error.InvalidTypeCode) {
+            // Debug: print scenario ID and first bytes of hex
+            if (root.object.get("id")) |id_val| {
+                std.debug.print("InvalidTypeCode in scenario: {s}\n", .{id_val.string});
+            }
+            std.debug.print("  First 10 bytes: {any}\n", .{ergotree_bytes[0..@min(10, ergotree_bytes.len)]});
+        }
         const err_name = switch (e) {
             error.InvalidTypeCode => "InvalidTypeCode",
             error.NotSupported => "NotSupported",
             error.InvalidOpcode => "InvalidOpcode",
             error.ExpressionTooComplex => "ExpressionTooComplex",
             error.NestingTooDeep => "NestingTooDeep",
+            error.OutOfMemory => "OutOfMemory",
+            error.UnexpectedEndOfInput => "UnexpectedEOF",
+            error.TreeTooBig => "TreeTooBig",
+            error.TooManyConstants => "TooManyConstants",
+            error.InvalidHeader => "InvalidHeader",
             else => "DeserializeError",
         };
         return .{ .deser_error = err_name };
@@ -386,6 +398,17 @@ test "testbench: scenario stats" {
         eval_error: u32 = 0,
         unsupported: u32 = 0,
         wrong_result: u32 = 0,
+        // Detailed deser error counts
+        invalid_type_code: u32 = 0,
+        not_supported: u32 = 0,
+        invalid_opcode: u32 = 0,
+        out_of_memory: u32 = 0,
+        unexpected_eof: u32 = 0,
+        other_deser: u32 = 0,
+        // Detailed eval error counts
+        unsupported_expr: u32 = 0,
+        type_mismatch: u32 = 0,
+        other_eval: u32 = 0,
     }{};
 
     var iter = dir.iterate();
@@ -415,8 +438,32 @@ test "testbench: scenario stats" {
                 }
             },
             .parse_error => stats.parse_error += 1,
-            .deser_error => stats.deser_error += 1,
-            .eval_error => stats.eval_error += 1,
+            .deser_error => |e| {
+                stats.deser_error += 1;
+                if (std.mem.eql(u8, e, "InvalidTypeCode")) {
+                    stats.invalid_type_code += 1;
+                } else if (std.mem.eql(u8, e, "NotSupported")) {
+                    stats.not_supported += 1;
+                } else if (std.mem.eql(u8, e, "InvalidOpcode")) {
+                    stats.invalid_opcode += 1;
+                } else if (std.mem.eql(u8, e, "OutOfMemory")) {
+                    stats.out_of_memory += 1;
+                } else if (std.mem.eql(u8, e, "UnexpectedEOF")) {
+                    stats.unexpected_eof += 1;
+                } else {
+                    stats.other_deser += 1;
+                }
+            },
+            .eval_error => |e| {
+                stats.eval_error += 1;
+                if (std.mem.eql(u8, e, "UnsupportedExpression")) {
+                    stats.unsupported_expr += 1;
+                } else if (std.mem.eql(u8, e, "TypeMismatch")) {
+                    stats.type_mismatch += 1;
+                } else {
+                    stats.other_eval += 1;
+                }
+            },
             .unsupported => stats.unsupported += 1,
         }
     }
@@ -425,8 +472,21 @@ test "testbench: scenario stats" {
     std.debug.print("Total:        {}\n", .{stats.total});
     std.debug.print("Passed:       {}\n", .{stats.passed});
     std.debug.print("Wrong result: {}\n", .{stats.wrong_result});
-    std.debug.print("Deser error:  {}\n", .{stats.deser_error});
-    std.debug.print("Eval error:   {}\n", .{stats.eval_error});
+    std.debug.print("Deser error:  {} (InvalidType:{} NotSupported:{} InvalidOp:{} OOM:{} EOF:{} Other:{})\n", .{
+        stats.deser_error,
+        stats.invalid_type_code,
+        stats.not_supported,
+        stats.invalid_opcode,
+        stats.out_of_memory,
+        stats.unexpected_eof,
+        stats.other_deser,
+    });
+    std.debug.print("Eval error:   {} (Unsupported:{} TypeMismatch:{} Other:{})\n", .{
+        stats.eval_error,
+        stats.unsupported_expr,
+        stats.type_mismatch,
+        stats.other_eval,
+    });
     std.debug.print("Parse error:  {}\n", .{stats.parse_error});
     std.debug.print("Unsupported:  {}\n", .{stats.unsupported});
     std.debug.print("================================\n", .{});

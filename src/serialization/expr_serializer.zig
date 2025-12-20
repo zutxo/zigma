@@ -454,9 +454,12 @@ fn deserializeWithDepth(
     const tag = reader.readByte() catch |e| return mapVlqError(e);
 
     // Dispatch based on tag value
-    if (tag <= opcodes.constant_last) {
-        // Type code (1-111) - this is a constant
+    if (tag >= opcodes.constant_first and tag <= opcodes.constant_last) {
+        // Type code (1-111) - this is an inline constant
         try deserializeConstant(tree, reader, arena, tag);
+    } else if (tag == 0) {
+        // Opcode 0 is reserved/invalid
+        return error.InvalidOpcode;
     } else {
         // Operation opcode
         switch (tag) {
@@ -479,10 +482,12 @@ fn deserializeWithDepth(
                 });
             },
             opcodes.ConstantPlaceholder => {
-                const idx = reader.readByte() catch |e| return mapVlqError(e);
+                // Index is VLQ u32, not a single byte
+                // Reference: Rust constant_placeholder.rs: r.get_u32()
+                const idx = reader.readU32() catch |e| return mapVlqError(e);
                 _ = try tree.addNode(.{
                     .tag = .constant_placeholder,
-                    .data = idx,
+                    .data = @truncate(idx),
                     // Type comes from constants pool
                 });
             },
@@ -590,8 +595,8 @@ fn deserializeWithDepth(
             opcodes.Fold => try deserializeFold(tree, reader, arena, depth),
             opcodes.Filter => try deserializeCollectionHOF(tree, reader, arena, .filter, depth),
             opcodes.FlatMapCollection => try deserializeCollectionHOF(tree, reader, arena, .flat_map, depth),
-            // Collection binary operations
-            opcodes.ByIndex => try deserializeBinOp(tree, reader, arena, .by_index, depth),
+            // Collection operations with optional default
+            opcodes.ByIndex => try deserializeByIndex(tree, reader, arena, depth),
             opcodes.Append => try deserializeBinOp(tree, reader, arena, .append, depth),
             opcodes.Slice => try deserializeSlice(tree, reader, arena, depth),
             // Collection unary operations
@@ -747,6 +752,37 @@ fn deserializeBinOp(
 
     // Recursively parse right operand
     try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+/// Deserialize ByIndex (opcode 0xB2/178)
+/// Serialization format: input_collection + index + Option[default]
+/// Reference: Rust coll_by_index.rs - has optional default for getOrElse
+fn deserializeByIndex(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Add the bin_op node first (pre-order)
+    // We treat ByIndex as a binary op since we don't handle the default yet
+    _ = try tree.addNode(.{
+        .tag = .bin_op,
+        .data = @intFromEnum(BinOpKind.by_index),
+        .result_type = TypePool.ANY, // Element type depends on collection
+    });
+
+    // Parse input collection
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse index
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Read optional default value (0 = None, 1 = Some + expression)
+    const has_default = reader.readByte() catch |e| return mapVlqError(e);
+    if (has_default != 0) {
+        // Has default value - parse it (but we don't use it currently)
+        try deserializeWithDepth(tree, reader, arena, depth + 1);
+    }
 }
 
 fn deserializeIf(
@@ -1292,6 +1328,7 @@ fn deserializeExtractRegisterAs(
 
     // Read the element type (inner type of Option[T])
     const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
+        std.debug.print("ExtractRegisterAs type deser failed at pos {d}\n", .{reader.pos});
         return switch (e) {
             error.InvalidTypeCode => error.InvalidTypeCode,
             error.PoolFull => error.PoolFull,
