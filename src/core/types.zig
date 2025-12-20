@@ -621,6 +621,8 @@ pub const TypeCodeInfo = union(enum) {
     coll_generic,
     /// Generic option - needs recursive parsing
     option_generic,
+    /// Generic pair1 - both elements need recursive parsing (code 60)
+    pair1_generic,
     /// Triple - needs 3 recursive types
     triple,
     /// Quadruple - needs 4 recursive types
@@ -672,7 +674,7 @@ pub const TypeCodeInfo = union(enum) {
 
         if (code >= TypeConstrCode.pair1_base) {
             const offset = code - TypeConstrCode.pair1_base;
-            if (offset == 0) return .coll_generic; // 60 = pair1 with non-embeddable
+            if (offset == 0) return .pair1_generic; // 60 = pair where first is non-embeddable
             if (offset <= embeddable_count) return .{ .pair1_primitive = offset };
             return .invalid;
         }

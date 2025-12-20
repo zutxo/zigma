@@ -136,6 +136,13 @@ fn deserializeWithDepth(
             break :blk pool.getPair(first_idx, second_idx) catch return error.PoolFull;
         },
 
+        // (NonPrimitive, X): parse both types
+        .pair1_generic => blk: {
+            const first_idx = try deserializeWithDepth(pool, reader, depth + 1);
+            const second_idx = try deserializeWithDepth(pool, reader, depth + 1);
+            break :blk pool.getPair(first_idx, second_idx) catch return error.PoolFull;
+        },
+
         // Coll[NonPrimitive]: generic collection
         .coll_generic => blk: {
             const elem_idx = try deserializeWithDepth(pool, reader, depth + 1);
