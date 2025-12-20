@@ -211,6 +211,47 @@ pub const ExprTag = enum(u8) {
     /// Returns: SigmaProp
     bool_to_sigma_prop,
 
+    // Additional unary operations
+    /// SizeOf: get collection length (opcode 0xB1/177) - Coll[T] → Int
+    size_of,
+    /// Negation: arithmetic negation (opcode 0xF0/240) - T → T
+    negation,
+    /// LogicalNot: boolean negation (opcode 0xEF/239) - Boolean → Boolean
+    logical_not,
+
+    // Additional box operations (opcodes 0xC1-0xC7 / 193-199)
+    /// ExtractAmount: get box value in nanoERGs (opcode 0xC1/193) - Box → Long
+    extract_amount,
+    /// ExtractScriptBytes: get box script as bytes (opcode 0xC2/194) - Box → Coll[Byte]
+    extract_script_bytes,
+    /// ExtractBytes: get box serialized bytes (opcode 0xC3/195) - Box → Coll[Byte]
+    extract_bytes,
+    /// ExtractBytesWithNoRef: box bytes without transaction ref (opcode 0xC4/196) - Box → Coll[Byte]
+    extract_bytes_with_no_ref,
+    /// ExtractId: get 32-byte box ID (opcode 0xC5/197) - Box → Coll[Byte]
+    extract_id,
+    /// ExtractCreationInfo: get (height, txId) (opcode 0xC7/199) - Box → (Int, Coll[Byte])
+    extract_creation_info,
+
+    // Sigma proposition literals
+    /// TrivialPropTrue: always-true proposition (opcode 0xD3/211)
+    trivial_prop_true,
+    /// TrivialPropFalse: always-false proposition (opcode 0xD2/210)
+    trivial_prop_false,
+
+    // Sigma protocol constructors
+    /// ProveDlog: Schnorr signature (opcode 0xCD/205) - GroupElement → SigmaProp
+    prove_dlog,
+    /// ProveDHTuple: DH tuple (opcode 0xCE/206) - 4 GroupElements → SigmaProp
+    prove_dh_tuple,
+    /// SigmaPropBytes: get proposition bytes (opcode 0xD0/208) - SigmaProp → Coll[Byte]
+    sigma_prop_bytes,
+
+    // Collection slice (ternary operation)
+    /// Slice: collection.slice(from, until) (opcode 0xB4/180)
+    /// 3 children: collection, from, until
+    slice,
+
     /// Unsupported opcode
     unsupported,
 };
@@ -241,6 +282,12 @@ pub const BinOpKind = enum(u8) {
     bit_shift_right, // arithmetic (sign-extending)
     bit_shift_left,
     bit_shift_right_zeroed, // logical (zero-extending)
+    // Collection operations
+    by_index, // collection[index]
+    append, // collection ++ collection
+    min, // min(a, b)
+    max, // max(a, b)
+    xor_byte_array, // byte array XOR
 };
 
 /// Expression node (compact representation)
@@ -543,6 +590,43 @@ fn deserializeWithDepth(
             opcodes.Fold => try deserializeFold(tree, reader, arena, depth),
             opcodes.Filter => try deserializeCollectionHOF(tree, reader, arena, .filter, depth),
             opcodes.FlatMapCollection => try deserializeCollectionHOF(tree, reader, arena, .flat_map, depth),
+            // Collection binary operations
+            opcodes.ByIndex => try deserializeBinOp(tree, reader, arena, .by_index, depth),
+            opcodes.Append => try deserializeBinOp(tree, reader, arena, .append, depth),
+            opcodes.Slice => try deserializeSlice(tree, reader, arena, depth),
+            // Collection unary operations
+            opcodes.SizeOf => try deserializeUnaryOp(tree, reader, arena, .size_of, depth),
+            // Arithmetic binary ops
+            opcodes.Min => try deserializeBinOp(tree, reader, arena, .min, depth),
+            opcodes.Max => try deserializeBinOp(tree, reader, arena, .max, depth),
+            opcodes.Xor => try deserializeBinOp(tree, reader, arena, .xor_byte_array, depth),
+            // Unary operations
+            opcodes.Negation => try deserializeUnaryOp(tree, reader, arena, .negation, depth),
+            opcodes.LogicalNot => try deserializeUnaryOp(tree, reader, arena, .logical_not, depth),
+            // Box extraction operations
+            opcodes.ExtractAmount => try deserializeUnaryOp(tree, reader, arena, .extract_amount, depth),
+            opcodes.ExtractScriptBytes => try deserializeUnaryOp(tree, reader, arena, .extract_script_bytes, depth),
+            opcodes.ExtractBytes => try deserializeUnaryOp(tree, reader, arena, .extract_bytes, depth),
+            opcodes.ExtractBytesWithNoRef => try deserializeUnaryOp(tree, reader, arena, .extract_bytes_with_no_ref, depth),
+            opcodes.ExtractId => try deserializeUnaryOp(tree, reader, arena, .extract_id, depth),
+            opcodes.ExtractCreationInfo => try deserializeUnaryOp(tree, reader, arena, .extract_creation_info, depth),
+            // Sigma proposition constructors
+            opcodes.ProveDlog => try deserializeUnaryOp(tree, reader, arena, .prove_dlog, depth),
+            opcodes.ProveDHTuple => try deserializeProveDHTuple(tree, reader, arena, depth),
+            opcodes.SigmaPropBytes => try deserializeUnaryOp(tree, reader, arena, .sigma_prop_bytes, depth),
+            // Trivial propositions (nullary)
+            opcodes.TrivialPropTrue => {
+                _ = try tree.addNode(.{
+                    .tag = .trivial_prop_true,
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+            },
+            opcodes.TrivialPropFalse => {
+                _ = try tree.addNode(.{
+                    .tag = .trivial_prop_false,
+                    .result_type = TypePool.SIGMA_PROP,
+                });
+            },
             // FuncValue
             opcodes.FuncValue => try deserializeFuncValue(tree, reader, arena, depth),
             // Sigma proposition connectives
@@ -686,6 +770,50 @@ fn deserializeIf(
     try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
+/// Deserialize Slice (opcode 0xB4/180)
+/// Serialization format: collection, from, until (3 children)
+fn deserializeSlice(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Add the slice node first
+    _ = try tree.addNode(.{
+        .tag = .slice,
+    });
+
+    // Parse collection
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse from index
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Parse until index
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
+/// Deserialize ProveDHTuple (opcode 0xCE/206)
+/// Serialization format: g, h, u, v (4 GroupElement children)
+fn deserializeProveDHTuple(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // Add the node first
+    _ = try tree.addNode(.{
+        .tag = .prove_dh_tuple,
+        .result_type = TypePool.SIGMA_PROP,
+    });
+
+    // Parse 4 GroupElement expressions: g, h, u, v
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
+
 fn deserializeUnaryOp(
     tree: *ExprTree,
     reader: *vlq.Reader,
@@ -699,7 +827,15 @@ fn deserializeUnaryOp(
         tag == .long_to_byte_array or tag == .byte_array_to_bigint or
         tag == .byte_array_to_long or tag == .decode_point or
         tag == .mod_q or tag == .bool_to_sigma_prop or
-        tag == .bit_inversion);
+        tag == .bit_inversion or
+        // Box extraction operations
+        tag == .extract_amount or tag == .extract_script_bytes or
+        tag == .extract_bytes or tag == .extract_bytes_with_no_ref or
+        tag == .extract_id or tag == .extract_creation_info or
+        // Additional unary operations
+        tag == .size_of or tag == .negation or tag == .logical_not or
+        // Sigma proposition operations
+        tag == .prove_dlog or tag == .sigma_prop_bytes);
 
     // Determine result type based on operation
     const result_type: TypeIndex = switch (tag) {

@@ -53,6 +53,20 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&run_mainnet_tests.step);
     test_step.dependOn(&run_mainnet_tests.step);
 
+    // Testbench scenario tests (from ~/orgs/zutxo/testbench)
+    const testbench_tests = b.addTest(.{
+        .root_source_file = b.path("tests/conformance/testbench_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    testbench_tests.root_module.addImport("zigma", lib.root_module);
+    const run_testbench_tests = b.addRunArtifact(testbench_tests);
+    const testbench_step = b.step("testbench", "Run testbench scenario tests");
+    testbench_step.dependOn(&run_testbench_tests.step);
+
+    // Include testbench tests in conformance step (not main test - may have long runtime)
+    conformance_step.dependOn(&run_testbench_tests.step);
+
     // Property-based tests (invariants and metamorphic properties)
     const property_tests = b.addTest(.{
         .root_source_file = b.path("tests/property/main.zig"),
