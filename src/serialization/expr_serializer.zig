@@ -63,6 +63,10 @@ pub const ExprTag = enum(u8) {
     miner_pk,
     /// Last block UTXO root hash from headers (opcode 0xA6)
     last_block_utxo_root,
+    /// Context object (opcode 0xFE/254) - provides access to context methods
+    context,
+    /// Global object (opcode 0xDD/221) - provides access to global methods
+    global,
     /// If-then-else
     if_then_else,
     /// CalcBlake2b256 hash (opcode 0xCB)
@@ -573,6 +577,19 @@ fn deserializeWithDepth(
                 _ = try tree.addNode(.{
                     .tag = .group_generator,
                     .result_type = TypePool.GROUP_ELEMENT,
+                });
+            },
+            // Context and Global objects (nullary)
+            opcodes.Context => {
+                _ = try tree.addNode(.{
+                    .tag = .context,
+                    .result_type = TypePool.ANY, // Context type
+                });
+            },
+            opcodes.Global => {
+                _ = try tree.addNode(.{
+                    .tag = .global,
+                    .result_type = TypePool.ANY, // Global type
                 });
             },
             opcodes.Exponentiate => try deserializeBinaryGroupOp(tree, reader, arena, .exponentiate, depth),

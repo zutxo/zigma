@@ -992,6 +992,20 @@ pub const Evaluator = struct {
                 try self.pushValue(.{ .coll_byte = &self.ctx.headers[0].state_root });
             },
 
+            .context => {
+                // Context object: used as receiver for context methods via PropertyCall
+                // The actual context data is accessed through computeMethodCall dispatch
+                try self.addCost(10);
+                try self.pushValue(.{ .unit = {} }); // Placeholder - methods access self.ctx directly
+            },
+
+            .global => {
+                // Global object: used as receiver for global methods via PropertyCall
+                // Global methods like groupGenerator are dispatched through computeMethodCall
+                try self.addCost(10);
+                try self.pushValue(.{ .unit = {} }); // Placeholder - methods are static
+            },
+
             .get_var => {
                 // GetVar: access context extension variable by ID
                 // node.data: (type_idx << 8) | var_id
@@ -7986,7 +8000,7 @@ pub const Evaluator = struct {
 
         return switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context, .trivial_prop_true, .trivial_prop_false => 0,
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context, .trivial_prop_true, .trivial_prop_false, .context, .global => 0,
 
             // Unary operations (1 child)
             .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop, .size_of, .negation, .logical_not, .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info, .prove_dlog, .sigma_prop_bytes => 1,
