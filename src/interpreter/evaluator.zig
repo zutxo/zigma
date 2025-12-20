@@ -1352,6 +1352,17 @@ pub const Evaluator = struct {
                 }
             },
 
+            // Binary sigma proposition operations (BinAnd, BinOr, BinXor)
+            .bin_and, .bin_or, .bin_xor => {
+                // Binary: 2 SigmaProp children → SigmaProp
+                const child1_idx = node_idx + 1;
+                const child2_idx = self.findSubtreeEnd(child1_idx);
+
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = child2_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = child1_idx, .phase = .evaluate });
+            },
+
             // Method call (collection methods like zip, indices, reverse)
             .method_call => {
                 // Method call structure: [method_call] [obj] [args...]
@@ -1678,6 +1689,8 @@ pub const Evaluator = struct {
             // Sigma proposition connectives
             .sigma_and => try self.computeSigmaAnd(node.data),
             .sigma_or => try self.computeSigmaOr(node.data),
+            // Binary sigma operations: TODO implement full sigma tree combination
+            .bin_and, .bin_or, .bin_xor => return error.UnsupportedExpression,
 
             // Function application
             .apply => try self.computeApply(node_idx),
@@ -2296,9 +2309,11 @@ pub const Evaluator = struct {
         reg: Register,
         expected_type: TypeIndex,
     ) EvalError!Value {
-        // PRECONDITION: Register is user-defined (R4-R9)
-        assert(@intFromEnum(reg) >= 4);
-        assert(@intFromEnum(reg) <= 9);
+        // Validate register is user-defined (R4-R9)
+        // R0-R3 are fixed registers accessed differently
+        if (@intFromEnum(reg) < 4 or @intFromEnum(reg) > 9) {
+            return error.InvalidData;
+        }
 
         // Check cache first
         const cached = self.pools.register_cache.get(source, box_idx, reg);
@@ -2332,8 +2347,9 @@ pub const Evaluator = struct {
         expected_type: TypeIndex,
     ) EvalError!Value {
         // PRECONDITIONS
-        assert(@intFromEnum(reg) >= 4);
-        assert(@intFromEnum(reg) <= 9);
+        if (@intFromEnum(reg) < 4 or @intFromEnum(reg) > 9) {
+            return error.InvalidData;
+        }
 
         // Get the box from context
         const box = self.getBoxFromSource(source, box_idx) orelse {
@@ -8009,7 +8025,7 @@ pub const Evaluator = struct {
             .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop, .size_of, .negation, .logical_not, .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info, .prove_dlog, .sigma_prop_bytes, .logical_and, .logical_or => 1,
 
             // Binary operations (2 children)
-            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
+            .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q, .bin_and, .bin_or, .bin_xor => 2,
 
             // Ternary operations (3 children)
             .if_then_else, .triple_construct, .fold, .tree_lookup, .subst_constants, .slice => 3,

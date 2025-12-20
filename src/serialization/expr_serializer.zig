@@ -143,6 +143,12 @@ pub const ExprTag = enum(u8) {
     sigma_and,
     /// SigmaOr: at least one child proposition must be proven (opcode 0xEB)
     sigma_or,
+    /// Binary AND of two SigmaBoolean propositions (opcode 0xED/237)
+    bin_and,
+    /// Binary OR of two SigmaBoolean propositions (opcode 0xEC/236)
+    bin_or,
+    /// Binary XOR of two SigmaBoolean propositions (opcode 0xF4/244)
+    bin_xor,
 
     // Header field extraction opcodes (0xE9-0xF2)
     /// Extract version byte from Header (opcode 0xE9)
@@ -465,7 +471,11 @@ fn deserializeWithDepth(
     }
 
     // Read opcode/type tag
-    const tag = reader.readByte() catch |e| return mapVlqError(e);
+    const start_pos = reader.pos;
+    const tag = reader.readByte() catch |e| {
+        std.debug.print("EOF at pos {d}, depth {d}, total_len {d}\n", .{ start_pos, depth, reader.data.len });
+        return mapVlqError(e);
+    };
 
     // Dispatch based on tag value
     if (tag >= opcodes.constant_first and tag <= opcodes.constant_last) {
@@ -670,6 +680,10 @@ fn deserializeWithDepth(
             // Sigma proposition connectives
             opcodes.SigmaAnd => try deserializeSigmaConnective(tree, reader, arena, .sigma_and, depth),
             opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
+            // Binary sigma proposition operations (2 children each)
+            opcodes.BinAnd => try deserializeBinarySigmaOp(tree, reader, arena, .bin_and, depth),
+            opcodes.BinOr => try deserializeBinarySigmaOp(tree, reader, arena, .bin_or, depth),
+            opcodes.BinXor => try deserializeBinarySigmaOp(tree, reader, arena, .bin_xor, depth),
             // BoolToSigmaProp: wrap Boolean as SigmaProp (trivial proposition)
             opcodes.BoolToSigmaProp => try deserializeUnaryOp(tree, reader, arena, .bool_to_sigma_prop, depth),
             // Method call (collection methods like zip, indices, etc.)
@@ -1082,6 +1096,26 @@ fn deserializeApply(
     while (i < arg_count) : (i += 1) {
         try deserializeWithDepth(tree, reader, arena, depth + 1);
     }
+}
+
+/// Deserialize binary sigma operations (BinAnd, BinOr, BinXor)
+/// Format: opcode + left_child + right_child
+fn deserializeBinarySigmaOp(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    tag: ExprTag,
+    depth: u8,
+) DeserializeError!void {
+    // Add the node first (pre-order)
+    _ = try tree.addNode(.{
+        .tag = tag,
+        .result_type = TypePool.SIGMA_PROP,
+    });
+
+    // Parse two children
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
 /// Type codes for methods with explicit type arguments

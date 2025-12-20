@@ -145,6 +145,12 @@ fn runScenario(
             }
             std.debug.print("  First 10 bytes: {any}\n", .{ergotree_bytes[0..@min(10, ergotree_bytes.len)]});
         }
+        if (e == error.UnexpectedEndOfInput) {
+            // Debug: print scenario ID for EOF errors
+            if (root.object.get("id")) |id_val| {
+                std.debug.print("EOF in scenario: {s}, tree nodes={d}\n", .{ id_val.string, tree.expr_tree.node_count });
+            }
+        }
         const err_name = switch (e) {
             error.InvalidTypeCode => "InvalidTypeCode",
             error.NotSupported => "NotSupported",
