@@ -1456,18 +1456,27 @@ pub const Evaluator = struct {
                 }
             },
 
-            // New operations - placeholder handlers until evaluation is implemented
-            .size_of,
-            .negation,
-            .logical_not,
-            .extract_amount,
-            .extract_script_bytes,
-            .extract_bytes,
-            .extract_bytes_with_no_ref,
-            .extract_id,
-            .extract_creation_info,
-            .trivial_prop_true,
-            .trivial_prop_false,
+            // Unary operations: size_of, negation, logical_not
+            .size_of, .negation, .logical_not => {
+                // Push compute phase, then push child for evaluation
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            // Box extraction operations - unary (Box → value)
+            .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info => {
+                // Push compute phase, then push box child for evaluation
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            },
+
+            // Trivial propositions - leaf nodes (no children)
+            .trivial_prop_true, .trivial_prop_false => {
+                // Just push compute phase - no children to evaluate
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+            },
+
+            // Sigma operations - not yet implemented
             .prove_dlog,
             .prove_dh_tuple,
             .sigma_prop_bytes,
@@ -1670,6 +1679,23 @@ pub const Evaluator = struct {
             .subst_constants => try self.computeSubstConstants(),
             .deserialize_context => try self.computeDeserializeContext(node),
             .deserialize_register => try self.computeDeserializeRegister(node),
+
+            // Unary operations: size_of, negation, logical_not
+            .logical_not => try self.computeLogicalNot(),
+            .negation => try self.computeNegation(),
+            .size_of => try self.computeSizeOf(),
+
+            // Box extraction operations
+            .extract_amount => try self.computeBoxValue(),
+            .extract_script_bytes => try self.computeBoxPropositionBytes(),
+            .extract_bytes => try self.computeBoxBytes(),
+            .extract_bytes_with_no_ref => try self.computeBoxBytesWithoutRef(),
+            .extract_id => try self.computeBoxId(),
+            .extract_creation_info => try self.computeBoxCreationInfo(),
+
+            // Trivial propositions
+            .trivial_prop_true => try self.computeTrivialPropTrue(),
+            .trivial_prop_false => try self.computeTrivialPropFalse(),
 
             else => {
                 // Other node types don't need compute phase
@@ -1928,6 +1954,95 @@ pub const Evaluator = struct {
         // Allocate from arena for proper lifetime
         const sigma_bytes = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
         sigma_bytes[0] = opcode;
+
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute LogicalNot - boolean negation
+    fn computeLogicalNot(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(11); // LogicalNot cost from opcodes
+
+        const input = try self.popValue();
+        if (input != .boolean) return error.TypeMismatch;
+
+        try self.pushValue(.{ .boolean = !input.boolean });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute Negation - arithmetic negation
+    fn computeNegation(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(30); // Negation cost from opcodes
+
+        const input = try self.popValue();
+
+        const result: Value = switch (input) {
+            .int => |v| .{ .int = -v },
+            .long => |v| .{ .long = -v },
+            .short => |v| .{ .short = -v },
+            .byte => |v| .{ .byte = -v },
+            // BigInt negation would need BigInt arithmetic
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(result);
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute SizeOf - collection length
+    fn computeSizeOf(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(14); // SizeOf cost from opcodes
+
+        const input = try self.popValue();
+
+        const len: i32 = switch (input) {
+            .coll_byte => |c| @intCast(c.len),
+            .coll => |c| @intCast(c.len),
+            else => return error.TypeMismatch,
+        };
+
+        try self.pushValue(.{ .int = len });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute TrivialPropTrue - create trivially true SigmaProp
+    fn computeTrivialPropTrue(self: *Evaluator) EvalError!void {
+        try self.addCost(10); // TrivialPropTrue cost from opcodes
+
+        // Trivial true proposition: single byte 0x01
+        const sigma_bytes = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
+        sigma_bytes[0] = 0x01;
+
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute TrivialPropFalse - create trivially false SigmaProp
+    fn computeTrivialPropFalse(self: *Evaluator) EvalError!void {
+        try self.addCost(10); // TrivialPropFalse cost from opcodes
+
+        // Trivial false proposition: single byte 0x00
+        const sigma_bytes = self.arena.allocSlice(u8, 1) catch return error.OutOfMemory;
+        sigma_bytes[0] = 0x00;
 
         try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
 
