@@ -464,6 +464,10 @@ fn deserializeWithDepth(
     // Dispatch based on tag value
     if (tag >= opcodes.constant_first and tag <= opcodes.constant_last) {
         // Type code (1-111) - this is an inline constant
+        // Skip reserved type codes 10-11 (between primitives 1-9 and Coll at 12+)
+        if (tag == 10 or tag == 11) {
+            return error.InvalidTypeCode;
+        }
         try deserializeConstant(tree, reader, arena, tag);
     } else if (tag == 0) {
         // Opcode 0 is reserved/invalid
@@ -1308,23 +1312,24 @@ fn deserializeSelectField(
     arena: anytype,
     depth: u8,
 ) DeserializeError!void {
-    // SelectField format: tuple expression + field index (VLQ)
-    // Note: some serializations have field index before the expression
-
-    // For now, assume format: SelectField(fieldIdx, tupleExpr)
+    // SelectField format (Rust): input expression FIRST, then field_index (1 byte)
     // Field index is 1-based in ErgoTree
-    const field_idx = reader.readU32() catch |e| return mapVlqError(e);
 
-    // Add the select_field node first (pre-order)
-    // Store field index in data (convert to 0-based)
-    _ = try tree.addNode(.{
+    // Add the select_field node first (pre-order) with placeholder
+    const node_idx = try tree.addNode(.{
         .tag = .select_field,
-        .data = @truncate(field_idx -| 1), // Convert 1-based to 0-based, saturating
+        .data = 0, // Placeholder, updated after reading field_index
         .result_type = TypePool.ANY, // Determined at runtime from tuple type
     });
 
-    // Parse the tuple expression
+    // Parse the tuple expression FIRST
     try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Read field_index SECOND (1 byte, 1-based)
+    const field_idx = reader.readByte() catch return error.UnexpectedEndOfInput;
+
+    // Update node with field index (convert to 0-based)
+    tree.nodes[node_idx].data = field_idx -| 1; // Saturating subtract for 0-based
 }
 
 /// Deserialize Select1-5 (fixed field index, no VLQ)
@@ -1389,7 +1394,6 @@ fn deserializeExtractRegisterAs(
 
     // Read the element type (inner type of Option[T])
     const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
-        std.debug.print("ExtractRegisterAs type deser failed at pos {d}\n", .{reader.pos});
         return switch (e) {
             error.InvalidTypeCode => error.InvalidTypeCode,
             error.PoolFull => error.PoolFull,

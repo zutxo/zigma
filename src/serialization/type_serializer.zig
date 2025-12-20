@@ -82,7 +82,7 @@ fn deserializeWithDepth(
 
     // INVARIANT: We handle all valid type code patterns
     return switch (info) {
-        .invalid => error.InvalidTypeCode,
+        .invalid => return error.InvalidTypeCode,
 
         // Primitives: return pre-allocated index
         .primitive => |t| primitiveToIndex(t),
