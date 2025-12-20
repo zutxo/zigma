@@ -1375,6 +1375,22 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = obj_idx, .phase = .evaluate });
             },
 
+            // Property call (property access with no args, like box.value)
+            .property_call => {
+                // Property call structure: [property_call] [obj]
+                // data: low 8 bits = type_code, high 8 bits = property_id
+                //
+                // PRECONDITIONS
+                const obj_idx = node_idx + 1;
+                assert(obj_idx < self.tree.node_count);
+
+                // Push compute phase first
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+
+                // Push obj for evaluation (no args unlike MethodCall)
+                try self.pushWork(.{ .node_idx = obj_idx, .phase = .evaluate });
+            },
+
             // AVL tree operations
             .create_avl_tree => {
                 // CreateAvlTree: 3 or 4 children (flags, digest, key_length, opt value_length)
@@ -1438,6 +1454,28 @@ pub const Evaluator = struct {
                     const child_idx = node_idx + 1;
                     try self.pushWork(.{ .node_idx = child_idx, .phase = .evaluate });
                 }
+            },
+
+            // New operations - placeholder handlers until evaluation is implemented
+            .size_of,
+            .negation,
+            .logical_not,
+            .extract_amount,
+            .extract_script_bytes,
+            .extract_bytes,
+            .extract_bytes_with_no_ref,
+            .extract_id,
+            .extract_creation_info,
+            .trivial_prop_true,
+            .trivial_prop_false,
+            .prove_dlog,
+            .prove_dh_tuple,
+            .sigma_prop_bytes,
+            .slice,
+            => {
+                // These operations are deserialized but not yet evaluated.
+                // TODO: Implement evaluation for each of these.
+                return self.handleUnsupported();
             },
 
             .unsupported => {
@@ -1620,6 +1658,9 @@ pub const Evaluator = struct {
 
             // Method call (collection methods)
             .method_call => try self.computeMethodCall(node_idx),
+
+            // Property call (property access, no args)
+            .property_call => try self.computePropertyCall(node_idx),
 
             // AVL tree operations
             .create_avl_tree => try self.computeCreateAvlTree(node.data),
@@ -2703,6 +2744,57 @@ pub const Evaluator = struct {
             .bit_shift_right_zeroed => {
                 const result = try bitShiftRightZeroedInts(left, right);
                 try self.pushValue(result);
+            },
+
+            // Collection operations
+            .by_index => {
+                // collection[index]: get element at index
+                // Left is collection, right is index (Int)
+                if (right != .int) return error.TypeMismatch;
+                const idx = right.int;
+                if (idx < 0) return error.IndexOutOfBounds;
+
+                switch (left) {
+                    .coll_byte => |arr| {
+                        if (idx >= arr.len) return error.IndexOutOfBounds;
+                        try self.pushValue(.{ .byte = @intCast(arr[@intCast(idx)]) });
+                    },
+                    .coll => |_| {
+                        // Generic collection indexing requires ValuePool access
+                        // TODO: Implement when ValuePool is integrated
+                        return error.UnsupportedExpression;
+                    },
+                    .box_coll => |bc| {
+                        // Get box at index from inputs/outputs
+                        const boxes = if (bc.source == .inputs) self.ctx.inputs else self.ctx.outputs;
+                        if (idx >= boxes.len) return error.IndexOutOfBounds;
+                        try self.pushValue(.{ .box = .{
+                            .source = bc.source,
+                            .index = @intCast(idx),
+                        } });
+                    },
+                    else => return error.TypeMismatch,
+                }
+            },
+            .append => {
+                // collection ++ collection: concatenate
+                // TODO: Implement collection append
+                return error.UnsupportedExpression;
+            },
+            .min => {
+                // min(a, b)
+                const cmp = try compareInts(left, right);
+                try self.pushValue(if (cmp <= 0) left else right);
+            },
+            .max => {
+                // max(a, b)
+                const cmp = try compareInts(left, right);
+                try self.pushValue(if (cmp >= 0) left else right);
+            },
+            .xor_byte_array => {
+                // byte array XOR
+                // TODO: Implement byte array XOR
+                return error.UnsupportedExpression;
             },
         }
 
@@ -4344,6 +4436,15 @@ pub const Evaluator = struct {
             // Unsupported type - use soft-fork aware handling
             return self.handleUnsupported();
         }
+    }
+
+    /// Compute property call (property access with no args)
+    /// PropertyCall has same format as MethodCall but is used for property access (no args)
+    /// Since most "methods" in computeMethodCall only use obj (no args), we can delegate
+    fn computePropertyCall(self: *Evaluator, node_idx: u16) EvalError!void {
+        // PropertyCall is like MethodCall but with no args
+        // The dispatch methods only read obj from stack, so this works correctly
+        try self.computeMethodCall(node_idx);
     }
 
     /// Compute zip: Coll[A].zip(Coll[B]) → Coll[(A, B)]
@@ -7770,16 +7871,19 @@ pub const Evaluator = struct {
 
         return switch (node.tag) {
             // Leaf nodes - no children
-            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context => 0,
+            .true_leaf, .false_leaf, .unit, .height, .constant, .constant_placeholder, .val_use, .unsupported, .inputs, .outputs, .self_box, .miner_pk, .last_block_utxo_root, .group_generator, .get_var, .deserialize_context, .trivial_prop_true, .trivial_prop_false => 0,
 
             // Unary operations (1 child)
-            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop => 1,
+            .calc_blake2b256, .calc_sha256, .option_get, .option_is_defined, .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long, .decode_point, .select_field, .upcast, .downcast, .extract_version, .extract_parent_id, .extract_ad_proofs_root, .extract_state_root, .extract_txs_root, .extract_timestamp, .extract_n_bits, .extract_difficulty, .extract_votes, .extract_miner_rewards, .val_def, .func_value, .extract_register_as, .mod_q, .bit_inversion, .bool_to_sigma_prop, .size_of, .negation, .logical_not, .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info, .prove_dlog, .sigma_prop_bytes => 1,
 
             // Binary operations (2 children)
             .bin_op, .option_get_or_else, .exponentiate, .multiply_group, .pair_construct, .apply, .map_collection, .exists, .for_all, .filter, .flat_map, .plus_mod_q, .minus_mod_q => 2,
 
             // Ternary operations (3 children)
-            .if_then_else, .triple_construct, .fold, .tree_lookup, .subst_constants => 3,
+            .if_then_else, .triple_construct, .fold, .tree_lookup, .subst_constants, .slice => 3,
+
+            // 4 children (ProveDHTuple)
+            .prove_dh_tuple => 4,
 
             // N-ary with data-driven child count
             .block_value => node.data + 1, // items + result
@@ -7802,6 +7906,9 @@ pub const Evaluator = struct {
                 // zip (29) has 1 arg, indices (14) and reverse (30) have 0
                 break :blk if (method_id == 29) 2 else 1;
             },
+
+            // property_call: always 1 (obj only, no args)
+            .property_call => 1,
         };
     }
 

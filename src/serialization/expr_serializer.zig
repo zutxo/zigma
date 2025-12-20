@@ -160,6 +160,10 @@ pub const ExprTag = enum(u8) {
     /// data: low 8 bits = type_code, high 8 bits = method_id
     method_call,
 
+    /// Property call (opcode 0xDB/219) - obj.property (no args)
+    /// data: low 8 bits = type_code, high 8 bits = property_id
+    property_call,
+
     // AVL tree operations (opcodes 0xB6-0xB7 / 182-183)
     /// Create AVL tree (opcode 0xB6/182) - flags, digest, key_len, opt_value_len → AvlTree
     create_avl_tree,
@@ -641,6 +645,8 @@ fn deserializeWithDepth(
             opcodes.BoolToSigmaProp => try deserializeUnaryOp(tree, reader, arena, .bool_to_sigma_prop, depth),
             // Method call (collection methods like zip, indices, etc.)
             opcodes.MethodCall => try deserializeMethodCall(tree, reader, arena, depth),
+            // Property call (property access like box.value, context.dataInputs)
+            opcodes.PropertyCall => try deserializePropertyCall(tree, reader, arena, depth),
             // AVL tree operations
             opcodes.AvlTree => try deserializeCreateAvlTree(tree, reader, arena, depth),
             opcodes.AvlTreeGet => try deserializeTreeLookup(tree, reader, arena, depth),
@@ -1138,6 +1144,44 @@ fn deserializeMethodCall(
         // The actual result type is Option[T], but we need T for deserialization
         tree.nodes[node_idx].result_type = inner_type_idx;
     }
+}
+
+/// Deserialize PropertyCall operation (opcode 0xDB/219)
+/// Format: type_code + property_id + obj
+/// Reference: Rust ergotree-ir/src/serialization/property_call.rs
+fn deserializePropertyCall(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    assert(tree.node_count < tree.nodes.len);
+
+    // Read type code (1 byte) and property_id (1 byte)
+    const type_code = reader.readByte() catch |e| return mapVlqError(e);
+    const property_id = reader.readByte() catch |e| return mapVlqError(e);
+
+    // INVARIANT: valid type code range
+    assert(type_code > 0 or property_id > 0); // At least one must be non-zero
+
+    // Pack type_code and property_id into data field
+    // low 8 bits = type_code, high 8 bits = property_id
+    const data: u16 = @as(u16, property_id) << 8 | @as(u16, type_code);
+
+    // Add the property_call node first (pre-order)
+    const node_idx = try tree.addNode(.{
+        .tag = .property_call,
+        .data = data,
+        .result_type = TypePool.ANY,
+    });
+
+    // POSTCONDITION: Node was added
+    assert(node_idx < tree.node_count);
+
+    // Parse object expression (no args unlike MethodCall)
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
 }
 
 /// Deserialize CreateAvlTree operation (opcode 0xB6/182)
