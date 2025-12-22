@@ -27,8 +27,9 @@ const BumpAllocator = memory.BumpAllocator;
 /// Maximum expression tree depth
 const max_expr_depth: u8 = 64;
 
-/// Maximum number of constants in an ErgoTree
-pub const max_constants: usize = 256;
+/// Maximum number of constants/nodes in an ErgoTree
+/// 1024 handles complex DeFi contracts (SigmaO, Paideia, etc.)
+pub const max_constants: usize = 1024;
 
 // Compile-time sanity checks
 comptime {
@@ -1152,7 +1153,7 @@ fn deserializeMethodCall(
 
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Read type code (1 byte) and method_id (1 byte)
     const type_code = reader.readByte() catch |e| return mapVlqError(e);
@@ -1220,7 +1221,7 @@ fn deserializePropertyCall(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Read type code (1 byte) and property_id (1 byte)
     const type_code = reader.readByte() catch |e| return mapVlqError(e);
@@ -1258,7 +1259,7 @@ fn deserializeCreateAvlTree(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Add the create_avl_tree node first (pre-order)
     const node_idx = try tree.addNode(.{
@@ -1301,7 +1302,7 @@ fn deserializeTreeLookup(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Get Option[Coll[Byte]] type for result
     const coll_byte_idx = TypePool.COLL_BYTE;
@@ -1385,7 +1386,7 @@ fn deserializeSelectN(
     // PRECONDITIONS
     assert(field_idx < 5); // Select1-5 only (0-4)
     assert(depth < max_expr_depth); // Depth not exceeded
-    assert(tree.node_count < tree.nodes.len); // Space available in tree
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex; // Space available in tree
 
     // Select1-5 format: just the tuple expression (field index is implicit from opcode)
 
@@ -1414,7 +1415,7 @@ fn deserializeExtractRegisterAs(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Add the extract_register_as node first (pre-order) with placeholder data
     const node_idx = try tree.addNode(.{
@@ -1840,7 +1841,7 @@ fn deserializeSubstConstants(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Add the subst_constants node first (pre-order)
     // Returns Coll[Byte] (the modified serialized ErgoTree)
@@ -1870,7 +1871,7 @@ fn deserializeDeserializeContext(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Read expected type T
     const type_idx = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
@@ -1906,7 +1907,7 @@ fn deserializeDeserializeRegister(
 ) DeserializeError!void {
     // PRECONDITIONS
     assert(depth < max_expr_depth);
-    assert(tree.node_count < tree.nodes.len);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
 
     // Read register id (0-9 for R0-R9)
     const reg_id = reader.readByte() catch return error.UnexpectedEndOfInput;

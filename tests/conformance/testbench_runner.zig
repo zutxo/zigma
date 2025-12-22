@@ -162,7 +162,12 @@ fn runScenario(
             error.TreeTooBig => "TreeTooBig",
             error.TooManyConstants => "TooManyConstants",
             error.InvalidHeader => "InvalidHeader",
-            else => "DeserializeError",
+            error.Overflow => "Overflow",
+            error.PoolFull => "PoolFull",
+            error.InvalidTupleLength => "InvalidTupleLength",
+            error.InvalidData => "InvalidData",
+            error.TypeMismatch => "TypeMismatch",
+            error.SizeMismatch => "SizeMismatch",
         };
         return .{ .deser_error = err_name };
     };
@@ -448,13 +453,14 @@ test "testbench: scenario stats" {
             .parse_error => stats.parse_error += 1,
             .deser_error => |e| {
                 stats.deser_error += 1;
+                std.debug.print("DESER: {s} -> {s}\n", .{ entry.name, e });
                 if (std.mem.eql(u8, e, "InvalidTypeCode")) {
                     stats.invalid_type_code += 1;
                 } else if (std.mem.eql(u8, e, "NotSupported")) {
                     stats.not_supported += 1;
                 } else if (std.mem.eql(u8, e, "InvalidOpcode")) {
                     stats.invalid_opcode += 1;
-                } else if (std.mem.eql(u8, e, "OutOfMemory")) {
+                } else if (std.mem.eql(u8, e, "OutOfMemory") or std.mem.eql(u8, e, "PoolFull")) {
                     stats.out_of_memory += 1;
                 } else if (std.mem.eql(u8, e, "UnexpectedEOF")) {
                     stats.unexpected_eof += 1;
