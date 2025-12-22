@@ -240,8 +240,8 @@ pub const UnprovenLeaf = union(enum) {
 
 /// Unproven AND node
 pub const CandUnproven = struct {
-    /// Children
-    children: [MAX_CHILDREN]?UnprovenTree,
+    /// Children (pointers into node pool)
+    children: [MAX_CHILDREN]?*UnprovenTree,
     /// Number of children
     child_count: u8,
     /// Challenge assigned to this node
@@ -255,37 +255,27 @@ pub const CandUnproven = struct {
         return !self.simulated;
     }
 
-    pub fn withSimulated(self: CandUnproven, sim: bool) CandUnproven {
-        var copy = self;
-        copy.simulated = sim;
-        return copy;
+    pub fn withSimulated(self: *CandUnproven, sim: bool) void {
+        self.simulated = sim;
     }
 
-    pub fn withChallenge(self: CandUnproven, c: Challenge) CandUnproven {
-        var copy = self;
-        copy.challenge_opt = c;
-        return copy;
+    pub fn withChallenge(self: *CandUnproven, c: Challenge) void {
+        self.challenge_opt = c;
     }
 
-    pub fn withPosition(self: CandUnproven, pos: NodePosition) CandUnproven {
-        var copy = self;
-        copy.position = pos;
-        return copy;
+    pub fn withPosition(self: *CandUnproven, pos: NodePosition) void {
+        self.position = pos;
     }
 
-    pub fn getChildren(self: *const CandUnproven) []const ?UnprovenTree {
-        return self.children[0..self.child_count];
-    }
-
-    pub fn getChildrenMut(self: *CandUnproven) []?UnprovenTree {
-        return self.children[0..self.child_count];
+    pub fn childCount(self: CandUnproven) u8 {
+        return self.child_count;
     }
 };
 
 /// Unproven OR node
 pub const CorUnproven = struct {
-    /// Children
-    children: [MAX_CHILDREN]?UnprovenTree,
+    /// Children (pointers into node pool)
+    children: [MAX_CHILDREN]?*UnprovenTree,
     /// Number of children
     child_count: u8,
     /// Challenge assigned to this node
@@ -299,30 +289,20 @@ pub const CorUnproven = struct {
         return !self.simulated;
     }
 
-    pub fn withSimulated(self: CorUnproven, sim: bool) CorUnproven {
-        var copy = self;
-        copy.simulated = sim;
-        return copy;
+    pub fn withSimulated(self: *CorUnproven, sim: bool) void {
+        self.simulated = sim;
     }
 
-    pub fn withChallenge(self: CorUnproven, c: Challenge) CorUnproven {
-        var copy = self;
-        copy.challenge_opt = c;
-        return copy;
+    pub fn withChallenge(self: *CorUnproven, c: Challenge) void {
+        self.challenge_opt = c;
     }
 
-    pub fn withPosition(self: CorUnproven, pos: NodePosition) CorUnproven {
-        var copy = self;
-        copy.position = pos;
-        return copy;
+    pub fn withPosition(self: *CorUnproven, pos: NodePosition) void {
+        self.position = pos;
     }
 
-    pub fn getChildren(self: *const CorUnproven) []const ?UnprovenTree {
-        return self.children[0..self.child_count];
-    }
-
-    pub fn getChildrenMut(self: *CorUnproven) []?UnprovenTree {
-        return self.children[0..self.child_count];
+    pub fn childCount(self: CorUnproven) u8 {
+        return self.child_count;
     }
 };
 
@@ -330,8 +310,8 @@ pub const CorUnproven = struct {
 pub const CthresholdUnproven = struct {
     /// Required number of children to prove
     k: u8,
-    /// Children
-    children: [MAX_CHILDREN]?UnprovenTree,
+    /// Children (pointers into node pool)
+    children: [MAX_CHILDREN]?*UnprovenTree,
     /// Number of children
     child_count: u8,
     /// Challenge assigned to this node
@@ -347,22 +327,20 @@ pub const CthresholdUnproven = struct {
         return !self.simulated;
     }
 
-    pub fn withSimulated(self: CthresholdUnproven, sim: bool) CthresholdUnproven {
-        var copy = self;
-        copy.simulated = sim;
-        return copy;
+    pub fn withSimulated(self: *CthresholdUnproven, sim: bool) void {
+        self.simulated = sim;
     }
 
-    pub fn withChallenge(self: CthresholdUnproven, c: Challenge) CthresholdUnproven {
-        var copy = self;
-        copy.challenge_opt = c;
-        return copy;
+    pub fn withChallenge(self: *CthresholdUnproven, c: Challenge) void {
+        self.challenge_opt = c;
     }
 
-    pub fn withPosition(self: CthresholdUnproven, pos: NodePosition) CthresholdUnproven {
-        var copy = self;
-        copy.position = pos;
-        return copy;
+    pub fn withPosition(self: *CthresholdUnproven, pos: NodePosition) void {
+        self.position = pos;
+    }
+
+    pub fn childCount(self: CthresholdUnproven) u8 {
+        return self.child_count;
     }
 };
 
@@ -400,28 +378,28 @@ pub const UnprovenConjecture = union(enum) {
         };
     }
 
-    pub fn withSimulated(self: UnprovenConjecture, sim: bool) UnprovenConjecture {
-        return switch (self) {
-            .cand => |c| .{ .cand = c.withSimulated(sim) },
-            .cor => |c| .{ .cor = c.withSimulated(sim) },
-            .cthreshold => |c| .{ .cthreshold = c.withSimulated(sim) },
-        };
+    pub fn setSimulated(self: *UnprovenConjecture, sim: bool) void {
+        switch (self.*) {
+            .cand => |*c| c.withSimulated(sim),
+            .cor => |*c| c.withSimulated(sim),
+            .cthreshold => |*c| c.withSimulated(sim),
+        }
     }
 
-    pub fn withChallenge(self: UnprovenConjecture, ch: Challenge) UnprovenConjecture {
-        return switch (self) {
-            .cand => |c| .{ .cand = c.withChallenge(ch) },
-            .cor => |c| .{ .cor = c.withChallenge(ch) },
-            .cthreshold => |c| .{ .cthreshold = c.withChallenge(ch) },
-        };
+    pub fn setChallenge(self: *UnprovenConjecture, ch: Challenge) void {
+        switch (self.*) {
+            .cand => |*c| c.withChallenge(ch),
+            .cor => |*c| c.withChallenge(ch),
+            .cthreshold => |*c| c.withChallenge(ch),
+        }
     }
 
-    pub fn withPosition(self: UnprovenConjecture, pos: NodePosition) UnprovenConjecture {
-        return switch (self) {
-            .cand => |c| .{ .cand = c.withPosition(pos) },
-            .cor => |c| .{ .cor = c.withPosition(pos) },
-            .cthreshold => |c| .{ .cthreshold = c.withPosition(pos) },
-        };
+    pub fn setPosition(self: *UnprovenConjecture, pos: NodePosition) void {
+        switch (self.*) {
+            .cand => |*c| c.withPosition(pos),
+            .cor => |*c| c.withPosition(pos),
+            .cthreshold => |*c| c.withPosition(pos),
+        }
     }
 
     pub fn childCount(self: UnprovenConjecture) u8 {

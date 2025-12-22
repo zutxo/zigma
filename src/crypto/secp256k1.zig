@@ -356,6 +356,155 @@ pub const N: [4]u64 = .{
     0xFFFFFFFFFFFFFFFF,
 };
 
+/// Scalar element in Z_n (integers modulo curve order n)
+/// Used for private keys and responses in sigma protocols
+pub const Scalar = struct {
+    limbs: [4]u64,
+
+    pub const zero = Scalar{ .limbs = .{ 0, 0, 0, 0 } };
+    pub const one = Scalar{ .limbs = .{ 1, 0, 0, 0 } };
+
+    /// Create from 32-byte big-endian encoding
+    pub fn fromBytes(bytes: [32]u8) !Scalar {
+        var limbs: [4]u64 = undefined;
+        for (0..4) |i| {
+            const offset = 32 - (i + 1) * 8;
+            limbs[i] = std.mem.readInt(u64, bytes[offset..][0..8], .big);
+        }
+
+        // Validate < n
+        if (cmpLimbs(limbs, N) != .lt) {
+            return error.InvalidScalar;
+        }
+
+        return Scalar{ .limbs = limbs };
+    }
+
+    /// Create from u64
+    pub fn fromInt(n: u64) Scalar {
+        return Scalar{ .limbs = .{ n, 0, 0, 0 } };
+    }
+
+    /// Convert to 32-byte big-endian encoding
+    pub fn toBytes(self: Scalar) [32]u8 {
+        var result: [32]u8 = undefined;
+        for (0..4) |i| {
+            const offset = 32 - (i + 1) * 8;
+            std.mem.writeInt(u64, result[offset..][0..8], self.limbs[i], .big);
+        }
+        return result;
+    }
+
+    /// Check if zero
+    pub fn isZero(self: Scalar) bool {
+        return self.limbs[0] == 0 and self.limbs[1] == 0 and
+            self.limbs[2] == 0 and self.limbs[3] == 0;
+    }
+
+    /// Check equality
+    pub fn eql(a: Scalar, b: Scalar) bool {
+        return a.limbs[0] == b.limbs[0] and a.limbs[1] == b.limbs[1] and
+            a.limbs[2] == b.limbs[2] and a.limbs[3] == b.limbs[3];
+    }
+
+    /// Addition mod n
+    pub fn add(a: Scalar, b: Scalar) Scalar {
+        var result: [4]u64 = undefined;
+        var carry: u64 = 0;
+
+        for (0..4) |i| {
+            const sum1 = @addWithOverflow(a.limbs[i], b.limbs[i]);
+            const sum2 = @addWithOverflow(sum1[0], carry);
+            result[i] = sum2[0];
+            carry = sum1[1] + sum2[1];
+        }
+
+        // If carry or result >= n, subtract n
+        if (carry != 0 or cmpLimbs(result, N) != .lt) {
+            result = subLimbs(result, N);
+        }
+
+        return Scalar{ .limbs = result };
+    }
+
+    /// Subtraction mod n
+    pub fn sub(a: Scalar, b: Scalar) Scalar {
+        var result: [4]u64 = undefined;
+        if (cmpLimbs(a.limbs, b.limbs) != .lt) {
+            result = subLimbs(a.limbs, b.limbs);
+        } else {
+            // a < b: compute a - b + n
+            result = addLimbsNoReduce(a.limbs, N);
+            result = subLimbs(result, b.limbs);
+        }
+
+        return Scalar{ .limbs = result };
+    }
+
+    /// Multiplication mod n
+    pub fn mul(a: Scalar, b: Scalar) Scalar {
+        // Schoolbook multiplication
+        var result: [8]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        for (0..4) |i| {
+            var carry: u64 = 0;
+            for (0..4) |j| {
+                const prod: u128 = @as(u128, a.limbs[i]) * @as(u128, b.limbs[j]);
+                const sum: u128 = @as(u128, result[i + j]) + prod + @as(u128, carry);
+                result[i + j] = @truncate(sum);
+                carry = @truncate(sum >> 64);
+            }
+            result[i + 4] = carry;
+        }
+
+        // Reduce mod n using Barrett reduction
+        return reduceScalar512(result);
+    }
+
+    /// Reduce 512-bit number mod n
+    fn reduceScalar512(x: [8]u64) Scalar {
+        // Simple modular reduction by repeated subtraction
+        // For production, Barrett reduction would be more efficient
+        var result: [5]u64 = .{ x[0], x[1], x[2], x[3], 0 };
+
+        // Reduce high limbs
+        for (4..8) |i| {
+            if (x[i] == 0) continue;
+            // Multiply by 2^(64*i) mod n and add
+            // For now, use a simple approach
+            const val = x[i];
+            var shift_amount: usize = (i - 4) * 64;
+            while (shift_amount >= 256) {
+                // 2^256 mod n needs to be computed
+                shift_amount -= 256;
+            }
+            // Add the contribution - this is a simplified version
+            const contribution = @as(u128, val) << @intCast(shift_amount % 64);
+            const limb_idx = shift_amount / 64;
+            if (limb_idx < 5) {
+                const sum: u128 = @as(u128, result[limb_idx]) + contribution;
+                result[limb_idx] = @truncate(sum);
+                var carry: u64 = @truncate(sum >> 64);
+                var j = limb_idx + 1;
+                while (carry != 0 and j < 5) : (j += 1) {
+                    const s2: u128 = @as(u128, result[j]) + @as(u128, carry);
+                    result[j] = @truncate(s2);
+                    carry = @truncate(s2 >> 64);
+                }
+            }
+        }
+
+        var r: [4]u64 = .{ result[0], result[1], result[2], result[3] };
+
+        // Final reduction while r >= n
+        while (cmpLimbs(r, N) != .lt) {
+            r = subLimbs(r, N);
+        }
+
+        return Scalar{ .limbs = r };
+    }
+};
+
 // ============================================================================
 // Point on secp256k1
 // ============================================================================

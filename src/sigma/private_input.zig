@@ -39,10 +39,9 @@ pub const DlogProverInput = struct {
 
     /// Compute the public image: g^w
     pub fn publicImage(self: DlogProverInput) ProveDlog {
-        const g = Point.generator();
-        const pk = g.mul(self.w);
-        var compressed: [33]u8 = undefined;
-        pk.encode(&compressed);
+        const g = Point.G;
+        const pk = g.mul(self.w.limbs);
+        const compressed = pk.encode();
         return ProveDlog.init(compressed);
     }
 

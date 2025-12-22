@@ -423,8 +423,8 @@ pub const Prover = struct {
                             } else {
                                 // Real: generate random r and commitment a = g^r
                                 const r = self.randomScalar() catch return error.RandomFailed;
-                                const g = Point.generator();
-                                const a = g.mul(r);
+                                const g = Point.G;
+                                const a = g.mul(r.limbs);
                                 s.randomness_opt = r;
                                 s.commitment_opt = .{ .a = a };
                             }
@@ -437,8 +437,8 @@ pub const Prover = struct {
                                 const r = self.randomScalar() catch return error.RandomFailed;
                                 const g = Point.decode(&d.proposition.g) catch return error.InvalidPoint;
                                 const h = Point.decode(&d.proposition.h) catch return error.InvalidPoint;
-                                const a = g.mul(r);
-                                const b = h.mul(r);
+                                const a = g.mul(r.limbs);
+                                const b = h.mul(r.limbs);
                                 d.randomness_opt = r;
                                 d.commitment_opt = .{ .a = a, .b = b };
                             }
@@ -519,8 +519,7 @@ pub const Prover = struct {
                                 buffer[pos] = 0x00;
                                 buffer[pos + 1] = 33;
                                 pos += 2;
-                                var encoded: [33]u8 = undefined;
-                                commit.a.encode(&encoded);
+                                const encoded = commit.a.encode();
                                 @memcpy(buffer[pos .. pos + 33], &encoded);
                                 pos += 33;
                             } else {
@@ -545,10 +544,8 @@ pub const Prover = struct {
                                 buffer[pos] = 0x00;
                                 buffer[pos + 1] = 66;
                                 pos += 2;
-                                var a_encoded: [33]u8 = undefined;
-                                var b_encoded: [33]u8 = undefined;
-                                commit.a.encode(&a_encoded);
-                                commit.b.encode(&b_encoded);
+                                const a_encoded = commit.a.encode();
+                                const b_encoded = commit.b.encode();
                                 @memcpy(buffer[pos .. pos + 33], &a_encoded);
                                 @memcpy(buffer[pos + 33 .. pos + 66], &b_encoded);
                                 pos += 66;
@@ -931,7 +928,6 @@ pub const Prover = struct {
             },
         }
 
-        _ = self;
         return pos;
     }
 
@@ -1135,4 +1131,53 @@ test "Prover: prove TrivialFalse fails" {
 
     const result = prover.prove(prop, "message");
     try std.testing.expectError(error.RootNotReal, result);
+}
+
+test "Prover-Verifier: ProveDlog roundtrip" {
+    const verifier = @import("verifier.zig");
+
+    // Create a secret and corresponding public key
+    var secret: [32]u8 = [_]u8{0} ** 32;
+    secret[31] = 42;
+
+    const dlog_input = try DlogProverInput.init(secret);
+    const pub_image = dlog_input.publicImage();
+
+    // Create prover with the secret
+    const private = PrivateInput{ .dlog = dlog_input };
+    var prover = Prover.initWithSeed(&[_]PrivateInput{private}, 12345);
+
+    // Create proposition: ProveDlog(pk)
+    const prop = SigmaBoolean{ .prove_dlog = pub_image };
+
+    // Generate proof
+    const message = "test message for signing";
+    const proof = try prover.prove(prop, message);
+
+    // Verify the proof
+    const is_valid = try verifier.verifySignature(prop, proof.toSlice(), message);
+    try std.testing.expect(is_valid);
+}
+
+test "Prover-Verifier: wrong message fails verification" {
+    const verifier = @import("verifier.zig");
+
+    // Create a secret and corresponding public key
+    var secret: [32]u8 = [_]u8{0} ** 32;
+    secret[31] = 99;
+
+    const dlog_input = try DlogProverInput.init(secret);
+    const pub_image = dlog_input.publicImage();
+
+    const private = PrivateInput{ .dlog = dlog_input };
+    var prover = Prover.initWithSeed(&[_]PrivateInput{private}, 54321);
+
+    const prop = SigmaBoolean{ .prove_dlog = pub_image };
+
+    // Generate proof with one message
+    const proof = try prover.prove(prop, "original message");
+
+    // Verify with different message should fail
+    const is_valid = try verifier.verifySignature(prop, proof.toSlice(), "different message");
+    try std.testing.expect(!is_valid);
 }

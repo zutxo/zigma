@@ -35,6 +35,44 @@ const SCALAR_SIZE = challenge_mod.SCALAR_SIZE;
 const GROUP_SIZE = challenge_mod.GROUP_SIZE;
 
 // ============================================================================
+// Verification Cost Model
+// ============================================================================
+
+/// Verification costs (based on JitCost from sigmastate)
+pub const VerificationCosts = struct {
+    /// Cost to verify a ProveDlog (Schnorr) leaf
+    /// Includes: point decompression, scalar mul, point add
+    pub const PROVE_DLOG: u64 = 900;
+
+    /// Cost to verify a ProveDHTuple leaf
+    /// Includes: 4 point decompressions, 2 scalar muls, 2 point adds
+    pub const PROVE_DH_TUPLE: u64 = 1800;
+
+    /// Cost per AND/OR node
+    pub const CONNECTIVE: u64 = 20;
+
+    /// Cost per THRESHOLD node (base)
+    pub const THRESHOLD_BASE: u64 = 50;
+
+    /// Cost per child in THRESHOLD (polynomial evaluation)
+    pub const THRESHOLD_PER_CHILD: u64 = 30;
+
+    /// Cost for Fiat-Shamir hash computation (base)
+    pub const FIAT_SHAMIR_BASE: u64 = 100;
+
+    /// Cost per byte in Fiat-Shamir serialization
+    pub const FIAT_SHAMIR_PER_BYTE: u64 = 1;
+};
+
+/// Verification result with cost
+pub const VerificationResult = struct {
+    /// Whether the signature is valid
+    valid: bool,
+    /// Cost consumed during verification
+    cost: u64,
+};
+
+// ============================================================================
 // Verifier Errors
 // ============================================================================
 
@@ -609,6 +647,100 @@ pub fn verifySignature(
     return expected_challenge.eql(actual_challenge);
 }
 
+/// Verify a signature and return cost information
+/// This is the full version that tracks verification cost
+pub fn verifySignatureWithCost(
+    proposition: SigmaBoolean,
+    signature: []const u8,
+    message: []const u8,
+) VerifierError!VerificationResult {
+    // PRECONDITION: inputs have reasonable bounds
+    assert(signature.len <= 65536);
+    assert(message.len <= 65536);
+
+    var cost: u64 = 0;
+
+    // Handle trivial propositions (minimal cost)
+    switch (proposition) {
+        .trivial_true => return .{ .valid = true, .cost = 1 },
+        .trivial_false => return .{ .valid = false, .cost = 1 },
+        else => {},
+    }
+
+    if (signature.len == 0) return error.EmptyProof;
+
+    var ctx = VerifierContext{};
+
+    // Step 1-3: Parse proof and compute challenges
+    var reader = ProofReader.init(signature);
+    var tree = try parseProofTree(proposition, &reader, null, &ctx);
+
+    // Step 4: Compute commitments for all leaves (track cost)
+    cost += try computeCommitmentsWithCost(&tree);
+
+    // Step 5: Serialize tree for Fiat-Shamir
+    const tree_bytes = try serializeForFiatShamir(&tree, &ctx.fs_buffer);
+
+    // Add Fiat-Shamir cost
+    cost += VerificationCosts.FIAT_SHAMIR_BASE;
+    cost += tree_bytes.len * VerificationCosts.FIAT_SHAMIR_PER_BYTE;
+
+    // Step 6: Verify root challenge
+    const expected_challenge = challenge_mod.computeChallenge(tree_bytes, message);
+    const actual_challenge = tree.getChallenge();
+
+    const valid = expected_challenge.eql(actual_challenge);
+    return .{ .valid = valid, .cost = cost };
+}
+
+/// Compute commitments and return total cost
+fn computeCommitmentsWithCost(tree: *UncheckedTree) VerifierError!u64 {
+    var cost: u64 = 0;
+
+    var work_stack: [MAX_WORK_STACK]*UncheckedTree = undefined;
+    var work_sp: u16 = 0;
+
+    work_stack[0] = tree;
+    work_sp = 1;
+
+    var iterations: u32 = 0;
+    while (work_sp > 0) : (iterations += 1) {
+        if (iterations >= MAX_TREE_NODES * 2) {
+            return error.ProofTooLarge;
+        }
+
+        work_sp -= 1;
+        const node = work_stack[work_sp];
+
+        switch (node.*) {
+            .trivial_true, .trivial_false => {},
+            .schnorr => |*s| {
+                try computeSchnorrCommitment(s);
+                cost += VerificationCosts.PROVE_DLOG;
+            },
+            .dh_tuple => |*d| {
+                try computeDHTupleCommitment(d);
+                cost += VerificationCosts.PROVE_DH_TUPLE;
+            },
+            .cand => |*and_node| {
+                cost += VerificationCosts.CONNECTIVE;
+                try pushChildren(and_node.children, &work_stack, &work_sp);
+            },
+            .cor => |*or_node| {
+                cost += VerificationCosts.CONNECTIVE;
+                try pushChildren(or_node.children, &work_stack, &work_sp);
+            },
+            .cthreshold => |*th_node| {
+                cost += VerificationCosts.THRESHOLD_BASE;
+                cost += @as(u64, th_node.children.len) * VerificationCosts.THRESHOLD_PER_CHILD;
+                try pushChildren(th_node.children, &work_stack, &work_sp);
+            },
+        }
+    }
+
+    return cost;
+}
+
 // ============================================================================
 // Fiat-Shamir Tree Serialization (for verification)
 // ============================================================================
@@ -1049,4 +1181,29 @@ test "conformance: OR signature structure" {
     const child2_challenge = root_challenge.xor(child1_challenge);
     // This computed challenge is what would be used for child2
     try std.testing.expect(!child2_challenge.isZero());
+}
+
+// ============================================================================
+// Cost Accounting Tests
+// ============================================================================
+
+test "verifier: trivial propositions have minimal cost" {
+    // Trivial true
+    const result_true = try verifySignatureWithCost(.trivial_true, &[_]u8{}, &[_]u8{});
+    try std.testing.expect(result_true.valid);
+    try std.testing.expectEqual(@as(u64, 1), result_true.cost);
+
+    // Trivial false
+    const result_false = try verifySignatureWithCost(.trivial_false, &[_]u8{}, &[_]u8{});
+    try std.testing.expect(!result_false.valid);
+    try std.testing.expectEqual(@as(u64, 1), result_false.cost);
+}
+
+test "verifier: cost constants are reasonable" {
+    // Verify cost constants are properly defined
+    try std.testing.expect(VerificationCosts.PROVE_DLOG > 0);
+    try std.testing.expect(VerificationCosts.PROVE_DH_TUPLE > VerificationCosts.PROVE_DLOG);
+    try std.testing.expect(VerificationCosts.FIAT_SHAMIR_BASE > 0);
+    try std.testing.expect(VerificationCosts.CONNECTIVE > 0);
+    try std.testing.expect(VerificationCosts.THRESHOLD_BASE > 0);
 }
