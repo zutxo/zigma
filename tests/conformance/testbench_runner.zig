@@ -439,8 +439,10 @@ test "testbench: scenario stats" {
             .success => |s| {
                 if (s.expected_true == s.actual_true) {
                     stats.passed += 1;
+                    std.debug.print("PASS: {s}\n", .{entry.name});
                 } else {
                     stats.wrong_result += 1;
+                    std.debug.print("WRONG: {s} (expected={}, actual={})\n", .{ entry.name, s.expected_true, s.actual_true });
                 }
             },
             .parse_error => stats.parse_error += 1,
