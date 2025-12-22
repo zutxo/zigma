@@ -21,6 +21,10 @@ const private_input = @import("private_input.zig");
 const unproven_tree = @import("unproven_tree.zig");
 const schnorr = @import("schnorr.zig");
 const dh_tuple = @import("dh_tuple.zig");
+const gf2_192 = @import("gf2_192.zig");
+
+const Gf2_192 = gf2_192.Gf2_192;
+const Gf2_192Poly = gf2_192.Gf2_192Poly;
 
 const Point = secp256k1.Point;
 const Scalar = secp256k1.Scalar;
@@ -720,19 +724,51 @@ pub const Prover = struct {
                             }
                         },
                         .cthreshold => |*c| {
-                            // THRESHOLD: more complex, uses polynomial interpolation
-                            // For now, treat similarly to OR
-                            var simulated_xor = Challenge.zero;
+                            // THRESHOLD(k,n): use polynomial interpolation
+                            // Polynomial Q passes through:
+                            // - Q(0) = parent_challenge
+                            // - Q(i+1) = simulated_child[i]_challenge for simulated children
+                            // Real children get Q(i+1) as their challenge
 
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
+                            // Collect simulated children's challenges as interpolation points
+                            var sim_points: [MAX_CHILDREN]u8 = undefined;
+                            var sim_values: [MAX_CHILDREN]Gf2_192 = undefined;
+                            var sim_count: usize = 0;
+
+                            for (c.children[0..c.child_count], 0..) |maybe_child, idx| {
+                                if (maybe_child) |child| {
                                     if (child.simulated()) {
-                                        const child_challenge = child.challenge() orelse return error.ChallengeFailed;
-                                        simulated_xor = simulated_xor.xor(child_challenge);
-                                    } else {
-                                        // Real children share the remaining challenge
-                                        const real_challenge = parent_challenge.xor(simulated_xor);
-                                        child.* = child.withChallenge(real_challenge);
+                                        const ch = child.challenge() orelse return error.ChallengeFailed;
+                                        sim_points[sim_count] = @intCast(idx + 1); // 1-indexed
+                                        sim_values[sim_count] = Gf2_192.fromChallenge(ch);
+                                        sim_count += 1;
+                                    }
+                                }
+                            }
+
+                            // Interpolate polynomial: Q(0) = parent_challenge, Q(sim_points[i]) = sim_values[i]
+                            const value_at_zero = Gf2_192.fromChallenge(parent_challenge);
+                            const poly = Gf2_192Poly.interpolate(
+                                sim_points[0..sim_count],
+                                sim_values[0..sim_count],
+                                value_at_zero,
+                            ) catch return error.ChallengeFailed;
+
+                            // Store polynomial for serialization
+                            const poly_bytes = poly.toBytes();
+                            const n_coeff = c.child_count - c.k;
+                            const coeff_bytes = n_coeff * SOUNDNESS_BYTES;
+                            var poly_storage: [MAX_CHILDREN * SOUNDNESS_BYTES]u8 = [_]u8{0} ** (MAX_CHILDREN * SOUNDNESS_BYTES);
+                            @memcpy(poly_storage[0..coeff_bytes], poly_bytes[0..coeff_bytes]);
+                            c.polynomial_opt = poly_storage;
+
+                            // Assign challenges to real children by evaluating polynomial
+                            for (c.children[0..c.child_count], 0..) |*maybe_child, idx| {
+                                if (maybe_child.*) |*child| {
+                                    if (!child.simulated()) {
+                                        // Real child: evaluate Q at x = idx+1
+                                        const child_ch = poly.evaluate(@intCast(idx + 1)).toChallenge();
+                                        child.* = child.withChallenge(child_ch);
                                     }
                                     self.pushWork(.{ .node = child, .phase = .descend });
                                 }
@@ -791,97 +827,112 @@ pub const Prover = struct {
         return self.serializeProof(&tree);
     }
 
-    /// Serialize the proven tree to bytes
+    /// Serialize the proven tree to bytes (Ergo-compatible format)
+    ///
+    /// Format follows sig_serializer.rs:
+    /// - Root: challenge + children
+    /// - Leaf (ProveDlog/ProveDHTuple): response z only (challenge written by parent)
+    /// - AND: challenge + children (children don't write challenges - they inherit parent's)
+    /// - OR: challenge + [child1 with challenge] + ... + [last child without challenge]
+    /// - THRESHOLD: challenge + polynomial coefficients + children (no challenges)
     fn serializeProof(self: *const Prover, tree: *const UnprovenTree) ProverError!Proof {
         var proof = Proof{ .bytes = [_]u8{0} ** 1024, .len = 0 };
         var pos: usize = 0;
 
-        // Use iterative serialization
-        var stack: [MAX_TREE_DEPTH]SerializeState = undefined;
-        var sp: usize = 0;
-
-        stack[sp] = .{ .node = tree, .child_idx = 0 };
-        sp += 1;
-
-        while (sp > 0) {
-            sp -= 1;
-            const state = stack[sp];
-
-            switch (state.node.*) {
-                .leaf => |leaf| {
-                    switch (leaf) {
-                        .schnorr => |s| {
-                            // Write challenge (24 bytes) + response (32 bytes)
-                            if (pos + SOUNDNESS_BYTES + 32 > proof.bytes.len) {
-                                return error.BufferTooSmall;
-                            }
-                            if (s.challenge_opt) |ch| {
-                                @memcpy(proof.bytes[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
-                                pos += SOUNDNESS_BYTES;
-                            }
-                            // Response z = r + e*x (mod q)
-                            if (s.response_opt) |z| {
-                                const z_bytes = z.toBytes();
-                                @memcpy(proof.bytes[pos .. pos + 32], &z_bytes);
-                                pos += 32;
-                            }
-                        },
-                        .dh_tuple => |d| {
-                            if (pos + SOUNDNESS_BYTES + 32 > proof.bytes.len) {
-                                return error.BufferTooSmall;
-                            }
-                            if (d.challenge_opt) |ch| {
-                                @memcpy(proof.bytes[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
-                                pos += SOUNDNESS_BYTES;
-                            }
-                            if (d.response_opt) |z| {
-                                const z_bytes = z.toBytes();
-                                @memcpy(proof.bytes[pos .. pos + 32], &z_bytes);
-                                pos += 32;
-                            }
-                        },
-                    }
-                },
-                .conjecture => |conj| {
-                    // Write challenge for this node
-                    if (pos + SOUNDNESS_BYTES > proof.bytes.len) {
-                        return error.BufferTooSmall;
-                    }
-
-                    const node_challenge = state.node.challenge();
-                    if (node_challenge) |ch| {
-                        @memcpy(proof.bytes[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
-                        pos += SOUNDNESS_BYTES;
-                    }
-
-                    // Push children
-                    const child_count: u8 = switch (conj) {
-                        .cand => |c| c.child_count,
-                        .cor => |c| c.child_count,
-                        .cthreshold => |c| c.child_count,
-                    };
-
-                    var i: usize = child_count;
-                    while (i > 0) {
-                        i -= 1;
-                        const maybe_child = switch (conj) {
-                            .cand => |c| c.children[i],
-                            .cor => |c| c.children[i],
-                            .cthreshold => |c| c.children[i],
-                        };
-                        if (maybe_child) |*child| {
-                            if (sp >= MAX_TREE_DEPTH) return error.TreeTooDeep;
-                            stack[sp] = .{ .node = child, .child_idx = 0 };
-                            sp += 1;
-                        }
-                    }
-                },
-            }
-        }
+        // Serialize with write_challenge flag
+        pos = try self.serializeNode(tree, &proof.bytes, pos, true);
 
         proof.len = @intCast(pos);
-        _ = self;
         return proof;
+    }
+
+    /// Serialize a single node with optional challenge writing
+    fn serializeNode(
+        self: *const Prover,
+        node: *const UnprovenTree,
+        buffer: []u8,
+        start_pos: usize,
+        write_challenge: bool,
+    ) ProverError!usize {
+        var pos = start_pos;
+
+        // Write challenge if requested
+        if (write_challenge) {
+            const ch = node.challenge() orelse return error.ChallengeFailed;
+            if (pos + SOUNDNESS_BYTES > buffer.len) return error.BufferTooSmall;
+            @memcpy(buffer[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
+            pos += SOUNDNESS_BYTES;
+        }
+
+        switch (node.*) {
+            .leaf => |leaf| {
+                // Leaves only write their response z (challenge handled above)
+                switch (leaf) {
+                    .schnorr => |s| {
+                        if (pos + 32 > buffer.len) return error.BufferTooSmall;
+                        const z = s.response_opt orelse return error.ResponseFailed;
+                        const z_bytes = z.toBytes();
+                        @memcpy(buffer[pos .. pos + 32], &z_bytes);
+                        pos += 32;
+                    },
+                    .dh_tuple => |d| {
+                        if (pos + 32 > buffer.len) return error.BufferTooSmall;
+                        const z = d.response_opt orelse return error.ResponseFailed;
+                        const z_bytes = z.toBytes();
+                        @memcpy(buffer[pos .. pos + 32], &z_bytes);
+                        pos += 32;
+                    },
+                }
+            },
+            .conjecture => |conj| {
+                switch (conj) {
+                    .cand => |c| {
+                        // AND: children don't write their challenges (they inherit parent's)
+                        for (c.children[0..c.child_count]) |maybe_child| {
+                            if (maybe_child) |*child| {
+                                pos = try self.serializeNode(child, buffer, pos, false);
+                            }
+                        }
+                    },
+                    .cor => |c| {
+                        // OR: all children except last write their challenges
+                        // Last child's challenge is computed via XOR by verifier
+                        if (c.child_count > 0) {
+                            // Write all but last with challenge
+                            for (c.children[0 .. c.child_count - 1]) |maybe_child| {
+                                if (maybe_child) |*child| {
+                                    pos = try self.serializeNode(child, buffer, pos, true);
+                                }
+                            }
+                            // Write last without challenge
+                            if (c.children[c.child_count - 1]) |*last_child| {
+                                pos = try self.serializeNode(last_child, buffer, pos, false);
+                            }
+                        }
+                    },
+                    .cthreshold => |c| {
+                        // THRESHOLD: write polynomial coefficients first, then children (no challenges)
+                        // Polynomial has (n-k) coefficients (excluding degree-0 which is the challenge)
+                        if (c.polynomial_opt) |poly| {
+                            const n_coeff = c.child_count - c.k;
+                            const poly_bytes = n_coeff * SOUNDNESS_BYTES;
+                            if (pos + poly_bytes > buffer.len) return error.BufferTooSmall;
+                            @memcpy(buffer[pos .. pos + poly_bytes], poly[0..poly_bytes]);
+                            pos += poly_bytes;
+                        }
+                        // Children don't write challenges (computed from polynomial)
+                        for (c.children[0..c.child_count]) |maybe_child| {
+                            if (maybe_child) |*child| {
+                                pos = try self.serializeNode(child, buffer, pos, false);
+                            }
+                        }
+                    },
+                }
+            },
+        }
+
+        _ = self;
+        return pos;
     }
 
     // ========================================================================
@@ -1018,4 +1069,70 @@ test "Prover: xorshift128plus produces different values" {
     try std.testing.expect(v1 != v2);
     try std.testing.expect(v2 != v3);
     try std.testing.expect(v1 != v3);
+}
+
+test "Prover: prove ProveDlog end-to-end" {
+    // Create a secret and corresponding public key
+    var secret: [32]u8 = [_]u8{0} ** 32;
+    secret[31] = 42;
+
+    const dlog_input = try DlogProverInput.init(secret);
+    const pub_image = dlog_input.publicImage();
+
+    // Create prover with the secret
+    const private = PrivateInput{ .dlog = dlog_input };
+    var prover = Prover.initWithSeed(&[_]PrivateInput{private}, 12345);
+
+    // Create proposition: ProveDlog(pk)
+    const prop = SigmaBoolean{ .prove_dlog = pub_image };
+
+    // Generate proof
+    const message = "test message for signing";
+    const proof = try prover.prove(prop, message);
+
+    // Proof should have:
+    // - 24 bytes challenge
+    // - 32 bytes response
+    // = 56 bytes total for a single ProveDlog
+    try std.testing.expectEqual(@as(u16, 56), proof.len);
+
+    // Challenge should be first 24 bytes
+    const challenge = Challenge.fromSlice(proof.bytes[0..SOUNDNESS_BYTES]) catch unreachable;
+    try std.testing.expect(!challenge.isZero());
+
+    // Response should be next 32 bytes (non-zero)
+    var all_zero = true;
+    for (proof.bytes[SOUNDNESS_BYTES .. SOUNDNESS_BYTES + 32]) |b| {
+        if (b != 0) all_zero = false;
+    }
+    try std.testing.expect(!all_zero);
+}
+
+test "Prover: prove fails without secret" {
+    // Create a public key we don't have the secret for
+    const pk = [_]u8{0x02} ++ [_]u8{0xAB} ** 32;
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk) };
+
+    // Prover has no secrets
+    var prover = Prover.init(&[_]PrivateInput{});
+
+    // Should fail with RootNotReal
+    const result = prover.prove(prop, "message");
+    try std.testing.expectError(error.RootNotReal, result);
+}
+
+test "Prover: prove TrivialTrue returns empty proof" {
+    var prover = Prover.init(&[_]PrivateInput{});
+    const prop = SigmaBoolean.trivial_true;
+
+    const proof = try prover.prove(prop, "message");
+    try std.testing.expectEqual(@as(u16, 0), proof.len);
+}
+
+test "Prover: prove TrivialFalse fails" {
+    var prover = Prover.init(&[_]PrivateInput{});
+    const prop = SigmaBoolean.trivial_false;
+
+    const result = prover.prove(prop, "message");
+    try std.testing.expectError(error.RootNotReal, result);
 }
