@@ -173,8 +173,10 @@ test "coverage: getMissingOpcodes" {
     const missing = tracker.getMissingOpcodes();
 
     // Should have most opcodes missing (only 3 were hit)
+    // Count is capped at max_missing
     const total_opcodes = @typeInfo(ExprTag).@"enum".fields.len;
-    try std.testing.expectEqual(total_opcodes - 3, missing.count);
+    const expected_missing = @min(total_opcodes - 3, MissingOpcodes.max_missing);
+    try std.testing.expectEqual(expected_missing, missing.count);
 
     // true_leaf, false_leaf, height should NOT be in missing list
     for (missing.tags[0..missing.count]) |tag| {

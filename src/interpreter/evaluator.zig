@@ -8381,6 +8381,12 @@ fn divInts(left: Value, right: Value) EvalError!Value {
 
     if (r == 0) return error.DivisionByZero;
 
+    // Check for MIN_INT / -1 overflow (only division that overflows in two's complement)
+    // MIN_INT / -1 = -MIN_INT = MAX_INT + 1, which doesn't fit
+    if (r == -1 and l == std.math.minInt(i64)) {
+        return error.ArithmeticOverflow;
+    }
+
     // Ergo uses truncated division (rounds toward zero)
     const result = @divTrunc(l, r);
 

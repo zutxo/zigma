@@ -471,9 +471,7 @@ fn deserializeWithDepth(
     }
 
     // Read opcode/type tag
-    const start_pos = reader.pos;
     const tag = reader.readByte() catch |e| {
-        std.debug.print("EOF at pos {d}, depth {d}, total_len {d}\n", .{ start_pos, depth, reader.data.len });
         return mapVlqError(e);
     };
 

@@ -139,6 +139,10 @@ pub const TypeChecker = struct {
             .bit_or, .bit_and, .bit_xor, .bit_shift_right, .bit_shift_left, .bit_shift_right_zeroed => {
                 // These should have numeric operands
             },
+            // Collection ops
+            .by_index, .append, .min, .max, .xor_byte_array => {
+                // Collection operations - type depends on element type
+            },
         }
 
         return null;
