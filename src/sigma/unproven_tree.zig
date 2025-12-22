@@ -97,6 +97,8 @@ pub const UnprovenSchnorr = struct {
     randomness_opt: ?Scalar,
     /// Challenge assigned to this node
     challenge_opt: ?Challenge,
+    /// Response z = r + e*x (mod q)
+    response_opt: ?Scalar,
     /// True if simulated, false if real
     simulated: bool,
     /// Position in tree
@@ -142,6 +144,8 @@ pub const UnprovenDhTuple = struct {
     randomness_opt: ?Scalar,
     /// Challenge assigned to this node
     challenge_opt: ?Challenge,
+    /// Response z = r + e*x (mod q)
+    response_opt: ?Scalar,
     /// True if simulated, false if real
     simulated: bool,
     /// Position in tree
@@ -505,6 +509,7 @@ fn convertToUnprovenWithPosition(sb: SigmaBoolean, pos: NodePosition) UnprovenTr
                     .commitment_opt = null,
                     .randomness_opt = null,
                     .challenge_opt = null,
+                    .response_opt = null,
                     .simulated = true, // Default to simulated
                     .position = pos,
                 },
@@ -517,6 +522,7 @@ fn convertToUnprovenWithPosition(sb: SigmaBoolean, pos: NodePosition) UnprovenTr
                     .commitment_opt = null,
                     .randomness_opt = null,
                     .challenge_opt = null,
+                    .response_opt = null,
                     .simulated = true,
                     .position = pos,
                 },

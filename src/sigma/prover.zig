@@ -656,8 +656,7 @@ pub const Prover = struct {
                                 const ex = e.mul(x);
                                 const z = r.add(ex);
                                 s.challenge_opt = node_challenge;
-                                // Store response as bytes
-                                _ = z; // Response stored implicitly for now
+                                s.response_opt = z;
                             }
                         },
                         .dh_tuple => |*d| {
@@ -673,7 +672,7 @@ pub const Prover = struct {
                                 const ex = e.mul(x);
                                 const z = r.add(ex);
                                 d.challenge_opt = node_challenge;
-                                _ = z;
+                                d.response_opt = z;
                             }
                         },
                     }
@@ -820,11 +819,10 @@ pub const Prover = struct {
                                 @memcpy(proof.bytes[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
                                 pos += SOUNDNESS_BYTES;
                             }
-                            // Response would go here (computed from r + e*x)
-                            // For now, write placeholder
-                            if (s.randomness_opt) |r| {
-                                const r_bytes = r.toBytes();
-                                @memcpy(proof.bytes[pos .. pos + 32], &r_bytes);
+                            // Response z = r + e*x (mod q)
+                            if (s.response_opt) |z| {
+                                const z_bytes = z.toBytes();
+                                @memcpy(proof.bytes[pos .. pos + 32], &z_bytes);
                                 pos += 32;
                             }
                         },
@@ -836,9 +834,9 @@ pub const Prover = struct {
                                 @memcpy(proof.bytes[pos .. pos + SOUNDNESS_BYTES], &ch.bytes);
                                 pos += SOUNDNESS_BYTES;
                             }
-                            if (d.randomness_opt) |r| {
-                                const r_bytes = r.toBytes();
-                                @memcpy(proof.bytes[pos .. pos + 32], &r_bytes);
+                            if (d.response_opt) |z| {
+                                const z_bytes = z.toBytes();
+                                @memcpy(proof.bytes[pos .. pos + 32], &z_bytes);
                                 pos += 32;
                             }
                         },
