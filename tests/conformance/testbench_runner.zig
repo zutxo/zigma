@@ -391,6 +391,48 @@ test "testbench: pin-lock-valid" {
     }
 }
 
+test "testbench: pattern-multisig-2of3" {
+    const allocator = testing.allocator;
+
+    const file = std.fs.openFileAbsolute(testbench_path ++ "/pattern-multisig-2of3-valid.json", .{}) catch |e| {
+        std.debug.print("Could not open pattern-multisig-2of3-valid.json: {}\n", .{e});
+        return error.SkipZigTest;
+    };
+    defer file.close();
+
+    const json_bytes = file.readToEndAlloc(allocator, 64 * 1024) catch |e| {
+        std.debug.print("Could not read scenario file: {}\n", .{e});
+        return error.SkipZigTest;
+    };
+    defer allocator.free(json_bytes);
+
+    const result = runScenario(allocator, json_bytes);
+
+    switch (result) {
+        .success => |s| {
+            std.debug.print("multisig: expected={}, actual={}, cost={}\n", .{ s.expected_true, s.actual_true, s.cost });
+            // Verify the evaluation succeeded and result matches
+            try testing.expect(s.expected_true == s.actual_true);
+        },
+        .deser_error => |e| {
+            std.debug.print("multisig deserialize error: {s}\n", .{e});
+            try testing.expect(false); // Deserialization should work now
+        },
+        .eval_error => |e| {
+            std.debug.print("multisig eval error: {s}\n", .{e});
+            try testing.expect(false); // Evaluation should work now
+        },
+        .parse_error => |e| {
+            std.debug.print("multisig parse error: {s}\n", .{e});
+            try testing.expect(false);
+        },
+        .unsupported => |e| {
+            std.debug.print("multisig unsupported: {s}\n", .{e});
+            try testing.expect(false); // Should be supported now
+        },
+    }
+}
+
 // Stats test - count how many scenarios pass/fail/error
 test "testbench: scenario stats" {
     const allocator = testing.allocator;
@@ -470,6 +512,7 @@ test "testbench: scenario stats" {
             },
             .eval_error => |e| {
                 stats.eval_error += 1;
+                std.debug.print("EVAL: {s} -> {s}\n", .{ entry.name, e });
                 if (std.mem.eql(u8, e, "UnsupportedExpression")) {
                     stats.unsupported_expr += 1;
                 } else if (std.mem.eql(u8, e, "TypeMismatch")) {

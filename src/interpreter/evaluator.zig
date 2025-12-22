@@ -256,6 +256,7 @@ pub const CostOp = enum(u8) {
     method_call,
     sigma_and,
     sigma_or,
+    sigma_threshold,
     create_avl_tree,
     tree_lookup,
     extract_register,
@@ -293,6 +294,7 @@ const JIT_COSTS = [_]u32{
     10, // method_call
     20, // sigma_and (from trees.scala line 1257)
     20, // sigma_or (from trees.scala line 1280)
+    20, // sigma_threshold (AtLeast - similar to sigma_or)
     100, // create_avl_tree
     800, // tree_lookup
     50, // extract_register (from transformers.scala line 500)
@@ -330,6 +332,7 @@ const AOT_COSTS = [_]u32{
     15, // method_call
     25, // sigma_and
     25, // sigma_or
+    25, // sigma_threshold
     120, // create_avl_tree
     900, // tree_lookup
     60, // extract_register
@@ -387,6 +390,7 @@ const FixedCost = struct {
     pub const method_call: u32 = JIT_COSTS[@intFromEnum(CostOp.method_call)];
     pub const sigma_and: u32 = JIT_COSTS[@intFromEnum(CostOp.sigma_and)];
     pub const sigma_or: u32 = JIT_COSTS[@intFromEnum(CostOp.sigma_or)];
+    pub const sigma_threshold: u32 = JIT_COSTS[@intFromEnum(CostOp.sigma_threshold)];
     pub const create_avl_tree: u32 = JIT_COSTS[@intFromEnum(CostOp.create_avl_tree)];
     pub const tree_lookup: u32 = JIT_COSTS[@intFromEnum(CostOp.tree_lookup)];
     pub const extract_register: u32 = JIT_COSTS[@intFromEnum(CostOp.extract_register)];
@@ -1325,9 +1329,10 @@ pub const Evaluator = struct {
             },
 
             // Sigma proposition connectives
-            .sigma_and, .sigma_or => {
-                // N-ary: n SigmaProp children → SigmaProp
-                const child_count = node.data;
+            .sigma_and, .sigma_or, .sigma_threshold => {
+                // sigma_and/sigma_or: N-ary with data = child_count
+                // sigma_threshold (AtLeast): data = 2 (bound expr + input collection)
+                const child_count: u16 = node.data;
                 // Validate child_count is reasonable (may be corrupted by fault injection)
                 if (child_count == 0 or child_count > 255) {
                     return error.InvalidData;
@@ -1689,6 +1694,7 @@ pub const Evaluator = struct {
             // Sigma proposition connectives
             .sigma_and => try self.computeSigmaAnd(node.data),
             .sigma_or => try self.computeSigmaOr(node.data),
+            .sigma_threshold => try self.computeSigmaThreshold(node.data),
             // Binary sigma operations: TODO implement full sigma tree combination
             .bin_and, .bin_or, .bin_xor => return error.UnsupportedExpression,
 
@@ -5381,6 +5387,62 @@ pub const Evaluator = struct {
         try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
     }
 
+    /// Compute SigmaThreshold (AtLeast): k out of n children must be proven
+    /// Stack: [bound (Int), input (Coll[SigmaProp])] - input on top
+    /// Format: bound expression + input collection expression (always 2 children)
+    fn computeSigmaThreshold(self: *Evaluator, node_data: u16) EvalError!void {
+        // PRECONDITIONS
+        assert(node_data == 2); // Always 2 children: bound and input
+        assert(self.value_sp >= 2);
+
+        try self.addCost(FixedCost.sigma_threshold);
+
+        // Pop input collection (Coll[SigmaProp]) - last pushed, so first popped
+        const input_val = try self.popValue();
+        if (input_val != .coll) return error.TypeMismatch;
+        const coll_ref = input_val.coll;
+        const coll_len: usize = coll_ref.len;
+
+        // Pop bound (Int) - the k threshold value
+        const bound_val = try self.popValue();
+        // Extract integer value (could be byte, short, int, or long)
+        const k_i64: i64 = switch (bound_val) {
+            .byte => |v| v,
+            .short => |v| v,
+            .int => |v| v,
+            .long => |v| v,
+            else => return error.TypeMismatch,
+        };
+
+        // Validate k is reasonable
+        if (k_i64 < 1) return error.InvalidData; // k must be at least 1
+        if (coll_len < 2) return error.InvalidData; // need at least 2 children
+        if (k_i64 > @as(i64, @intCast(coll_len))) return error.InvalidData; // k can't exceed n
+        if (k_i64 > 255 or coll_len > 255) return error.InvalidData; // reasonable limits
+        const k: u8 = @intCast(k_i64);
+
+        // Extract SigmaBoolean from each collection element
+        var children: [256]*const sigma_tree.SigmaBoolean = undefined;
+        for (0..coll_len) |i| {
+            const elem = self.values[coll_ref.start + i];
+            children[i] = try self.extractSigmaBoolean(elem);
+        }
+
+        // Allocate children slice in arena
+        const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, coll_len) catch return error.OutOfMemory;
+        @memcpy(child_slice, children[0..coll_len]);
+
+        // Allocate the SigmaBoolean node itself
+        const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+        node_ptr[0] = .{ .cthreshold = .{ .k = k, .children = child_slice } };
+
+        // Serialize the SigmaBoolean to bytes for SigmaProp
+        const sigma_bytes = try self.serializeSigmaBoolean(&node_ptr[0]);
+
+        // Push result as SigmaProp
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+    }
+
     // ========================================================================
     // AVL Tree Operations
     // ========================================================================
@@ -8036,6 +8098,7 @@ pub const Evaluator = struct {
             // N-ary with data-driven child count
             .block_value => node.data + 1, // items + result
             .tuple_construct, .concrete_collection, .sigma_and, .sigma_or => node.data,
+            .sigma_threshold => 2, // Always 2 children: bound (Int) and input (Coll[SigmaProp])
 
             // create_avl_tree: 3 or 4 children (data = 1 if value_length present)
             .create_avl_tree => if (node.data == 1) 4 else 3,

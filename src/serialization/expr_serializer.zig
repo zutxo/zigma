@@ -144,6 +144,8 @@ pub const ExprTag = enum(u8) {
     sigma_and,
     /// SigmaOr: at least one child proposition must be proven (opcode 0xEB)
     sigma_or,
+    /// SigmaThreshold (AtLeast): k out of n child propositions must be proven (opcode 0x98/152)
+    sigma_threshold,
     /// Binary AND of two SigmaBoolean propositions (opcode 0xED/237)
     bin_and,
     /// Binary OR of two SigmaBoolean propositions (opcode 0xEC/236)
@@ -679,6 +681,7 @@ fn deserializeWithDepth(
             // Sigma proposition connectives
             opcodes.SigmaAnd => try deserializeSigmaConnective(tree, reader, arena, .sigma_and, depth),
             opcodes.SigmaOr => try deserializeSigmaConnective(tree, reader, arena, .sigma_or, depth),
+            opcodes.AtLeast => try deserializeAtLeast(tree, reader, arena, depth),
             // Binary sigma proposition operations (2 children each)
             opcodes.BinAnd => try deserializeBinarySigmaOp(tree, reader, arena, .bin_and, depth),
             opcodes.BinOr => try deserializeBinarySigmaOp(tree, reader, arena, .bin_or, depth),
@@ -1829,6 +1832,37 @@ fn deserializeSigmaConnective(
 
 /// Maximum children for AND/OR/THRESHOLD
 const max_children: u32 = 255;
+
+/// Deserialize AtLeast (THRESHOLD) connective (opcode 0x98 / 152)
+/// Format: bound_expr + input_expr (two expression children)
+/// - bound_expr: Int expression specifying how many must be proven (k)
+/// - input_expr: Coll[SigmaProp] expression containing the propositions
+/// Creates THRESHOLD(k, props) where k out of len(props) children must be proven
+/// Reference: Scala AtLeastSerializer.scala
+fn deserializeAtLeast(
+    tree: *ExprTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    depth: u8,
+) DeserializeError!void {
+    // PRECONDITIONS
+    assert(depth < max_expr_depth);
+    if (tree.node_count >= tree.nodes.len) return error.ExpressionTooComplex;
+
+    // Add the threshold node first (pre-order traversal)
+    // data = 2 (fixed child count: bound and input expressions)
+    _ = try tree.addNode(.{
+        .tag = .sigma_threshold,
+        .data = 2, // Always 2 children: bound and input
+        .result_type = TypePool.SIGMA_PROP,
+    });
+
+    // Child 1: bound expression (Int) - the threshold k value
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+
+    // Child 2: input expression (Coll[SigmaProp]) - the collection of propositions
+    try deserializeWithDepth(tree, reader, arena, depth + 1);
+}
 
 /// Deserialize SubstConstants (opcode 0x74 / 116)
 /// Format: script_bytes_expr + positions_expr + new_values_expr
