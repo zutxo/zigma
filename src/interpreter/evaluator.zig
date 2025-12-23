@@ -2447,6 +2447,7 @@ pub const Evaluator = struct {
             .coll_byte => |cb| .{ .type_idx = TypePool.COLL_BYTE, .data = .{ .byte_slice = .{ .ptr = cb.ptr, .len = @intCast(cb.len) } } },
             .option => |o| .{ .type_idx = type_idx, .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } } },
             .box => |b| .{ .type_idx = TypePool.BOX, .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } } },
+            .sigma_prop => |sp| .{ .type_idx = TypePool.SIGMA_PROP, .data = .{ .sigma_prop = .{ .ptr = sp.data.ptr, .len = @intCast(sp.data.len) } } },
             else => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } }, // Fallback for complex types
         };
 
