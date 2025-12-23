@@ -542,8 +542,9 @@ fn encodeRegisterValue(type_name: []const u8, value_opt: ?std.json.Value, output
     const SShort: u8 = 0x02;
     const SInt: u8 = 0x04;
     const SLong: u8 = 0x05;
-    const SBoolean: u8 = 0x01 | 0x80; // 0x81 for boolean
-    const SCollByte: u8 = 0x0C; // Coll[Byte]
+    const SGroupElement: u8 = 0x07;
+    const SSigmaProp: u8 = 0x08;
+    const SCollByte: u8 = 0x0C; // Coll[Byte] = 0x0C (12)
 
     // Simple integer types with VLQ ZigZag encoding
     if (std.mem.eql(u8, type_name, "SByte")) {
@@ -612,29 +613,66 @@ fn encodeRegisterValue(type_name: []const u8, value_opt: ?std.json.Value, output
     }
 
     if (std.mem.eql(u8, type_name, "SBoolean")) {
-        output[0] = SBoolean;
-        output[1] = if (value.bool) 0x01 else 0x00;
-        return output[0..2];
+        const hex_str = switch (value) {
+            .string => |s| s,
+            .bool => |b| return blk: {
+                output[0] = 0x01; // SBoolean type code
+                output[1] = if (b) 0x01 else 0x00;
+                break :blk output[0..2];
+            },
+            else => return output[0..0],
+        };
+        // Hex-encoded boolean
+        const decoded = std.fmt.hexToBytes(output[0..], hex_str) catch return output[0..0];
+        return decoded;
     }
 
-    // Coll[Byte] from hex string
-    if (std.mem.eql(u8, type_name, "Coll[SByte]") or std.mem.eql(u8, type_name, "Coll[Byte]")) {
+    // SGroupElement - 33 bytes compressed EC point
+    if (std.mem.eql(u8, type_name, "SGroupElement")) {
         const hex_str = switch (value) {
             .string => |s| s,
             else => return output[0..0],
         };
-        output[0] = SCollByte;
-        const decoded = std.fmt.hexToBytes(output[2..], hex_str) catch return output[0..0];
-        // VLQ encode length
+        output[0] = SGroupElement;
+        const decoded = std.fmt.hexToBytes(output[1..], hex_str) catch return output[0..0];
+        return output[0 .. 1 + decoded.len];
+    }
+
+    // SSigmaProp - hex-encoded sigma proposition
+    if (std.mem.eql(u8, type_name, "SSigmaProp")) {
+        const hex_str = switch (value) {
+            .string => |s| s,
+            else => return output[0..0],
+        };
+        output[0] = SSigmaProp;
+        const decoded = std.fmt.hexToBytes(output[1..], hex_str) catch return output[0..0];
+        return output[0 .. 1 + decoded.len];
+    }
+
+    // Coll[Byte] / SColl[SByte] from hex string
+    if (std.mem.eql(u8, type_name, "SColl[SByte]") or std.mem.eql(u8, type_name, "Coll[SByte]") or std.mem.eql(u8, type_name, "Coll[Byte]")) {
+        const hex_str = switch (value) {
+            .string => |s| s,
+            else => return output[0..0],
+        };
+        // Decode hex first to get length
+        var temp_buf: [1024]u8 = undefined;
+        const decoded = std.fmt.hexToBytes(&temp_buf, hex_str) catch return output[0..0];
         const coll_len = decoded.len;
-        if (coll_len < 0x80) {
-            output[1] = @truncate(coll_len);
-            // Shift bytes to make room for length
-            std.mem.copyBackwards(u8, output[2..], decoded);
-            return output[0 .. 2 + coll_len];
+
+        output[0] = SCollByte;
+        // VLQ encode length
+        var pos: usize = 1;
+        var len_val = coll_len;
+        while (len_val >= 0x80) : (len_val >>= 7) {
+            output[pos] = @truncate((len_val & 0x7F) | 0x80);
+            pos += 1;
         }
-        // For longer collections, need multi-byte VLQ
-        return output[0..0]; // Simplified for now
+        output[pos] = @truncate(len_val);
+        pos += 1;
+        // Copy bytes
+        @memcpy(output[pos .. pos + coll_len], decoded);
+        return output[0 .. pos + coll_len];
     }
 
     // Unsupported type
