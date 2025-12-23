@@ -606,3 +606,287 @@ test "conformance: FalseLeaf always fails" {
     try std.testing.expect(result == .boolean);
     try std.testing.expect(result.boolean == false);
 }
+
+// ============================================================================
+// Golden Tests (Serialization Conformance)
+// ============================================================================
+// These tests verify deserialization produces expected structures for
+// known-good byte sequences from the Ergo protocol.
+
+test "golden: proveDlog with generator G" {
+    // ProveDlog(G) - prove discrete log of generator point
+    // 0x00 header v0 + 0xCD ProveDlog + 0x07 GroupElement + compressed G
+    const G_compressed = [_]u8{
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62,
+        0x95, 0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28,
+        0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+    };
+
+    var bytes: [36]u8 = undefined;
+    bytes[0] = 0x00; // Header v0
+    bytes[1] = 0xCD; // ProveDlog opcode
+    bytes[2] = 0x07; // GroupElement type code
+    @memcpy(bytes[3..36], &G_compressed);
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &bytes, &arena);
+
+    try std.testing.expectEqual(ErgoTreeVersion.v0, tree.header.version);
+    try std.testing.expectEqual(@as(u16, 2), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.prove_dlog, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.constant, tree.expr_tree.nodes[1].tag);
+}
+
+test "golden: ExtractAmount from SELF" {
+    // SELF.value (extract nanoErgs from SELF box)
+    // ExtractAmount = 193 = 0xC1, Self = 167 = 0xA7
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0xC1, // ExtractAmount (opcode 193)
+        0xA7, // Self (opcode 167)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 2), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.extract_amount, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.self_box, tree.expr_tree.nodes[1].tag);
+}
+
+test "golden: ExtractId from SELF" {
+    // SELF.id (get box ID)
+    // ExtractId = 197 = 0xC5, Self = 167 = 0xA7
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0xC5, // ExtractId (opcode 197)
+        0xA7, // Self (opcode 167)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 2), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.extract_id, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.self_box, tree.expr_tree.nodes[1].tag);
+}
+
+test "golden: header v1 with size field" {
+    // v1 header + size=2 + TrueLeaf (minimal valid v1 tree)
+    const ergo_tree_bytes = [_]u8{
+        0x09, // Header: v1 + has_size
+        0x01, // Size: 1 byte for expression
+        0x7F, // TrueLeaf
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(ErgoTreeVersion.v1, tree.header.version);
+    try std.testing.expect(tree.header.has_size);
+    try std.testing.expectEqual(@as(?u32, 1), tree.size);
+    try std.testing.expectEqual(expr_serializer.ExprTag.true_leaf, tree.expr_tree.nodes[0].tag);
+}
+
+test "golden: constant segregation with single constant" {
+    // Header with segregation + 1 constant (Int 42) + ConstantPlaceholder
+    const ergo_tree_bytes = [_]u8{
+        0x10, // Header: v0 + constant_segregation
+        0x01, // 1 constant
+        // Constant 0: Int 42
+        0x04, // Int type
+        0x54, // VLQ zigzag 42 (42 * 2 = 84 = 0x54)
+        // Expression: ConstantPlaceholder(0)
+        0x76, 0x00, // ConstantPlaceholder index 0
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expect(tree.header.constant_segregation);
+    try std.testing.expectEqual(@as(u16, 1), tree.constant_count);
+    try std.testing.expectEqual(@as(i32, 42), tree.constant_values[0].int);
+}
+
+test "golden: Blake2b256 hash of SELF.id" {
+    // CalcBlake2b256(SELF.id) - common pattern for box ID hashing
+    // CalcBlake2b256 = 203 = 0xCB, ExtractId = 197 = 0xC5, Self = 167 = 0xA7
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0xCB, // CalcBlake2b256 (opcode 203)
+        0xC5, // ExtractId (opcode 197)
+        0xA7, // Self (opcode 167)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 3), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.calc_blake2b256, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.extract_id, tree.expr_tree.nodes[1].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.self_box, tree.expr_tree.nodes[2].tag);
+}
+
+test "golden: GroupGenerator constant" {
+    // Get secp256k1 generator G
+    // GroupGenerator = 130 = 0x82
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0x82, // GroupGenerator (opcode 130)
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 1), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.group_generator, tree.expr_tree.nodes[0].tag);
+}
+
+test "golden: SizeOf collection" {
+    // SizeOf(INPUTS) - get count of input boxes
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0xB1, // SizeOf (opcode 177)
+        0xA4, // INPUTS
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 2), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.size_of, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.inputs, tree.expr_tree.nodes[1].tag);
+}
+
+test "golden: negation operator" {
+    // -HEIGHT (negate height value)
+    const ergo_tree_bytes = [_]u8{
+        0x00, // Header v0
+        0xF0, // Negation (opcode 240)
+        0xA3, // HEIGHT
+    };
+
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(256).init();
+
+    try deserialize(&tree, &ergo_tree_bytes, &arena);
+
+    try std.testing.expectEqual(@as(u16, 2), tree.expr_tree.node_count);
+    try std.testing.expectEqual(expr_serializer.ExprTag.negation, tree.expr_tree.nodes[0].tag);
+    try std.testing.expectEqual(expr_serializer.ExprTag.height, tree.expr_tree.nodes[1].tag);
+}
+
+// ============================================================================
+// Type Serializer Roundtrip Conformance
+// ============================================================================
+
+test "type_roundtrip: all primitive types" {
+    var pool = TypePool.init();
+    var buf: [16]u8 = undefined;
+
+    // Test all primitive types roundtrip correctly
+    const primitives = [_]TypeIndex{
+        TypePool.BOOLEAN,
+        TypePool.BYTE,
+        TypePool.SHORT,
+        TypePool.INT,
+        TypePool.LONG,
+        TypePool.BIG_INT,
+        TypePool.GROUP_ELEMENT,
+        TypePool.SIGMA_PROP,
+        TypePool.UNIT,
+        TypePool.BOX,
+        TypePool.AVL_TREE,
+    };
+
+    for (primitives) |type_idx| {
+        const len = try type_serializer.serialize(&pool, type_idx, &buf);
+        var reader = vlq.Reader.init(buf[0..len]);
+        const result = try type_serializer.deserialize(&pool, &reader);
+        try std.testing.expectEqual(type_idx, result);
+    }
+}
+
+test "type_roundtrip: Coll[Coll[Byte]]" {
+    var pool = TypePool.init();
+
+    // Create Coll[Coll[Byte]]
+    const inner = pool.add(.{ .coll = TypePool.BYTE }) catch unreachable;
+    const outer = pool.add(.{ .coll = inner }) catch unreachable;
+
+    var buf: [16]u8 = undefined;
+    const len = try type_serializer.serialize(&pool, outer, &buf);
+
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result = try type_serializer.deserialize(&pool, &reader);
+
+    // Verify structure
+    const outer_type = pool.get(result);
+    try std.testing.expect(outer_type == .coll);
+    const inner_type = pool.get(outer_type.coll);
+    try std.testing.expect(inner_type == .coll);
+    try std.testing.expectEqual(TypePool.BYTE, inner_type.coll);
+}
+
+test "type_roundtrip: Option[GroupElement]" {
+    var pool = TypePool.init();
+
+    const opt_ge = pool.add(.{ .option = TypePool.GROUP_ELEMENT }) catch unreachable;
+
+    var buf: [16]u8 = undefined;
+    const len = try type_serializer.serialize(&pool, opt_ge, &buf);
+
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result = try type_serializer.deserialize(&pool, &reader);
+
+    const t = pool.get(result);
+    try std.testing.expect(t == .option);
+    try std.testing.expectEqual(TypePool.GROUP_ELEMENT, t.option);
+}
+
+test "type_roundtrip: (Int, Long, Boolean)" {
+    var pool = TypePool.init();
+
+    const triple = pool.add(.{ .triple = .{
+        .a = TypePool.INT,
+        .b = TypePool.LONG,
+        .c = TypePool.BOOLEAN,
+    } }) catch unreachable;
+
+    var buf: [16]u8 = undefined;
+    const len = try type_serializer.serialize(&pool, triple, &buf);
+
+    var reader = vlq.Reader.init(buf[0..len]);
+    const result = try type_serializer.deserialize(&pool, &reader);
+
+    const t = pool.get(result);
+    try std.testing.expect(t == .triple);
+    try std.testing.expectEqual(TypePool.INT, t.triple.a);
+    try std.testing.expectEqual(TypePool.LONG, t.triple.b);
+    try std.testing.expectEqual(TypePool.BOOLEAN, t.triple.c);
+}
