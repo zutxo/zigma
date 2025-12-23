@@ -191,6 +191,7 @@ fn valueTypeName(value: Value) []const u8 {
         .avl_tree => "SAvlTree",
         .tuple => "Tuple",
         .box_coll => "Coll[Box]",
+        .token_coll => "Coll[(Coll[Byte], Long)]",
         .hash32 => "Coll[Byte]",
         .soft_fork_placeholder => "SoftForkPlaceholder",
     };
@@ -277,6 +278,7 @@ fn printValueJson(value: Value, writer: anytype) !void {
         .tuple => try writer.print("\"<Tuple>\"", .{}),
         .unsigned_big_int => try writer.print("\"<UnsignedBigInt>\"", .{}),
         .box_coll => try writer.print("\"<BoxCollection>\"", .{}),
+        .token_coll => try writer.print("\"<TokenCollection>\"", .{}),
         .hash32 => |h| {
             try writer.print("\"", .{});
             for (h) |b| {

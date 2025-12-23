@@ -225,6 +225,10 @@ fn valuesEqual(a: Value, b: Value) bool {
             if (b != .box_coll) break :blk false;
             break :blk v.source == b.box_coll.source;
         },
+        .token_coll => |v| blk: {
+            if (b != .token_coll) break :blk false;
+            break :blk v.source == b.token_coll.source and v.box_index == b.token_coll.box_index;
+        },
         .header => |v| blk: {
             if (b != .header) break :blk false;
             // Compare by ID (header hash)

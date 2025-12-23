@@ -2108,6 +2108,16 @@ pub const Evaluator = struct {
         const len: i32 = switch (input) {
             .coll_byte => |c| @intCast(c.len),
             .coll => |c| @intCast(c.len),
+            .token_coll => |tc| blk: {
+                // Get box to retrieve token count
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
+                break :blk @intCast(boxes[tc.box_index].tokens.len);
+            },
             else => return error.TypeMismatch,
         };
 
@@ -2979,12 +2989,51 @@ pub const Evaluator = struct {
                     },
                     .box_coll => |bc| {
                         // Get box at index from inputs/outputs
-                        const boxes = if (bc.source == .inputs) self.ctx.inputs else self.ctx.outputs;
+                        const boxes = switch (bc.source) {
+                            .inputs => self.ctx.inputs,
+                            .outputs => self.ctx.outputs,
+                            .data_inputs => self.ctx.data_inputs,
+                        };
                         if (idx >= boxes.len) return error.IndexOutOfBounds;
                         try self.pushValue(.{ .box = .{
                             .source = bc.source,
                             .index = @intCast(idx),
                         } });
+                    },
+                    .token_coll => |tc| {
+                        // Get token at index from box's tokens collection
+                        // Returns tuple (Coll[Byte], Long) = (tokenId, amount)
+                        const boxes = switch (tc.source) {
+                            .inputs => self.ctx.inputs,
+                            .outputs => self.ctx.outputs,
+                            .data_inputs => self.ctx.data_inputs,
+                        };
+                        if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
+                        const box = boxes[tc.box_index];
+                        if (idx >= box.tokens.len) return error.IndexOutOfBounds;
+                        const token = box.tokens[@intCast(idx)];
+
+                        // Copy token id to arena
+                        const token_id = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+                        @memcpy(token_id, &token.id);
+
+                        // Store tuple elements in values array
+                        const start: u16 = @truncate(self.values_sp);
+                        if (start + 2 > self.values.len) return error.OutOfMemory;
+
+                        self.values[start] = .{ .coll_byte = token_id };
+                        self.values[start + 1] = .{ .long = token.amount };
+                        self.values_sp = start + 2;
+
+                        // Return tuple (Coll[Byte], Long)
+                        try self.pushValue(.{
+                            .tuple = .{
+                                .start = start,
+                                .len = 2,
+                                .types = .{ 0, 0, 0, 0 }, // External storage
+                                .values = .{ 0, 0, 0, 0 }, // External storage
+                            },
+                        });
                     },
                     else => return error.TypeMismatch,
                 }
@@ -3659,32 +3708,17 @@ pub const Evaluator = struct {
         const box_val = try self.popValue();
         if (box_val != .box) return error.TypeMismatch;
 
-        const source = convertBoxSource(box_val.box.source);
-        const box = self.getBoxFromSource(source, box_val.box.index) orelse {
-            return error.InvalidNodeIndex;
-        };
-
         // INVARIANT: Token count is bounded (Ergo protocol limit)
-        assert(box.tokens.len <= 255);
+        // Return a TokenCollRef that can be indexed later
+        try self.pushValue(.{
+            .token_coll = .{
+                .source = box_val.box.source,
+                .box_index = @intCast(box_val.box.index),
+            },
+        });
 
-        // Return empty collection if no tokens (common case)
-        // Empty collection represented as generic Coll with 0 elements
-        if (box.tokens.len == 0) {
-            try self.pushValue(.{
-                .coll = .{
-                    .elem_type = TypePool.ANY, // Tuple type placeholder
-                    .start = 0,
-                    .len = 0,
-                },
-            });
-            assert(self.value_sp == initial_sp);
-            return;
-        }
-
-        // For now, return soft-fork placeholder for non-empty tokens
-        // Full implementation requires proper tuple collection serialization
-        // TODO: Implement proper Coll[(Coll[Byte], Long)] construction
-        return self.handleUnsupported();
+        // POSTCONDITION: Stack unchanged (popped 1, pushed 1)
+        assert(self.value_sp == initial_sp);
     }
 
     // ========================================================================
@@ -6684,6 +6718,8 @@ pub const Evaluator = struct {
             .hash32 => TypePool.COLL_BYTE, // Hash32 is Coll[Byte] semantically
             // Box collections need dynamic type; fallback to unit
             .box_coll => TypePool.UNIT,
+            // Token collections need dynamic type; fallback to unit
+            .token_coll => TypePool.UNIT,
             .soft_fork_placeholder => TypePool.UNIT, // Placeholder
         };
     }

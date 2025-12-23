@@ -337,6 +337,10 @@ fn hashValue(value: Value) u32 {
         .box_coll => |v| {
             hash = @intFromEnum(v.source);
         },
+        .token_coll => |v| {
+            hash = @intFromEnum(v.source);
+            hash = hash *% 31 +% v.box_index;
+        },
         .header => |v| {
             for (v.id) |b| {
                 hash = hash *% 31 +% b;

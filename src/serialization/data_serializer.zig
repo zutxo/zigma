@@ -96,6 +96,9 @@ pub const Value = union(enum) {
     /// Collection of boxes (reference to context array)
     box_coll: BoxCollRef,
 
+    /// Collection of tokens from a box (reference to box's tokens)
+    token_coll: TokenCollRef,
+
     /// AVL+ tree metadata (authenticated dictionary)
     avl_tree: avl.AvlTreeData,
 
@@ -277,6 +280,20 @@ pub const Value = union(enum) {
         comptime {
             // BoxCollRef must be minimal
             assert(@sizeOf(BoxCollRef) <= 4);
+        }
+    };
+
+    /// Reference to a box's token collection.
+    /// Used for box.tokens accessor returning Coll[(Coll[Byte], Long)].
+    pub const TokenCollRef = struct {
+        /// Source collection (inputs, outputs, data_inputs)
+        source: BoxRef.BoxSource,
+        /// Box index within the source collection
+        box_index: u8,
+
+        // Compile-time assertions
+        comptime {
+            assert(@sizeOf(TokenCollRef) <= 4);
         }
     };
 };
@@ -577,7 +594,7 @@ fn storeValueInPool(
             .data = .{ .hash32 = h },
         },
         // Types not yet supported in pool storage
-        .tuple, .header, .pre_header, .sigma_prop, .unsigned_big_int, .box_coll, .avl_tree => {
+        .tuple, .header, .pre_header, .sigma_prop, .unsigned_big_int, .box_coll, .token_coll, .avl_tree => {
             return error.NotSupported;
         },
         // Soft-fork placeholder should not be stored in pool (internal-only)

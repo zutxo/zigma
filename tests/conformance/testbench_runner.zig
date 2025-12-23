@@ -153,7 +153,7 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
             }
             if (token_obj.get("amount")) |amt| {
                 token.amount = switch (amt) {
-                    .integer => |i| i,
+                    .integer => |v| v,
                     .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
                     else => 0,
                 };
