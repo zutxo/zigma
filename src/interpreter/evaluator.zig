@@ -92,7 +92,7 @@ comptime {
 
 /// Convert a PooledValue back to a Value.
 /// This is used when extracting values from Options, Tuples, and Collections.
-fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
+fn pooledValueToValue(pooled: *const PooledValue, type_pool: *const TypePool) EvalError!Value {
     // PRECONDITION: pooled value must be valid
     assert(pooled.type_idx != 0 or pooled.data.primitive == 0); // 0 type only valid for unit
 
@@ -131,15 +131,32 @@ fn pooledValueToValue(pooled: *const PooledValue) EvalError!Value {
             .len = pooled.data.collection.len,
         } },
 
+        // Pre-allocated option types
+        TypePool.OPTION_INT, TypePool.OPTION_LONG, TypePool.OPTION_COLL_BYTE => .{ .option = .{
+            .inner_type = pooled.data.option.inner_type,
+            .value_idx = pooled.data.option.value_idx,
+        } },
+
         else => blk: {
-            // Option types (indices >= OPTION_INT are Option variants)
-            if (type_idx >= TypePool.OPTION_INT) {
-                break :blk .{ .option = .{
-                    .inner_type = pooled.data.option.inner_type,
-                    .value_idx = pooled.data.option.value_idx,
-                } };
+            // Dynamic types - check actual type in pool
+            if (type_idx < type_pool.count) {
+                const type_desc = type_pool.types[type_idx];
+                switch (type_desc) {
+                    .coll => break :blk .{ .coll = .{
+                        .elem_type = pooled.data.collection.elem_type,
+                        .start = pooled.data.collection.start_idx,
+                        .len = pooled.data.collection.len,
+                    } },
+                    .option => break :blk .{ .option = .{
+                        .inner_type = pooled.data.option.inner_type,
+                        .value_idx = pooled.data.option.value_idx,
+                    } },
+                    // Pairs need special handling - stored differently than Value.TupleRef
+                    .pair => break :blk error.UnsupportedExpression,
+                    else => break :blk error.UnsupportedExpression,
+                }
             }
-            // Unsupported/unknown type
+            // Unknown type
             break :blk error.UnsupportedExpression;
         },
     };
@@ -1565,7 +1582,7 @@ pub const Evaluator = struct {
                 if (opt_val.option.isSome()) {
                     // Some(x) - get the inner value from ValuePool
                     const inner = self.pools.values.get(opt_val.option.value_idx) orelse return error.InvalidState;
-                    const result = try pooledValueToValue(inner);
+                    const result = try pooledValueToValue(inner, &self.pools.type_pool);
                     try self.pushValue(result);
                 } else {
                     // None - evaluate the default expression
@@ -1763,7 +1780,7 @@ pub const Evaluator = struct {
         if (opt_val.option.isSome()) {
             // Get inner value from ValuePool
             const inner = self.pools.values.get(opt_val.option.value_idx) orelse return error.InvalidState;
-            const result = try pooledValueToValue(inner);
+            const result = try pooledValueToValue(inner, &self.pools.type_pool);
             try self.pushValue(result);
         } else {
             // None - error per ErgoTree semantics
@@ -2479,10 +2496,19 @@ pub const Evaluator = struct {
             .long => |l| .{ .type_idx = TypePool.LONG, .data = .{ .primitive = l } },
             .group_element => |ge| .{ .type_idx = TypePool.GROUP_ELEMENT, .data = .{ .group_element = ge } },
             .coll_byte => |cb| .{ .type_idx = TypePool.COLL_BYTE, .data = .{ .byte_slice = .{ .ptr = cb.ptr, .len = @intCast(cb.len) } } },
+            .coll => |c| .{ .type_idx = type_idx, .data = .{ .collection = .{ .elem_type = c.elem_type, .start_idx = c.start, .len = c.len } } },
             .option => |o| .{ .type_idx = type_idx, .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } } },
             .box => |b| .{ .type_idx = TypePool.BOX, .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } } },
             .sigma_prop => |sp| .{ .type_idx = TypePool.SIGMA_PROP, .data = .{ .sigma_prop = .{ .ptr = sp.data.ptr, .len = @intCast(sp.data.len) } } },
-            else => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } }, // Fallback for complex types
+            .big_int => |bi| blk: {
+                var bi_data: PooledValue.BigIntData = .{ .bytes = [_]u8{0} ** 32, .len = bi.len };
+                @memcpy(bi_data.bytes[0..bi.len], bi.bytes[0..bi.len]);
+                break :blk .{ .type_idx = TypePool.BIG_INT, .data = .{ .big_int = bi_data } };
+            },
+            .hash32 => |h| .{ .type_idx = type_idx, .data = .{ .hash32 = h } },
+            .avl_tree => |a| .{ .type_idx = type_idx, .data = .{ .avl_tree = a } },
+            // Types that shouldn't be stored in pool (use stack Value directly)
+            .tuple, .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
         };
 
         self.pools.values.set(idx, pooled);
@@ -6186,7 +6212,7 @@ pub const Evaluator = struct {
         const val_idx = start_idx + idx;
 
         if (self.pools.values.get(val_idx)) |pooled| {
-            return pooledValueToValue(pooled);
+            return pooledValueToValue(pooled, &self.pools.type_pool);
         }
         return error.InvalidData;
     }

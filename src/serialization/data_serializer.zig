@@ -656,6 +656,17 @@ fn deserializeColl(
     // Validate length (max 255 per protocol, may be corrupted by fault injection)
     if (len > 255) return error.InvalidData;
 
+    // Handle empty collection - return valid CollRef with len=0
+    if (len == 0) {
+        return .{
+            .coll = .{
+                .elem_type = elem_idx,
+                .start = 0, // Unused for empty collection
+                .len = 0,
+            },
+        };
+    }
+
     // Allocate slots for elements
     const start_idx = vpool.allocN(len) catch return error.OutOfMemory;
 
