@@ -3,15 +3,10 @@
 //! Loads scenarios from ~/orgs/zutxo/testbench/scenarios/*.json
 //! and validates zigma evaluation matches expected results.
 //!
-//! Scenario JSON format (subset we need):
-//! {
-//!   "id": "scenario-id",
-//!   "transaction": {
-//!     "inputs": [{ "ergotree_hex": "...", "creation_height": N }],
-//!     "outputs": [{ "creation_height": N }]
-//!   },
-//!   "expected": { "result": "true"|"false"|"sigma_prop", "cost": N }
-//! }
+//! Parses full transaction context including:
+//! - Multiple inputs/outputs with tokens and registers
+//! - Data inputs for oracle/reference boxes
+//! - Version context for protocol-specific behavior
 
 const std = @import("std");
 const testing = std.testing;
@@ -24,6 +19,7 @@ const TypePool = zigma.types.TypePool;
 const ErgoTree = ergotree_serializer.ErgoTree;
 const Context = context_mod.Context;
 const BoxView = context_mod.BoxView;
+const Token = context_mod.Token;
 const Evaluator = evaluator_mod.Evaluator;
 const Value = zigma.data_serializer.Value;
 const memory = zigma.memory;
@@ -37,7 +33,13 @@ const BumpAllocator = memory.BumpAllocator;
 const testbench_path = "/home/mark/orgs/zutxo/testbench/scenarios";
 
 /// Arena size for deserialization
-const arena_size: usize = 8192;
+const arena_size: usize = 16384;
+
+/// Maximum boxes per category
+const max_boxes: usize = 16;
+
+/// Maximum tokens per box
+const max_tokens_per_box: usize = 8;
 
 // ============================================================================
 // Scenario Parsing
@@ -71,6 +73,132 @@ fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8) ![]u8 {
     return bytes;
 }
 
+/// Parse hex string to fixed-size byte array
+fn hexToFixedBytes(comptime N: usize, hex: []const u8) ![N]u8 {
+    if (hex.len != N * 2) return error.InvalidHexLength;
+
+    var result: [N]u8 = undefined;
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        result[i / 2] = std.fmt.parseInt(u8, hex[i..][0..2], 16) catch return error.InvalidHexChar;
+    }
+    return result;
+}
+
+/// Storage for parsed box data (static allocation)
+const ParsedBox = struct {
+    box: BoxView,
+    tokens: [max_tokens_per_box]Token,
+    token_count: usize,
+    registers: [6]?[]const u8,
+    prop_bytes: []const u8,
+};
+
+/// Parse a single box from JSON object
+fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_height: u32) !ParsedBox {
+    var result: ParsedBox = .{
+        .box = .{
+            .id = [_]u8{0} ** 32,
+            .value = 0,
+            .proposition_bytes = &.{},
+            .creation_height = default_height,
+            .tx_id = [_]u8{0} ** 32,
+            .index = 0,
+            .tokens = &.{},
+            .registers = .{ null, null, null, null, null, null },
+        },
+        .tokens = undefined,
+        .token_count = 0,
+        .registers = .{ null, null, null, null, null, null },
+        .prop_bytes = &.{},
+    };
+
+    const obj = box_json.object;
+
+    // Parse box_id if present
+    if (obj.get("box_id")) |id_val| {
+        result.box.id = hexToFixedBytes(32, id_val.string) catch [_]u8{0} ** 32;
+    }
+
+    // Parse value
+    if (obj.get("value")) |val| {
+        result.box.value = switch (val) {
+            .integer => |i| i,
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+            else => 0,
+        };
+    }
+
+    // Parse creation_height
+    if (obj.get("creation_height")) |h| {
+        result.box.creation_height = @intCast(h.integer);
+    }
+
+    // Parse ergotree_hex (proposition_bytes)
+    if (obj.get("ergotree_hex")) |hex_val| {
+        result.prop_bytes = hexToBytes(allocator, hex_val.string) catch &.{};
+        result.box.proposition_bytes = result.prop_bytes;
+    }
+
+    // Parse tokens
+    if (obj.get("tokens")) |tokens_val| {
+        for (tokens_val.array.items, 0..) |token_json, i| {
+            if (i >= max_tokens_per_box) break;
+
+            const token_obj = token_json.object;
+            var token: Token = .{ .id = [_]u8{0} ** 32, .amount = 0 };
+
+            if (token_obj.get("id")) |id_val| {
+                token.id = hexToFixedBytes(32, id_val.string) catch [_]u8{0} ** 32;
+            }
+            if (token_obj.get("amount")) |amt| {
+                token.amount = switch (amt) {
+                    .integer => |i| i,
+                    .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+                    else => 0,
+                };
+            }
+
+            result.tokens[i] = token;
+            result.token_count += 1;
+        }
+    }
+
+    // Parse registers (R4-R9)
+    if (obj.get("registers")) |regs_val| {
+        const reg_names = [_][]const u8{ "R4", "R5", "R6", "R7", "R8", "R9" };
+        for (reg_names, 0..) |reg_name, i| {
+            if (regs_val.object.get(reg_name)) |reg_val| {
+                // Register value could be raw hex or typed object
+                // For now, try to get a "value" field as hex, or skip
+                if (reg_val.object.get("value")) |val| {
+                    switch (val) {
+                        .string => |s| {
+                            // Try to parse as hex
+                            const reg_bytes = hexToBytes(allocator, s) catch null;
+                            result.registers[i] = reg_bytes;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+/// Transaction context parsed from JSON
+const ParsedTransaction = struct {
+    inputs: [max_boxes]ParsedBox,
+    input_count: usize,
+    outputs: [max_boxes]ParsedBox,
+    output_count: usize,
+    data_inputs: [max_boxes]ParsedBox,
+    data_input_count: usize,
+    height: u32,
+};
+
 /// Run a single scenario from JSON bytes
 fn runScenario(
     allocator: std.mem.Allocator,
@@ -84,39 +212,80 @@ fn runScenario(
 
     const root = parsed.value;
 
-    // Get ergotree_hex from transaction.inputs[0]
+    // Get transaction object
     const tx = root.object.get("transaction") orelse {
         return .{ .parse_error = "No transaction" };
     };
-    const inputs = tx.object.get("inputs") orelse {
-        return .{ .parse_error = "No inputs" };
-    };
-    if (inputs.array.items.len == 0) {
-        return .{ .parse_error = "Empty inputs" };
-    }
-    const input0 = inputs.array.items[0];
-    const ergotree_hex_val = input0.object.get("ergotree_hex") orelse {
-        return .{ .parse_error = "No ergotree_hex" };
-    };
-    const ergotree_hex = ergotree_hex_val.string;
 
-    // Get height from outputs[0].creation_height or use default
-    var height: u32 = 100;
-    if (tx.object.get("outputs")) |outputs| {
+    // Get height from version_context or outputs
+    var height: u32 = 500;
+    if (root.object.get("version_context")) |vc| {
+        if (vc.object.get("height")) |h| {
+            height = @intCast(h.integer);
+        }
+    } else if (tx.object.get("outputs")) |outputs| {
         if (outputs.array.items.len > 0) {
-            const out0 = outputs.array.items[0];
-            if (out0.object.get("creation_height")) |h| {
+            if (outputs.array.items[0].object.get("creation_height")) |h| {
                 height = @intCast(h.integer);
             }
         }
     }
+
+    // Parse all inputs
+    const inputs_json = tx.object.get("inputs") orelse {
+        return .{ .parse_error = "No inputs" };
+    };
+    if (inputs_json.array.items.len == 0) {
+        return .{ .parse_error = "Empty inputs" };
+    }
+
+    var parsed_inputs: [max_boxes]ParsedBox = undefined;
+    var input_count: usize = 0;
+    for (inputs_json.array.items) |input_json| {
+        if (input_count >= max_boxes) break;
+        parsed_inputs[input_count] = parseBox(allocator, input_json, height) catch {
+            return .{ .parse_error = "Failed to parse input box" };
+        };
+        input_count += 1;
+    }
+
+    // Parse all outputs
+    var parsed_outputs: [max_boxes]ParsedBox = undefined;
+    var output_count: usize = 0;
+    if (tx.object.get("outputs")) |outputs_json| {
+        for (outputs_json.array.items) |output_json| {
+            if (output_count >= max_boxes) break;
+            parsed_outputs[output_count] = parseBox(allocator, output_json, height) catch {
+                return .{ .parse_error = "Failed to parse output box" };
+            };
+            output_count += 1;
+        }
+    }
+
+    // Parse data inputs
+    var parsed_data_inputs: [max_boxes]ParsedBox = undefined;
+    var data_input_count: usize = 0;
+    if (tx.object.get("data_inputs")) |data_inputs_json| {
+        for (data_inputs_json.array.items) |di_json| {
+            if (data_input_count >= max_boxes) break;
+            parsed_data_inputs[data_input_count] = parseBox(allocator, di_json, height) catch {
+                return .{ .parse_error = "Failed to parse data input box" };
+            };
+            data_input_count += 1;
+        }
+    }
+
+    // Get ergotree from first input
+    const ergotree_hex_val = inputs_json.array.items[0].object.get("ergotree_hex") orelse {
+        return .{ .parse_error = "No ergotree_hex" };
+    };
+    const ergotree_hex = ergotree_hex_val.string;
 
     // Get expected result
     const expected = root.object.get("expected") orelse {
         return .{ .parse_error = "No expected" };
     };
     const expected_result_str = expected.object.get("result") orelse {
-        // Check for error case
         if (expected.object.get("error") != null) {
             return .{ .unsupported = "Expected error" };
         }
@@ -138,19 +307,6 @@ fn runScenario(
     var arena = BumpAllocator(arena_size).init();
 
     ergotree_serializer.deserialize(&tree, ergotree_bytes, &arena) catch |e| {
-        if (e == error.InvalidTypeCode) {
-            // Debug: print scenario ID and first bytes of hex
-            if (root.object.get("id")) |id_val| {
-                std.debug.print("InvalidTypeCode in scenario: {s}\n", .{id_val.string});
-            }
-            std.debug.print("  First 10 bytes: {any}\n", .{ergotree_bytes[0..@min(10, ergotree_bytes.len)]});
-        }
-        if (e == error.UnexpectedEndOfInput) {
-            // Debug: print scenario ID for EOF errors
-            if (root.object.get("id")) |id_val| {
-                std.debug.print("EOF in scenario: {s}, tree nodes={d}\n", .{ id_val.string, tree.expr_tree.node_count });
-            }
-        }
         const err_name = switch (e) {
             error.InvalidTypeCode => "InvalidTypeCode",
             error.NotSupported => "NotSupported",
@@ -172,24 +328,63 @@ fn runScenario(
         return .{ .deser_error = err_name };
     };
 
-    // Create evaluation context
-    var box = context_mod.testBox();
-    box.creation_height = height;
-    const inputs_slice = [_]BoxView{box};
-    var ctx = Context.forHeight(height, &inputs_slice);
+    // Build BoxView slices for context
+    // We need to set up token pointers correctly
+    var input_boxes: [max_boxes]BoxView = undefined;
+    var input_token_storage: [max_boxes][max_tokens_per_box]Token = undefined;
+    for (0..input_count) |i| {
+        input_boxes[i] = parsed_inputs[i].box;
+        // Copy tokens to storage and point to them
+        for (0..parsed_inputs[i].token_count) |t| {
+            input_token_storage[i][t] = parsed_inputs[i].tokens[t];
+        }
+        if (parsed_inputs[i].token_count > 0) {
+            input_boxes[i].tokens = input_token_storage[i][0..parsed_inputs[i].token_count];
+        }
+        // Copy registers
+        input_boxes[i].registers = parsed_inputs[i].registers;
+    }
 
-    // Create output box for outputs collection
-    var out_box = context_mod.testBox();
-    out_box.creation_height = height;
-    const outputs_slice = [_]BoxView{out_box};
-    ctx.outputs = &outputs_slice;
+    var output_boxes: [max_boxes]BoxView = undefined;
+    var output_token_storage: [max_boxes][max_tokens_per_box]Token = undefined;
+    for (0..output_count) |i| {
+        output_boxes[i] = parsed_outputs[i].box;
+        for (0..parsed_outputs[i].token_count) |t| {
+            output_token_storage[i][t] = parsed_outputs[i].tokens[t];
+        }
+        if (parsed_outputs[i].token_count > 0) {
+            output_boxes[i].tokens = output_token_storage[i][0..parsed_outputs[i].token_count];
+        }
+        output_boxes[i].registers = parsed_outputs[i].registers;
+    }
+
+    var data_input_boxes: [max_boxes]BoxView = undefined;
+    var di_token_storage: [max_boxes][max_tokens_per_box]Token = undefined;
+    for (0..data_input_count) |i| {
+        data_input_boxes[i] = parsed_data_inputs[i].box;
+        for (0..parsed_data_inputs[i].token_count) |t| {
+            di_token_storage[i][t] = parsed_data_inputs[i].tokens[t];
+        }
+        if (parsed_data_inputs[i].token_count > 0) {
+            data_input_boxes[i].tokens = di_token_storage[i][0..parsed_data_inputs[i].token_count];
+        }
+        data_input_boxes[i].registers = parsed_data_inputs[i].registers;
+    }
+
+    // Create evaluation context with full transaction data
+    const input_slice = input_boxes[0..input_count];
+    var ctx = Context.forHeight(height, input_slice);
+
+    if (output_count > 0) {
+        ctx.outputs = output_boxes[0..output_count];
+    }
+    if (data_input_count > 0) {
+        ctx.data_inputs = data_input_boxes[0..data_input_count];
+    }
 
     // Evaluate
     var eval = Evaluator.init(&tree.expr_tree, &ctx);
     eval.setCostLimit(1_000_000);
-
-    // Copy constants to expr_tree (already done in deserialize but ensure)
-    // tree.expr_tree already has constants copied
 
     const result = eval.evaluate() catch |e| {
         const err_name = switch (e) {
@@ -197,6 +392,8 @@ fn runScenario(
             error.TypeMismatch => "TypeMismatch",
             error.CostLimitExceeded => "CostLimitExceeded",
             error.InvalidContext => "InvalidContext",
+            error.IndexOutOfBounds => "IndexOutOfBounds",
+            error.OptionNone => "OptionNone",
             else => "EvalError",
         };
         return .{ .eval_error = err_name };
