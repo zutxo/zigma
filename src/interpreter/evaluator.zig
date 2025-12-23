@@ -880,6 +880,148 @@ pub const Evaluator = struct {
         return self.popValue();
     }
 
+    // ========================================================================
+    // Evaluate Phase: Leaf Node Handlers
+    // Each handler is under 70 lines per TigerBeetle style.
+    // ========================================================================
+
+    /// Evaluate true literal
+    fn evalTrueLeaf(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.constant);
+        try self.pushValue(.{ .boolean = true });
+    }
+
+    /// Evaluate false literal
+    fn evalFalseLeaf(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.constant);
+        try self.pushValue(.{ .boolean = false });
+    }
+
+    /// Evaluate unit literal
+    fn evalUnit(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.constant);
+        try self.pushValue(.{ .unit = {} });
+    }
+
+    /// Evaluate height accessor
+    fn evalHeight(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.height);
+        try self.pushValue(.{ .int = @intCast(self.ctx.height) });
+    }
+
+    /// Evaluate constant from tree values array
+    fn evalConstant(self: *Evaluator, node: ExprNode) EvalError!void {
+        try self.addCost(FixedCost.constant);
+        const value_idx = node.data;
+        if (value_idx >= self.tree.value_count) {
+            return error.InvalidConstantIndex;
+        }
+        try self.pushValue(self.tree.values[value_idx]);
+    }
+
+    /// Evaluate constant placeholder from constants pool
+    fn evalConstantPlaceholder(self: *Evaluator, node: ExprNode) EvalError!void {
+        try self.addCost(FixedCost.constant_placeholder);
+        const const_idx = node.data;
+        if (const_idx >= self.tree.constant_count) {
+            return error.InvalidConstantIndex;
+        }
+        try self.pushValue(self.tree.constants[const_idx]);
+    }
+
+    // ========================================================================
+    // Evaluate Phase: Context Accessor Handlers
+    // ========================================================================
+
+    /// Evaluate INPUTS accessor
+    fn evalInputs(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.inputs);
+        try self.pushValue(.{ .box_coll = .{ .source = .inputs } });
+    }
+
+    /// Evaluate OUTPUTS accessor
+    fn evalOutputs(self: *Evaluator) EvalError!void {
+        try self.addCost(FixedCost.inputs);
+        try self.pushValue(.{ .box_coll = .{ .source = .outputs } });
+    }
+
+    /// Evaluate SELF accessor
+    fn evalSelfBox(self: *Evaluator) EvalError!void {
+        assert(self.ctx.self_index < self.ctx.inputs.len);
+        try self.addCost(FixedCost.inputs);
+        try self.pushValue(.{ .box = .{
+            .source = .inputs,
+            .index = self.ctx.self_index,
+        } });
+    }
+
+    /// Evaluate MinerPubKey accessor
+    fn evalMinerPk(self: *Evaluator) EvalError!void {
+        const pk = self.ctx.pre_header.miner_pk;
+        assert(pk[0] == 0x02 or pk[0] == 0x03 or pk[0] == 0x00);
+        try self.addCost(100);
+        try self.pushValue(.{ .group_element = pk });
+    }
+
+    /// Evaluate LastBlockUtxoRootHash accessor
+    fn evalLastBlockUtxoRoot(self: *Evaluator) EvalError!void {
+        if (self.ctx.headers.len == 0) {
+            return error.InvalidContext;
+        }
+        try self.addCost(15);
+        try self.pushValue(.{ .coll_byte = &self.ctx.headers[0].state_root });
+    }
+
+    /// Evaluate Context object placeholder
+    fn evalContextObj(self: *Evaluator) EvalError!void {
+        try self.addCost(10);
+        try self.pushValue(.{ .unit = {} });
+    }
+
+    /// Evaluate Global object placeholder
+    fn evalGlobalObj(self: *Evaluator) EvalError!void {
+        try self.addCost(10);
+        try self.pushValue(.{ .unit = {} });
+    }
+
+    // ========================================================================
+    // Evaluate Phase: Deferred Operation Setup
+    // ========================================================================
+
+    /// Setup binary operation for deferred evaluation
+    fn evalBinOpSetup(self: *Evaluator, node_idx: u16) EvalError!void {
+        const left_idx = node_idx + 1;
+        const right_idx = self.findSubtreeEnd(left_idx);
+        try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+        try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
+        try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+    }
+
+    /// Setup if-then-else for deferred evaluation
+    fn evalIfThenElseSetup(self: *Evaluator, node_idx: u16) EvalError!void {
+        try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+        try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+    }
+
+    /// Setup unary operation for deferred evaluation (compute then child)
+    fn evalUnarySetup(self: *Evaluator, node_idx: u16) EvalError!void {
+        try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+        try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+    }
+
+    /// Setup binary deferred operation (compute then two children)
+    fn evalBinarySetup(self: *Evaluator, node_idx: u16) EvalError!void {
+        const left_idx = node_idx + 1;
+        const right_idx = self.findSubtreeEnd(left_idx);
+        try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+        try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
+        try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+    }
+
+    // ========================================================================
+    // Evaluate Phase: Main Dispatcher
+    // ========================================================================
+
     /// Evaluate a node (may push children for later processing)
     fn evaluateNode(self: *Evaluator, node_idx: u16) EvalError!void {
         if (node_idx >= self.tree.node_count) {
@@ -889,126 +1031,27 @@ pub const Evaluator = struct {
         const node = self.tree.nodes[node_idx];
 
         switch (node.tag) {
-            // Leaf nodes: push value directly
-            .true_leaf => {
-                try self.addCost(FixedCost.constant);
-                try self.pushValue(.{ .boolean = true });
-            },
+            // Leaf nodes: delegate to extracted handlers
+            .true_leaf => try self.evalTrueLeaf(),
+            .false_leaf => try self.evalFalseLeaf(),
+            .unit => try self.evalUnit(),
+            .height => try self.evalHeight(),
+            .constant => try self.evalConstant(node),
+            .constant_placeholder => try self.evalConstantPlaceholder(node),
 
-            .false_leaf => {
-                try self.addCost(FixedCost.constant);
-                try self.pushValue(.{ .boolean = false });
-            },
+            // Binary and control flow: setup deferred evaluation
+            .bin_op => try self.evalBinOpSetup(node_idx),
+            .if_then_else => try self.evalIfThenElseSetup(node_idx),
 
-            .unit => {
-                try self.addCost(FixedCost.constant);
-                try self.pushValue(.{ .unit = {} });
-            },
+            // Context accessors: delegate to extracted handlers
+            .inputs => try self.evalInputs(),
+            .outputs => try self.evalOutputs(),
+            .self_box => try self.evalSelfBox(),
+            .miner_pk => try self.evalMinerPk(),
 
-            .height => {
-                try self.addCost(FixedCost.height);
-                try self.pushValue(.{ .int = @intCast(self.ctx.height) });
-            },
-
-            .constant => {
-                try self.addCost(FixedCost.constant);
-                const value_idx = node.data;
-                if (value_idx >= self.tree.value_count) {
-                    return error.InvalidConstantIndex;
-                }
-                try self.pushValue(self.tree.values[value_idx]);
-            },
-
-            .constant_placeholder => {
-                try self.addCost(FixedCost.constant_placeholder);
-                const const_idx = node.data;
-                if (const_idx >= self.tree.constant_count) {
-                    return error.InvalidConstantIndex;
-                }
-                try self.pushValue(self.tree.constants[const_idx]);
-            },
-
-            .bin_op => {
-                // Binary op: push compute phase, then push children
-                // Left child at node_idx+1, right child after left subtree
-                const left_idx = node_idx + 1;
-                const right_idx = self.findSubtreeEnd(left_idx);
-
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // Push right child first (will be evaluated second, popped first)
-                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
-                // Push left child second (will be evaluated first)
-                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
-            },
-
-            .if_then_else => {
-                // If-then-else: evaluate condition first, then decide branch
-                // Condition at node_idx+1, then at node_idx+2, else after then subtree
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // Condition is at node_idx+1
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .inputs => {
-                // INPUTS accessor: returns collection of input boxes
-                try self.addCost(FixedCost.inputs);
-                try self.pushValue(.{ .box_coll = .{ .source = .inputs } });
-            },
-
-            .outputs => {
-                // OUTPUTS accessor: returns collection of output boxes
-                try self.addCost(FixedCost.inputs); // Same cost as inputs
-                try self.pushValue(.{ .box_coll = .{ .source = .outputs } });
-            },
-
-            .self_box => {
-                // SELF accessor: returns the box being validated
-                // PRECONDITION: Context has valid self_index
-                assert(self.ctx.self_index < self.ctx.inputs.len);
-                try self.addCost(FixedCost.inputs);
-                try self.pushValue(.{ .box = .{
-                    .source = .inputs,
-                    .index = self.ctx.self_index,
-                } });
-            },
-
-            .miner_pk => {
-                // MinerPubKey: returns miner's public key from pre-header
-                // PRECONDITION: Pre-header has valid miner_pk
-                const pk = self.ctx.pre_header.miner_pk;
-                // INVARIANT: SEC1 compressed point (0x02 or 0x03 prefix, or 0x00 for identity)
-                assert(pk[0] == 0x02 or pk[0] == 0x03 or pk[0] == 0x00);
-                try self.addCost(100); // MinerPubKey cost from opcodes.zig
-                try self.pushValue(.{ .group_element = pk });
-            },
-
-            .last_block_utxo_root => {
-                // LastBlockUtxoRootHash: returns UTXO state root from last header
-                // PRECONDITION: At least one header in context
-                if (self.ctx.headers.len == 0) {
-                    return error.InvalidContext;
-                }
-                // INVARIANT: First header (index 0) is most recent
-                // NOTE: Must reference original header memory, not a local copy.
-                // Taking &local_copy creates a dangling pointer after scope ends.
-                try self.addCost(15); // LastBlockUtxoRootHash cost from opcodes.zig
-                // Return as byte collection (44-byte AVL+ digest)
-                try self.pushValue(.{ .coll_byte = &self.ctx.headers[0].state_root });
-            },
-
-            .context => {
-                // Context object: used as receiver for context methods via PropertyCall
-                // The actual context data is accessed through computeMethodCall dispatch
-                try self.addCost(10);
-                try self.pushValue(.{ .unit = {} }); // Placeholder - methods access self.ctx directly
-            },
-
-            .global => {
-                // Global object: used as receiver for global methods via PropertyCall
-                // Global methods like groupGenerator are dispatched through computeMethodCall
-                try self.addCost(10);
-                try self.pushValue(.{ .unit = {} }); // Placeholder - methods are static
-            },
+            .last_block_utxo_root => try self.evalLastBlockUtxoRoot(),
+            .context => try self.evalContextObj(),
+            .global => try self.evalGlobalObj(),
 
             .get_var => {
                 // GetVar: access context extension variable by ID
@@ -1046,17 +1089,9 @@ pub const Evaluator = struct {
                 }
             },
 
-            .calc_blake2b256, .calc_sha256 => {
-                // Unary hash operations: push compute phase, then push operand
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // Operand is at node_idx+1 (pre-order layout)
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .bool_to_sigma_prop => {
-                // BoolToSigmaProp: wrap boolean as SigmaProp (trivial proposition)
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
+            // Unary operations: setup deferred evaluation
+            .calc_blake2b256, .calc_sha256, .bool_to_sigma_prop => {
+                try self.evalUnarySetup(node_idx);
             },
 
             .val_use => {
@@ -1068,12 +1103,7 @@ pub const Evaluator = struct {
                 try self.pushValue(value);
             },
 
-            .val_def => {
-                // Variable definition: evaluate RHS, then store binding
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // RHS is at node_idx+1
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
+            .val_def => try self.evalUnarySetup(node_idx),
 
             .block_value => {
                 // Block with let bindings: evaluate each ValDef, then result
@@ -1136,50 +1166,21 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = arg_idx, .phase = .evaluate });
             },
 
-            .option_get, .option_is_defined => {
-                // Unary option operations: push compute phase, then push operand
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
+            // Unary operations with deferred compute
+            .option_get,
+            .option_is_defined,
+            .option_get_or_else,
+            .long_to_byte_array,
+            .byte_array_to_bigint,
+            .byte_array_to_long,
+            .decode_point,
+            .mod_q,
+            .bit_inversion,
+            => try self.evalUnarySetup(node_idx),
 
-            .option_get_or_else => {
-                // Binary: option + default, but we evaluate lazily
-                // First evaluate the option, then in compute phase decide what to do
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .long_to_byte_array, .byte_array_to_bigint, .byte_array_to_long => {
-                // Type conversion unary operations
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .decode_point => {
-                // Unary: Coll[Byte] → GroupElement
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .mod_q => {
-                // Unary: BigInt → BigInt (reduce mod secp256k1 group order)
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .bit_inversion => {
-                // Unary: T → T (bitwise complement)
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .plus_mod_q, .minus_mod_q => {
-                // Binary: BigInt, BigInt → BigInt (mod secp256k1 group order)
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                const left_idx = node_idx + 1;
-                const right_idx = self.findSubtreeEnd(left_idx);
-                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
-                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
+            // Binary operations with deferred compute
+            .plus_mod_q, .minus_mod_q, .exponentiate, .multiply_group => {
+                try self.evalBinarySetup(node_idx);
             },
 
             .group_generator => {
@@ -1189,37 +1190,7 @@ pub const Evaluator = struct {
                 try self.pushValue(.{ .group_element = g });
             },
 
-            .exponentiate => {
-                // Binary: GroupElement, BigInt → GroupElement
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // Left child (GroupElement) at node_idx+1
-                const left_idx = node_idx + 1;
-                const right_idx = self.findSubtreeEnd(left_idx);
-                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
-                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
-            },
-
-            .multiply_group => {
-                // Binary: GroupElement, GroupElement → GroupElement
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                // Left child (GroupElement) at node_idx+1
-                const left_idx = node_idx + 1;
-                const right_idx = self.findSubtreeEnd(left_idx);
-                try self.pushWork(.{ .node_idx = right_idx, .phase = .evaluate });
-                try self.pushWork(.{ .node_idx = left_idx, .phase = .evaluate });
-            },
-
-            .select_field => {
-                // Unary: Tuple → element value
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            .extract_register_as => {
-                // Unary: Box → Option[T] (register value with lazy deserialization)
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
+            .select_field, .extract_register_as => try self.evalUnarySetup(node_idx),
 
             .tuple_construct => {
                 // N-ary: n elements → Tuple
@@ -1281,13 +1252,9 @@ pub const Evaluator = struct {
                 }
             },
 
-            .upcast, .downcast => {
-                // Unary: numeric value → target type
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            // Header field extraction opcodes (0xE9-0xF2)
+            // Unary operations: upcast, downcast, header field extraction
+            .upcast,
+            .downcast,
             .extract_version,
             .extract_parent_id,
             .extract_ad_proofs_root,
@@ -1298,11 +1265,7 @@ pub const Evaluator = struct {
             .extract_difficulty,
             .extract_votes,
             .extract_miner_rewards,
-            => {
-                // Unary: Header → field value
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
+            => try self.evalUnarySetup(node_idx),
 
             // Collection higher-order functions
             .map_collection, .exists, .for_all, .filter, .flat_map => {
@@ -1406,20 +1369,7 @@ pub const Evaluator = struct {
             },
 
             // Property call (property access with no args, like box.value)
-            .property_call => {
-                // Property call structure: [property_call] [obj]
-                // data: low 8 bits = type_code, high 8 bits = property_id
-                //
-                // PRECONDITIONS
-                const obj_idx = node_idx + 1;
-                assert(obj_idx < self.tree.node_count);
-
-                // Push compute phase first
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-
-                // Push obj for evaluation (no args unlike MethodCall)
-                try self.pushWork(.{ .node_idx = obj_idx, .phase = .evaluate });
-            },
+            .property_call => try self.evalUnarySetup(node_idx),
 
             // AVL tree operations
             .create_avl_tree => {
@@ -1486,19 +1436,17 @@ pub const Evaluator = struct {
                 }
             },
 
-            // Unary operations: size_of, negation, logical_not
-            .size_of, .negation, .logical_not => {
-                // Push compute phase, then push child for evaluation
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
-
-            // Box extraction operations - unary (Box → value)
-            .extract_amount, .extract_script_bytes, .extract_bytes, .extract_bytes_with_no_ref, .extract_id, .extract_creation_info => {
-                // Push compute phase, then push box child for evaluation
-                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
-                try self.pushWork(.{ .node_idx = node_idx + 1, .phase = .evaluate });
-            },
+            // More unary operations
+            .size_of,
+            .negation,
+            .logical_not,
+            .extract_amount,
+            .extract_script_bytes,
+            .extract_bytes,
+            .extract_bytes_with_no_ref,
+            .extract_id,
+            .extract_creation_info,
+            => try self.evalUnarySetup(node_idx),
 
             // Trivial propositions - leaf nodes (no children)
             .trivial_prop_true, .trivial_prop_false => {
