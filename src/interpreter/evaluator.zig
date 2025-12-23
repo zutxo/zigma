@@ -1350,17 +1350,31 @@ pub const Evaluator = struct {
                 // Find args by walking past obj
                 const arg1_start = self.findSubtreeEnd(obj_idx);
 
-                // Special case: Context.getVarFromInput has 2 args
-                if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input) {
-                    // 2 args: push both
+                // Determine arg count based on method
+                const arg_count: u8 = if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input)
+                    2
+                else if (type_code == CollTypeCode) switch (method_id) {
+                    CollMethodId.index_of, CollMethodId.updated, CollMethodId.update_many => 2,
+                    CollMethodId.patch => 3,
+                    CollMethodId.zip, CollMethodId.starts_with, CollMethodId.ends_with, CollMethodId.get, CollMethodId.flatmap => 1,
+                    else => 0,
+                } else if (arg1_start < self.tree.node_count and self.tree.nodes[arg1_start].tag != .unsupported)
+                    1
+                else
+                    0;
+
+                // Push args in reverse order (last arg first)
+                if (arg_count >= 3) {
+                    const arg2_start = self.findSubtreeEnd(arg1_start);
+                    const arg3_start = self.findSubtreeEnd(arg2_start);
+                    try self.pushWork(.{ .node_idx = arg3_start, .phase = .evaluate });
+                    try self.pushWork(.{ .node_idx = arg2_start, .phase = .evaluate });
+                    try self.pushWork(.{ .node_idx = arg1_start, .phase = .evaluate });
+                } else if (arg_count == 2) {
                     const arg2_start = self.findSubtreeEnd(arg1_start);
                     try self.pushWork(.{ .node_idx = arg2_start, .phase = .evaluate });
                     try self.pushWork(.{ .node_idx = arg1_start, .phase = .evaluate });
-                } else if (arg1_start < self.tree.node_count and
-                    self.tree.nodes[arg1_start].tag != .unsupported)
-                {
-                    // Generic case: 0 or 1 arg based on tree structure
-                    // If there's something after obj, it's an arg
+                } else if (arg_count == 1) {
                     try self.pushWork(.{ .node_idx = arg1_start, .phase = .evaluate });
                 }
 
@@ -2056,6 +2070,15 @@ pub const Evaluator = struct {
         const len: i32 = switch (input) {
             .coll_byte => |c| @intCast(c.len),
             .coll => |c| @intCast(c.len),
+            .box_coll => |bc| blk: {
+                // Get box collection length (INPUTS.size, OUTPUTS.size, etc.)
+                const boxes = switch (bc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                break :blk @intCast(boxes.len);
+            },
             .token_coll => |tc| blk: {
                 // Get box to retrieve token count
                 const boxes = switch (tc.source) {
@@ -4873,6 +4896,29 @@ pub const Evaluator = struct {
                     if (byte == target) {
                         // INVARIANT: idx fits in i32
                         assert(idx <= std.math.maxInt(i32));
+                        break :blk @intCast(idx);
+                    }
+                }
+                break :blk -1;
+            },
+            .box_coll => |bc| blk: {
+                // elem must be a box - compare by source and index
+                if (elem_val != .box) return error.TypeMismatch;
+                const target = elem_val.box;
+
+                const boxes = switch (bc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+
+                if (from_idx >= boxes.len) break :blk -1;
+
+                // Compare boxes by source and index (identity comparison)
+                // In ErgoTree, boxes are compared by their id, but for INPUTS.indexOf(SELF),
+                // we need identity comparison since SELF is a box reference
+                for (from_idx..boxes.len) |idx| {
+                    if (bc.source == target.source and idx == target.index) {
                         break :blk @intCast(idx);
                     }
                 }
@@ -8173,16 +8219,30 @@ pub const Evaluator = struct {
             // deserialize_register: 0 or 1 children (has_default in low byte)
             .deserialize_register => if ((node.data & 0xFF) == 1) 1 else 0,
 
-            // method_call: 1, 2, or 3 (obj + args based on method_id)
+            // method_call: 1, 2, or 3+ (obj + args based on method_id)
             .method_call => blk: {
                 const method_id: u8 = @truncate(node.data >> 8);
                 const type_code: u8 = @truncate(node.data);
-                // Context.getVarFromInput (12) has 2 args
+                // Context.getVarFromInput has 2 args
                 if (type_code == ContextTypeCode and method_id == ContextMethodId.get_var_from_input) {
                     break :blk 3; // obj + 2 args
                 }
-                // zip (29) has 1 arg, indices (14) and reverse (30) have 0
-                break :blk if (method_id == 29) 2 else 1;
+                // Collection methods with args:
+                if (type_code == CollTypeCode) {
+                    break :blk switch (method_id) {
+                        CollMethodId.index_of => 3, // obj + 2 args (elem, from)
+                        CollMethodId.updated => 3, // obj + 2 args (idx, value)
+                        CollMethodId.update_many => 3, // obj + 2 args (idxs, values)
+                        CollMethodId.patch => 4, // obj + 3 args (from, patch, replaced)
+                        CollMethodId.zip => 2, // obj + 1 arg (other)
+                        CollMethodId.starts_with => 2, // obj + 1 arg (other)
+                        CollMethodId.ends_with => 2, // obj + 1 arg (other)
+                        CollMethodId.get => 2, // obj + 1 arg (idx)
+                        CollMethodId.flatmap => 2, // obj + 1 arg (lambda)
+                        else => 1, // indices, reverse have no args
+                    };
+                }
+                break :blk 1; // Default: obj only
             },
 
             // property_call: always 1 (obj only, no args)
