@@ -1158,29 +1158,47 @@ pub const Evaluator = struct {
             },
 
             .func_value => {
-                // FuncValue alone doesn't evaluate to anything useful
-                // It's used as the target of Apply or collection HOFs
-                // For now, treat standalone func_value as error
-                return error.UnsupportedExpression;
+                // FuncValue can be stored as a first-class value (e.g., in a variable)
+                // When encountered standalone, create a function reference
+                const num_args: u8 = @truncate(node.data);
+                const body_idx: u16 = node_idx + 1;
+
+                // Validate body index
+                if (body_idx >= self.tree.node_count) return error.InvalidData;
+
+                try self.pushValue(.{ .func_ref = .{
+                    .body_idx = body_idx,
+                    .num_args = num_args,
+                } });
             },
 
             .apply => {
                 // Apply: evaluate argument, then apply function
-                // Tree structure: [apply] [func_value] [body...] [arg]
+                // Tree structure: [apply] [func_expr] [arg]
+                //   where func_expr can be:
+                //   - func_value (inline lambda): [func_value] [body...]
+                //   - val_use (stored function): [val_use(x)]
                 //
                 // PRECONDITIONS
                 const func_idx = node_idx + 1;
-                assert(func_idx < self.tree.node_count); // func_value must exist
+                assert(func_idx < self.tree.node_count); // func must exist
 
-                // Push compute phase first (will run after arg is evaluated)
+                const func_node = self.tree.nodes[func_idx];
+
+                // Push compute phase first (will run after arg and func are evaluated)
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
 
-                // Find the argument (after func_value subtree)
+                // Find the argument (after func subtree)
                 const arg_idx = self.findSubtreeEnd(func_idx);
                 assert(arg_idx < self.tree.node_count); // arg must exist
 
                 // Push argument for evaluation
                 try self.pushWork(.{ .node_idx = arg_idx, .phase = .evaluate });
+
+                // If function is a val_use (not inline func_value), evaluate it too
+                if (func_node.tag != .func_value) {
+                    try self.pushWork(.{ .node_idx = func_idx, .phase = .evaluate });
+                }
             },
 
             // Unary operations with deferred compute
@@ -1496,18 +1514,22 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = coll_idx, .phase = .evaluate });
             },
 
-            // Sigma operations - not yet implemented
-            .prove_dlog,
-            .prove_dh_tuple,
-            .sigma_prop_bytes,
-            // Logical AND/OR on collections - unary: Coll[Boolean] → Boolean
-            .logical_and,
-            .logical_or,
-            => {
-                // These operations are deserialized but not yet evaluated.
-                // TODO: Implement evaluation for each of these.
-                return self.handleUnsupported();
+            // Sigma proposition constructors
+            .prove_dlog, .sigma_prop_bytes => try self.evalUnarySetup(node_idx),
+
+            .prove_dh_tuple => {
+                // 4-ary: g, h, u, v → SigmaProp
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                // Evaluate 4 arguments
+                var arg_idx = node_idx + 1;
+                for (0..4) |_| {
+                    try self.pushWork(.{ .node_idx = arg_idx, .phase = .evaluate });
+                    arg_idx = self.findSubtreeEnd(arg_idx);
+                }
             },
+
+            // Logical AND/OR on collections - unary: Coll[Boolean] → Boolean
+            .logical_and, .logical_or => try self.evalUnarySetup(node_idx),
 
             .unsupported => {
                 // Unknown opcode encountered during deserialization.
@@ -1680,6 +1702,8 @@ pub const Evaluator = struct {
             .fold => try self.computeFold(node_idx),
             .flat_map => try self.computeFlatMap(node_idx),
             .slice => try self.computeSlice(),
+            .logical_and => try self.computeLogicalAnd(),
+            .logical_or => try self.computeLogicalOr(),
 
             // Sigma proposition connectives
             .sigma_and => try self.computeSigmaAnd(node.data),
@@ -1724,6 +1748,11 @@ pub const Evaluator = struct {
             // Trivial propositions
             .trivial_prop_true => try self.computeTrivialPropTrue(),
             .trivial_prop_false => try self.computeTrivialPropFalse(),
+
+            // Sigma proposition constructors
+            .prove_dlog => try self.computeProveDlog(),
+            .prove_dh_tuple => try self.computeProveDHTuple(),
+            .sigma_prop_bytes => try self.computeSigmaPropBytes(),
 
             else => {
                 // Other node types don't need compute phase
@@ -1984,6 +2013,85 @@ pub const Evaluator = struct {
         sigma_bytes[0] = opcode;
 
         try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute ProveDlog - create SigmaProp from GroupElement (public key)
+    /// Encodes as 0xCD + 33-byte compressed public key
+    fn computeProveDlog(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(20); // ProveDlog construction cost
+
+        const input = try self.popValue();
+        if (input != .group_element) return error.TypeMismatch;
+
+        // INVARIANT: GroupElement is 33-byte compressed public key
+        assert(input.group_element.len == 33);
+
+        // Allocate 34 bytes: 0xCD opcode + 33-byte public key
+        const sigma_bytes = self.arena.allocSlice(u8, 34) catch return error.OutOfMemory;
+        sigma_bytes[0] = 0xCD; // ProveDlog opcode
+        @memcpy(sigma_bytes[1..34], &input.group_element);
+
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute ProveDHTuple - create SigmaProp from 4 GroupElements (g, h, u, v)
+    /// Encodes as 0xCE + 4×33-byte compressed points = 133 bytes
+    fn computeProveDHTuple(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least 4 values
+        assert(self.value_sp >= 4);
+
+        try self.addCost(40); // ProveDHTuple construction cost
+
+        // Pop in reverse order: v, u, h, g
+        const v = try self.popValue();
+        const u = try self.popValue();
+        const h = try self.popValue();
+        const g = try self.popValue();
+
+        // All must be group elements
+        if (g != .group_element or h != .group_element or u != .group_element or v != .group_element)
+            return error.TypeMismatch;
+
+        // Allocate 133 bytes: 0xCE opcode + 4×33-byte points
+        const sigma_bytes = self.arena.allocSlice(u8, 133) catch return error.OutOfMemory;
+        sigma_bytes[0] = 0xCE; // ProveDHTuple opcode
+        @memcpy(sigma_bytes[1..34], &g.group_element);
+        @memcpy(sigma_bytes[34..67], &h.group_element);
+        @memcpy(sigma_bytes[67..100], &u.group_element);
+        @memcpy(sigma_bytes[100..133], &v.group_element);
+
+        try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute SigmaPropBytes - extract bytes from SigmaProp
+    fn computeSigmaPropBytes(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least one value
+        assert(self.value_sp > 0);
+
+        try self.addCost(15); // SigmaPropBytes cost
+
+        const input = try self.popValue();
+        if (input != .sigma_prop) return error.TypeMismatch;
+
+        // Return the raw sigma bytes as Coll[Byte]
+        const sigma_data = input.sigma_prop.data;
+
+        // INVARIANT: sigma_prop data is not empty
+        assert(sigma_data.len > 0);
+
+        try self.pushValue(.{ .coll_byte = sigma_data });
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -2509,6 +2617,8 @@ pub const Evaluator = struct {
             .avl_tree => |a| .{ .type_idx = type_idx, .data = .{ .avl_tree = a } },
             // Types that shouldn't be stored in pool (use stack Value directly)
             .tuple, .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
+            // Function references store body_idx and num_args
+            .func_ref => |f| .{ .type_idx = type_idx, .data = .{ .primitive = (@as(i64, f.body_idx) << 8) | @as(i64, f.num_args) } },
         };
 
         self.pools.values.set(idx, pooled);
@@ -2887,9 +2997,10 @@ pub const Evaluator = struct {
                 if (idx >= arr.len) return error.IndexOutOfBounds;
                 try self.pushValue(.{ .byte = @intCast(arr[@intCast(idx)]) });
             },
-            .coll => |_| {
-                // Generic collection indexing requires ValuePool access
-                return error.UnsupportedExpression;
+            .coll => |c| {
+                // Generic collection indexing from ValuePool
+                const elem = try self.getCollectionElementFromRef(c, @intCast(idx));
+                try self.pushValue(elem);
             },
             .box_coll => |bc| {
                 const boxes = switch (bc.source) {
@@ -2939,18 +3050,50 @@ pub const Evaluator = struct {
         }
     }
 
-    /// Append two byte arrays
+    /// Append two collections (concatenation)
     fn binOpAppend(self: *Evaluator, left: Value, right: Value) EvalError!void {
-        if (left != .coll_byte or right != .coll_byte) {
-            return error.UnsupportedExpression;
+        // Handle byte collections (most common case)
+        if (left == .coll_byte and right == .coll_byte) {
+            const left_bytes = left.coll_byte;
+            const right_bytes = right.coll_byte;
+            const total_len = left_bytes.len + right_bytes.len;
+            const result_bytes = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+            @memcpy(result_bytes[0..left_bytes.len], left_bytes);
+            @memcpy(result_bytes[left_bytes.len..], right_bytes);
+            try self.pushValue(.{ .coll_byte = result_bytes });
+            return;
         }
-        const left_bytes = left.coll_byte;
-        const right_bytes = right.coll_byte;
-        const total_len = left_bytes.len + right_bytes.len;
-        const result_bytes = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
-        @memcpy(result_bytes[0..left_bytes.len], left_bytes);
-        @memcpy(result_bytes[left_bytes.len..], right_bytes);
-        try self.pushValue(.{ .coll_byte = result_bytes });
+
+        // Handle generic collections
+        if (left == .coll and right == .coll) {
+            const lc = left.coll;
+            const rc = right.coll;
+            // Must have compatible element types
+            if (lc.elem_type != rc.elem_type) return error.TypeMismatch;
+
+            const total_len = @as(usize, lc.len) + @as(usize, rc.len);
+            const new_start: u16 = self.pools.values.count;
+
+            // Copy left elements
+            for (0..lc.len) |i| {
+                const elem = try self.getCollectionElementFromRef(lc, @intCast(i));
+                _ = try self.storeValueInPool(elem, lc.elem_type);
+            }
+            // Copy right elements
+            for (0..rc.len) |i| {
+                const elem = try self.getCollectionElementFromRef(rc, @intCast(i));
+                _ = try self.storeValueInPool(elem, rc.elem_type);
+            }
+
+            try self.pushValue(.{ .coll = .{
+                .elem_type = lc.elem_type,
+                .start = new_start,
+                .len = @intCast(total_len),
+            } });
+            return;
+        }
+
+        return error.TypeMismatch;
     }
 
     /// XOR two byte arrays element-wise
@@ -3998,7 +4141,7 @@ pub const Evaluator = struct {
     }
 
     /// Compute map: apply function to each element
-    /// Currently only supports Coll[Byte] → Coll[Byte]
+    /// Supports Coll[Byte] and generic Coll[T]
     fn computeMap(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp > 0);
@@ -4007,19 +4150,25 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Currently only support coll_byte
-        if (coll != .coll_byte) return error.UnsupportedExpression;
-
-        const input = coll.coll_byte;
+        // Get collection length
+        const len: usize = switch (coll) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
 
         // Chunk-based cost for map: PerItemCost(20, 1, 10)
-        try self.addCost(CollectionCost.map.cost(@truncate(input.len)));
+        try self.addCost(CollectionCost.map.cost(@truncate(len)));
 
-        // Empty collection: return empty
-        if (input.len == 0) {
-            const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
-            try self.pushValue(.{ .coll_byte = empty });
-            // POSTCONDITION: Stack depth unchanged
+        // Empty collection: return empty of same type
+        if (len == 0) {
+            if (coll == .coll_byte) {
+                const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
+                try self.pushValue(.{ .coll_byte = empty });
+            } else {
+                // Empty generic collection
+                try self.pushValue(.{ .coll = .{ .elem_type = coll.coll.elem_type, .start = 0, .len = 0 } });
+            }
             assert(self.value_sp == initial_sp);
             return;
         }
@@ -4034,29 +4183,55 @@ pub const Evaluator = struct {
         const body_idx = lambda_idx + 1;
         const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
 
-        // Allocate result array
-        const result = self.arena.allocSlice(u8, input.len) catch return error.OutOfMemory;
+        // Handle byte collections specially (more efficient)
+        if (coll == .coll_byte) {
+            const input = coll.coll_byte;
+            const result = self.arena.allocSlice(u8, input.len) catch return error.OutOfMemory;
 
-        // Apply function to each element
-        for (input, 0..) |elem, i| {
-            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+            for (input, 0..) |elem, i| {
+                self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+                const mapped = try self.evaluateSubtree(body_idx);
+                result[i] = switch (mapped) {
+                    .byte => |v| @bitCast(v),
+                    .int => |v| @truncate(@as(u32, @bitCast(v))),
+                    .long => |v| @truncate(@as(u64, @bitCast(v))),
+                    else => return error.TypeMismatch,
+                };
+            }
+            try self.pushValue(.{ .coll_byte = result });
+        } else {
+            // Generic collection: store results in ValuePool
+            const start_idx: u16 = self.pools.values.count;
+            var result_type: TypeIndex = coll.coll.elem_type;
 
-            const mapped = try self.evaluateSubtree(body_idx);
-            result[i] = switch (mapped) {
-                .byte => |v| @bitCast(v),
-                .int => |v| @truncate(@as(u32, @bitCast(v))),
-                .long => |v| @truncate(@as(u64, @bitCast(v))),
-                else => return error.TypeMismatch,
-            };
+            // Map each element
+            for (0..len) |i| {
+                const elem = try self.getCollectionElement(coll, i);
+                self.var_bindings[arg_var_id] = elem;
+
+                const mapped = try self.evaluateSubtree(body_idx);
+
+                // Store mapped value in pool - infer type from first element
+                if (i == 0) {
+                    result_type = valueToTypeIndex(mapped);
+                }
+                _ = try self.storeValueInPool(mapped, result_type);
+            }
+
+            // Create result collection reference
+            try self.pushValue(.{ .coll = .{
+                .elem_type = result_type,
+                .start = start_idx,
+                .len = @intCast(len),
+            } });
         }
 
-        try self.pushValue(.{ .coll_byte = result });
         // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
         assert(self.value_sp == initial_sp);
     }
 
     /// Compute filter: keep elements that satisfy predicate
-    /// Currently only supports Coll[Byte]
+    /// Supports Coll[Byte] and generic Coll[T]
     fn computeFilter(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp > 0);
@@ -4065,21 +4240,20 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Currently only support coll_byte
-        if (coll != .coll_byte) return error.UnsupportedExpression;
-
-        const input = coll.coll_byte;
+        // Get collection length
+        const len: usize = switch (coll) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            else => return error.TypeMismatch,
+        };
 
         // Chunk-based cost for filter: PerItemCost(20, 1, 10)
-        try self.addCost(CollectionCost.filter.cost(@truncate(input.len)));
-
-        if (input.len == 0) {
-            const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
-            try self.pushValue(.{ .coll_byte = empty });
-            // POSTCONDITION: Stack depth unchanged
-            assert(self.value_sp == initial_sp);
-            return;
-        }
+        try self.addCost(CollectionCost.filter.cost(@truncate(len)));
 
         // Find the lambda
         const coll_idx = node_idx + 1;
@@ -4091,28 +4265,106 @@ pub const Evaluator = struct {
         const body_idx = lambda_idx + 1;
         const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
 
-        // First pass: count matching elements
-        var count: usize = 0;
-        for (input) |elem| {
-            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
-            const predicate_result = try self.evaluateSubtree(body_idx);
-            if (predicate_result != .boolean) return error.TypeMismatch;
-            if (predicate_result.boolean) count += 1;
-        }
+        // Handle byte collections specially (more efficient)
+        if (coll == .coll_byte) {
+            const input = coll.coll_byte;
 
-        // Allocate result and fill
-        const result = self.arena.allocSlice(u8, count) catch return error.OutOfMemory;
-        var j: usize = 0;
-        for (input) |elem| {
-            self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
-            const pred = try self.evaluateSubtree(body_idx);
-            if (pred.boolean) {
-                result[j] = elem;
-                j += 1;
+            if (input.len == 0) {
+                const empty = self.arena.allocSlice(u8, 0) catch return error.OutOfMemory;
+                try self.pushValue(.{ .coll_byte = empty });
+                assert(self.value_sp == initial_sp);
+                return;
             }
+
+            // First pass: count matching elements
+            var count: usize = 0;
+            for (input) |elem| {
+                self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+                const predicate_result = try self.evaluateSubtree(body_idx);
+                if (predicate_result != .boolean) return error.TypeMismatch;
+                if (predicate_result.boolean) count += 1;
+            }
+
+            // Allocate result and fill
+            const result = self.arena.allocSlice(u8, count) catch return error.OutOfMemory;
+            var j: usize = 0;
+            for (input) |elem| {
+                self.var_bindings[arg_var_id] = .{ .byte = @bitCast(elem) };
+                const pred = try self.evaluateSubtree(body_idx);
+                if (pred.boolean) {
+                    result[j] = elem;
+                    j += 1;
+                }
+            }
+
+            try self.pushValue(.{ .coll_byte = result });
+        } else if (coll == .box_coll) {
+            // Filter boxes: store matching box references in ValuePool
+            const bc = coll.box_coll;
+
+            if (len == 0) {
+                try self.pushValue(.{ .coll = .{ .elem_type = TypePool.BOX, .start = 0, .len = 0 } });
+                assert(self.value_sp == initial_sp);
+                return;
+            }
+
+            const start_idx: u16 = self.pools.values.count;
+            var count: u16 = 0;
+
+            for (0..len) |i| {
+                // Get box reference
+                const box_val: Value = .{ .box = .{ .source = bc.source, .index = @intCast(i) } };
+                self.var_bindings[arg_var_id] = box_val;
+
+                const predicate_result = try self.evaluateSubtree(body_idx);
+                if (predicate_result != .boolean) return error.TypeMismatch;
+
+                if (predicate_result.boolean) {
+                    // Store matching box in pool
+                    _ = try self.storeValueInPool(box_val, TypePool.BOX);
+                    count += 1;
+                }
+            }
+
+            // Create result collection of boxes
+            try self.pushValue(.{ .coll = .{
+                .elem_type = TypePool.BOX,
+                .start = start_idx,
+                .len = count,
+            } });
+        } else {
+            // Generic collection: filter and store in ValuePool
+            const c = coll.coll;
+
+            if (len == 0) {
+                try self.pushValue(.{ .coll = .{ .elem_type = c.elem_type, .start = 0, .len = 0 } });
+                assert(self.value_sp == initial_sp);
+                return;
+            }
+
+            const start_idx: u16 = self.pools.values.count;
+            var count: u16 = 0;
+
+            for (0..len) |i| {
+                const elem = try self.getCollectionElement(coll, i);
+                self.var_bindings[arg_var_id] = elem;
+
+                const predicate_result = try self.evaluateSubtree(body_idx);
+                if (predicate_result != .boolean) return error.TypeMismatch;
+
+                if (predicate_result.boolean) {
+                    _ = try self.storeValueInPool(elem, c.elem_type);
+                    count += 1;
+                }
+            }
+
+            try self.pushValue(.{ .coll = .{
+                .elem_type = c.elem_type,
+                .start = start_idx,
+                .len = count,
+            } });
         }
 
-        try self.pushValue(.{ .coll_byte = result });
         // POSTCONDITION: Stack depth unchanged (popped 1, pushed 1)
         assert(self.value_sp == initial_sp);
     }
@@ -4190,7 +4442,10 @@ pub const Evaluator = struct {
         const coll = try self.popValue();
 
         // Currently only support coll_byte
-        if (coll != .coll_byte) return error.UnsupportedExpression;
+        if (coll != .coll_byte) {
+            std.debug.print("DEBUG: flatMap on non-byte coll type\n", .{});
+            return error.UnsupportedExpression;
+        }
 
         const input = coll.coll_byte;
 
@@ -4281,13 +4536,15 @@ pub const Evaluator = struct {
             else => return error.TypeMismatch,
         };
 
-        // Only support byte collections for now
-        if (coll_val != .coll_byte) return error.UnsupportedExpression;
-
-        const coll = coll_val.coll_byte;
+        // Get collection length based on type
+        const coll_len: usize = switch (coll_val) {
+            .coll_byte => |c| c.len,
+            .coll => |c| @as(usize, c.len),
+            else => return error.TypeMismatch,
+        };
 
         // Validate range (Scala semantics: clamp to bounds)
-        const len: i32 = @intCast(coll.len);
+        const len: i32 = @intCast(coll_len);
         const clamped_from = @max(0, @min(from, len));
         const clamped_until = @max(clamped_from, @min(until, len));
 
@@ -4299,13 +4556,107 @@ pub const Evaluator = struct {
         const cost = 20 + (result_len / 100) * 2;
         try self.addCost(@intCast(cost));
 
-        // Slice doesn't need allocation - just a view into original
-        const result = coll[start_idx..end_idx];
+        switch (coll_val) {
+            .coll_byte => |coll| {
+                // Slice doesn't need allocation - just a view into original
+                const result = coll[start_idx..end_idx];
+                assert(result.len == result_len);
+                try self.pushValue(.{ .coll_byte = result });
+            },
+            .coll => |c| {
+                // For generic collections, create a new reference with offset start
+                // Copy elements to new ValuePool location
+                const new_start: u16 = self.pools.values.count;
+                for (start_idx..end_idx) |i| {
+                    const elem = try self.getCollectionElementFromRef(c, @intCast(i));
+                    _ = try self.storeValueInPool(elem, c.elem_type);
+                }
+                try self.pushValue(.{ .coll = .{
+                    .elem_type = c.elem_type,
+                    .start = new_start,
+                    .len = @intCast(result_len),
+                } });
+            },
+            else => return error.TypeMismatch,
+        }
+    }
 
-        // POSTCONDITION: result length is correct
-        assert(result.len == result_len);
+    /// Compute LogicalAnd: Coll[Boolean] → Boolean (true iff all elements are true)
+    /// Returns true for empty collection (vacuous truth)
+    fn computeLogicalAnd(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
 
-        try self.pushValue(.{ .coll_byte = result });
+        const coll_val = try self.popValue();
+
+        // Get collection length and check type
+        const len: usize = switch (coll_val) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // Cost: base 10 + per-element
+        try self.addCost(10 + @as(u32, @intCast(len)));
+
+        // Empty collection: AND of nothing is true (vacuous truth)
+        if (len == 0) {
+            try self.pushValue(.{ .boolean = true });
+            return;
+        }
+
+        // Check all elements
+        for (0..len) |i| {
+            const elem = try self.getCollectionElement(coll_val, i);
+            if (elem != .boolean) return error.TypeMismatch;
+            if (!elem.boolean) {
+                // Found false: entire AND is false
+                try self.pushValue(.{ .boolean = false });
+                return;
+            }
+        }
+
+        // All true
+        try self.pushValue(.{ .boolean = true });
+    }
+
+    /// Compute LogicalOr: Coll[Boolean] → Boolean (true iff any element is true)
+    /// Returns false for empty collection
+    fn computeLogicalOr(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 1);
+
+        const coll_val = try self.popValue();
+
+        // Get collection length and check type
+        const len: usize = switch (coll_val) {
+            .coll_byte => |c| c.len,
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+
+        // Cost: base 10 + per-element
+        try self.addCost(10 + @as(u32, @intCast(len)));
+
+        // Empty collection: OR of nothing is false
+        if (len == 0) {
+            try self.pushValue(.{ .boolean = false });
+            return;
+        }
+
+        // Check all elements
+        for (0..len) |i| {
+            const elem = try self.getCollectionElement(coll_val, i);
+            if (elem != .boolean) return error.TypeMismatch;
+            if (elem.boolean) {
+                // Found true: entire OR is true
+                try self.pushValue(.{ .boolean = true });
+                return;
+            }
+        }
+
+        // All false
+        try self.pushValue(.{ .boolean = false });
     }
 
     // ========================================================================
@@ -4319,32 +4670,46 @@ pub const Evaluator = struct {
     /// correct scoping for subsequent evaluations. Uses errdefer pattern.
     fn computeApply(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
-        assert(self.value_sp > 0); // Argument must be on stack
+        assert(self.value_sp > 0); // At least argument must be on stack
         assert(node_idx < self.tree.node_count); // Node must be valid
 
         try self.addCost(FixedCost.func_apply);
 
-        // Pop the argument value
-        const arg_value = try self.popValue();
-
-        // Find the func_value node (immediately after apply)
+        // Find the func node (immediately after apply)
         const func_idx = node_idx + 1;
-        assert(func_idx < self.tree.node_count); // func_value must be in bounds
+        assert(func_idx < self.tree.node_count); // func must be in bounds
         const func_node = self.tree.nodes[func_idx];
 
-        // INVARIANT: func must be a func_value
-        if (func_node.tag != .func_value) return error.InvalidData;
+        // Determine function body and num_args based on whether inline or from variable
+        var body_idx: u16 = undefined;
+        var num_args: u8 = undefined;
+        var arg_value: Value = undefined;
 
-        const num_args = func_node.data;
+        if (func_node.tag == .func_value) {
+            // Inline function: stack has [arg]
+            arg_value = try self.popValue();
+            num_args = @truncate(func_node.data);
+            body_idx = func_idx + 1;
+        } else {
+            // Function from variable: stack has [func_ref, arg]
+            // func was evaluated first (pushed first), then arg (pushed second)
+            // Pop in reverse: arg first, then func_ref
+            arg_value = try self.popValue();
+            const func_ref_value = try self.popValue();
+            if (func_ref_value != .func_ref) return error.TypeMismatch;
+            const func_ref = func_ref_value.func_ref;
+            num_args = func_ref.num_args;
+            body_idx = func_ref.body_idx;
+        }
 
         // INVARIANT: Must have at least 1 argument
         if (num_args == 0) return error.InvalidData;
 
         // For v5.x, only single-arg functions are supported
-        if (num_args != 1) return error.UnsupportedExpression;
+        if (num_args != 1) {
+            return error.TypeMismatch;
+        }
 
-        // Find the lambda body (immediately after func_value node)
-        const body_idx = func_idx + 1;
         assert(body_idx < self.tree.node_count); // body must be in bounds
 
         // Find argument var_id by scanning body for val_use
@@ -6790,6 +7155,8 @@ pub const Evaluator = struct {
             // Token collections need dynamic type; fallback to unit
             .token_coll => TypePool.UNIT,
             .soft_fork_placeholder => TypePool.UNIT, // Placeholder
+            // Functions don't have a standard type in TypePool; fallback to unit
+            .func_ref => TypePool.UNIT,
         };
     }
 
@@ -8075,11 +8442,9 @@ pub const Evaluator = struct {
 
     /// Helper: get element from collection at index
     fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
-        _ = self;
         return switch (coll) {
             .coll_byte => |c| if (idx < c.len) .{ .byte = @bitCast(c[idx]) } else error.IndexOutOfBounds,
-            // Generic collections need value array access (not yet implemented)
-            .coll => return error.UnsupportedExpression,
+            .coll => |c| self.getCollectionElementFromRef(c, @intCast(idx)),
             else => error.TypeMismatch,
         };
     }

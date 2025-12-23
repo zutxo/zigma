@@ -262,6 +262,10 @@ fn valuesEqual(a: Value, b: Value) bool {
                 v.start == b.coll.start and
                 v.len == b.coll.len;
         },
+        .func_ref => |v| blk: {
+            if (b != .func_ref) break :blk false;
+            break :blk v.body_idx == b.func_ref.body_idx and v.num_args == b.func_ref.num_args;
+        },
     };
 }
 

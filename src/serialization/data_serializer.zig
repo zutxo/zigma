@@ -106,6 +106,9 @@ pub const Value = union(enum) {
     /// Conceptually equivalent to coll_byte but doesn't require heap/arena memory.
     hash32: [32]u8,
 
+    /// First-class function reference (lambda stored in variable)
+    func_ref: FuncRef,
+
     /// Placeholder for soft-fork unknown opcodes.
     /// When a script uses an opcode not supported by this node but the script
     /// version is higher than the activated version, we return this instead of
@@ -294,6 +297,19 @@ pub const Value = union(enum) {
         // Compile-time assertions
         comptime {
             assert(@sizeOf(TokenCollRef) <= 4);
+        }
+    };
+
+    /// First-class function reference (for functions stored in variables)
+    pub const FuncRef = struct {
+        /// Index of the function body in the expression tree
+        body_idx: u16,
+        /// Number of arguments the function takes
+        num_args: u8,
+
+        // Compile-time assertions
+        comptime {
+            assert(@sizeOf(FuncRef) <= 4);
         }
     };
 };
@@ -597,8 +613,8 @@ fn storeValueInPool(
         .tuple, .header, .pre_header, .sigma_prop, .unsigned_big_int, .box_coll, .token_coll, .avl_tree => {
             return error.NotSupported;
         },
-        // Soft-fork placeholder should not be stored in pool (internal-only)
-        .soft_fork_placeholder => {
+        // Soft-fork placeholder and func_ref should not be stored in pool (internal-only)
+        .soft_fork_placeholder, .func_ref => {
             return error.NotSupported;
         },
     };

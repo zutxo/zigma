@@ -203,6 +203,7 @@ fn valueTypeName(value: Value) []const u8 {
         .token_coll => "Coll[(Coll[Byte], Long)]",
         .hash32 => "Coll[Byte]",
         .soft_fork_placeholder => "SoftForkPlaceholder",
+        .func_ref => "SFunc",
     };
 }
 
@@ -769,5 +770,6 @@ fn printValueJson(value: Value, writer: anytype) !void {
             try writer.print("\"", .{});
         },
         .soft_fork_placeholder => try writer.print("\"<SoftForkPlaceholder>\"", .{}),
+        .func_ref => try writer.print("\"<Function>\"", .{}),
     }
 }

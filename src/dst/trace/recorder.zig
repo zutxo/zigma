@@ -372,6 +372,10 @@ fn hashValue(value: Value) u32 {
             hash = hash *% 31 +% v.start;
             hash = hash *% 31 +% v.len;
         },
+        .func_ref => |v| {
+            hash = v.body_idx;
+            hash = hash *% 31 +% v.num_args;
+        },
     }
 
     return hash;
