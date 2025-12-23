@@ -1468,11 +1468,21 @@ pub const Evaluator = struct {
                 try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
             },
 
+            .slice => {
+                // Ternary: collection, from, until → sliced collection
+                try self.pushWork(.{ .node_idx = node_idx, .phase = .compute });
+                const coll_idx = node_idx + 1;
+                const from_idx = self.findSubtreeEnd(coll_idx);
+                const until_idx = self.findSubtreeEnd(from_idx);
+                try self.pushWork(.{ .node_idx = until_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = from_idx, .phase = .evaluate });
+                try self.pushWork(.{ .node_idx = coll_idx, .phase = .evaluate });
+            },
+
             // Sigma operations - not yet implemented
             .prove_dlog,
             .prove_dh_tuple,
             .sigma_prop_bytes,
-            .slice,
             // Logical AND/OR on collections - unary: Coll[Boolean] → Boolean
             .logical_and,
             .logical_or,
@@ -1652,6 +1662,7 @@ pub const Evaluator = struct {
             .filter => try self.computeFilter(node_idx),
             .fold => try self.computeFold(node_idx),
             .flat_map => try self.computeFlatMap(node_idx),
+            .slice => try self.computeSlice(),
 
             // Sigma proposition connectives
             .sigma_and => try self.computeSigmaAnd(node.data),
@@ -4214,6 +4225,59 @@ pub const Evaluator = struct {
 
         // POSTCONDITION: All bytes were copied
         assert(offset == result_len);
+
+        try self.pushValue(.{ .coll_byte = result });
+    }
+
+    /// Compute Slice: extract sub-collection [from, until)
+    /// Stack: collection, from, until → sliced collection
+    fn computeSlice(self: *Evaluator) EvalError!void {
+        // PRECONDITIONS
+        assert(self.value_sp >= 3); // Need collection, from, until on stack
+
+        // Pop in reverse order (until, from, collection)
+        const until_val = try self.popValue();
+        const from_val = try self.popValue();
+        const coll_val = try self.popValue();
+
+        // Type checks
+        if (until_val != .int and until_val != .short) return error.TypeMismatch;
+        if (from_val != .int and from_val != .short) return error.TypeMismatch;
+
+        const until: i32 = switch (until_val) {
+            .int => |v| v,
+            .short => |v| @as(i32, v),
+            else => return error.TypeMismatch,
+        };
+        const from: i32 = switch (from_val) {
+            .int => |v| v,
+            .short => |v| @as(i32, v),
+            else => return error.TypeMismatch,
+        };
+
+        // Only support byte collections for now
+        if (coll_val != .coll_byte) return error.UnsupportedExpression;
+
+        const coll = coll_val.coll_byte;
+
+        // Validate range (Scala semantics: clamp to bounds)
+        const len: i32 = @intCast(coll.len);
+        const clamped_from = @max(0, @min(from, len));
+        const clamped_until = @max(clamped_from, @min(until, len));
+
+        const start_idx: usize = @intCast(clamped_from);
+        const end_idx: usize = @intCast(clamped_until);
+        const result_len = end_idx - start_idx;
+
+        // Cost: base 20 + (result_len / 100) * 2
+        const cost = 20 + (result_len / 100) * 2;
+        try self.addCost(@intCast(cost));
+
+        // Slice doesn't need allocation - just a view into original
+        const result = coll[start_idx..end_idx];
+
+        // POSTCONDITION: result length is correct
+        assert(result.len == result_len);
 
         try self.pushValue(.{ .coll_byte = result });
     }
