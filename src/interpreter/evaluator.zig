@@ -1695,8 +1695,10 @@ pub const Evaluator = struct {
             .sigma_and => try self.computeSigmaAnd(node.data),
             .sigma_or => try self.computeSigmaOr(node.data),
             .sigma_threshold => try self.computeSigmaThreshold(node.data),
-            // Binary sigma operations: TODO implement full sigma tree combination
-            .bin_and, .bin_or, .bin_xor => return error.UnsupportedExpression,
+            // Binary boolean operations (logical AND/OR/XOR on booleans)
+            .bin_and => try self.computeBinAnd(),
+            .bin_or => try self.computeBinOr(),
+            .bin_xor => try self.computeBinXor(),
 
             // Function application
             .apply => try self.computeApply(node_idx),
@@ -2008,6 +2010,63 @@ pub const Evaluator = struct {
         if (input != .boolean) return error.TypeMismatch;
 
         try self.pushValue(.{ .boolean = !input.boolean });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute binary boolean AND (BinAnd opcode)
+    /// Takes two boolean values from stack, returns their logical AND
+    fn computeBinAnd(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(36); // BinAnd cost from opcodes
+
+        const right = try self.popValue();
+        const left = try self.popValue();
+
+        if (left != .boolean or right != .boolean) return error.TypeMismatch;
+
+        try self.pushValue(.{ .boolean = left.boolean and right.boolean });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute binary boolean OR (BinOr opcode)
+    /// Takes two boolean values from stack, returns their logical OR
+    fn computeBinOr(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(36); // BinOr cost from opcodes
+
+        const right = try self.popValue();
+        const left = try self.popValue();
+
+        if (left != .boolean or right != .boolean) return error.TypeMismatch;
+
+        try self.pushValue(.{ .boolean = left.boolean or right.boolean });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute binary boolean XOR (BinXor opcode)
+    /// Takes two boolean values from stack, returns their logical XOR
+    fn computeBinXor(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has at least two values
+        assert(self.value_sp >= 2);
+
+        try self.addCost(36); // BinXor cost from opcodes
+
+        const right = try self.popValue();
+        const left = try self.popValue();
+
+        if (left != .boolean or right != .boolean) return error.TypeMismatch;
+
+        try self.pushValue(.{ .boolean = left.boolean != right.boolean });
 
         // POSTCONDITION: Result is on stack
         assert(self.value_sp > 0);
@@ -2932,8 +2991,25 @@ pub const Evaluator = struct {
             },
             .append => {
                 // collection ++ collection: concatenate
-                // TODO: Implement collection append
-                return error.UnsupportedExpression;
+                // Currently only supports Coll[Byte] ++ Coll[Byte]
+                if (left != .coll_byte or right != .coll_byte) {
+                    // Generic collection append not yet implemented
+                    return error.UnsupportedExpression;
+                }
+
+                const left_bytes = left.coll_byte;
+                const right_bytes = right.coll_byte;
+
+                const total_len = left_bytes.len + right_bytes.len;
+
+                // Allocate result in arena
+                const result_bytes = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+
+                // Copy left then right
+                @memcpy(result_bytes[0..left_bytes.len], left_bytes);
+                @memcpy(result_bytes[left_bytes.len..], right_bytes);
+
+                try self.pushValue(.{ .coll_byte = result_bytes });
             },
             .min => {
                 // min(a, b)
@@ -2946,9 +3022,31 @@ pub const Evaluator = struct {
                 try self.pushValue(if (cmp >= 0) left else right);
             },
             .xor_byte_array => {
-                // byte array XOR
-                // TODO: Implement byte array XOR
-                return error.UnsupportedExpression;
+                // byte array XOR: xor(left, right) → element-wise XOR of two byte arrays
+                // Both operands must be Coll[Byte] of same length
+                if (left != .coll_byte or right != .coll_byte) {
+                    return error.TypeMismatch;
+                }
+
+                const left_bytes = left.coll_byte;
+                const right_bytes = right.coll_byte;
+
+                // Arrays must have same length
+                if (left_bytes.len != right_bytes.len) {
+                    return error.TypeMismatch;
+                }
+
+                const len = left_bytes.len;
+
+                // Allocate result in arena
+                const result_bytes = self.arena.allocSlice(u8, len) catch return error.OutOfMemory;
+
+                // XOR element by element
+                for (0..len) |i| {
+                    result_bytes[i] = left_bytes[i] ^ right_bytes[i];
+                }
+
+                try self.pushValue(.{ .coll_byte = result_bytes });
             },
         }
 
