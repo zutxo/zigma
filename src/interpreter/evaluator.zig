@@ -277,6 +277,8 @@ pub const CostOp = enum(u8) {
     create_avl_tree,
     tree_lookup,
     extract_register,
+    get_encoded,
+    negate_group,
 };
 
 /// JIT cost table (v2+ mainnet, current default).
@@ -315,6 +317,8 @@ const JIT_COSTS = [_]u32{
     100, // create_avl_tree
     800, // tree_lookup
     50, // extract_register (from transformers.scala line 500)
+    250, // get_encoded (Scala GetEncodedCostKind = FixedCost(JitCost(250)))
+    45, // negate_group (Scala Negate_CostKind = FixedCost(JitCost(45)))
 };
 
 /// AOT cost table (pre-v2, legacy).
@@ -353,6 +357,8 @@ const AOT_COSTS = [_]u32{
     120, // create_avl_tree
     900, // tree_lookup
     60, // extract_register
+    300, // get_encoded
+    50, // negate_group
 };
 
 // Compile-time verification of cost table sizes
@@ -411,6 +417,8 @@ const FixedCost = struct {
     pub const create_avl_tree: u32 = JIT_COSTS[@intFromEnum(CostOp.create_avl_tree)];
     pub const tree_lookup: u32 = JIT_COSTS[@intFromEnum(CostOp.tree_lookup)];
     pub const extract_register: u32 = JIT_COSTS[@intFromEnum(CostOp.extract_register)];
+    pub const get_encoded: u32 = JIT_COSTS[@intFromEnum(CostOp.get_encoded)];
+    pub const negate_group: u32 = JIT_COSTS[@intFromEnum(CostOp.negate_group)];
 };
 
 /// PerItemCost - chunk-based cost model matching Scala's CostKind.PerItemCost.
@@ -2408,6 +2416,54 @@ pub const Evaluator = struct {
 
         // Perform point addition
         const result = crypto_ops.multiplyGroup(&left_bytes, &right_bytes) catch
+            return error.InvalidGroupElement;
+
+        try self.pushValue(.{ .group_element = result });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute GroupElement.getEncoded - return the 33-byte SEC1 compressed encoding
+    /// Reference: Scala SGroupElement.getEncoded / Rust GroupElement.get_encoded
+    fn computeGroupElementGetEncoded(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has GroupElement
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.get_encoded);
+
+        const ge_val = try self.popValue();
+        if (ge_val != .group_element) return error.TypeMismatch;
+
+        // INVARIANT: Value is a group element
+        assert(ge_val == .group_element);
+
+        // GroupElement is already stored as 33-byte compressed SEC1 encoding
+        // Just wrap it as Coll[Byte]
+        const encoded = ge_val.group_element;
+
+        try self.pushValue(.{ .coll_byte = &encoded });
+
+        // POSTCONDITION: Result is on stack
+        assert(self.value_sp > 0);
+    }
+
+    /// Compute GroupElement.negate - return the inverse point
+    /// Reference: Scala SGroupElement.negate / Rust GroupElement.negate
+    fn computeGroupElementNegate(self: *Evaluator) EvalError!void {
+        // PRECONDITION: Value stack has GroupElement
+        assert(self.value_sp > 0);
+
+        try self.addCost(FixedCost.negate_group);
+
+        const ge_val = try self.popValue();
+        if (ge_val != .group_element) return error.TypeMismatch;
+
+        // INVARIANT: Value is a group element
+        assert(ge_val == .group_element);
+
+        // Negate the point
+        const result = crypto_ops.negatePoint(&ge_val.group_element) catch
             return error.InvalidGroupElement;
 
         try self.pushValue(.{ .group_element = result });
@@ -4972,6 +5028,50 @@ pub const Evaluator = struct {
         }
     };
 
+    /// GroupElement type code from Scala SGroupElement
+    /// Reference: sigmastate-interpreter SGroupElement.scala
+    const GroupElementTypeCode: u8 = 7; // TYPE_CODE for GroupElement (0x07)
+
+    /// GroupElement method IDs from Scala SGroupElementMethods
+    /// Reference: sigmastate-interpreter methods.scala
+    const GroupElementMethodId = struct {
+        const get_encoded: u8 = 2; // ge.getEncoded → Coll[Byte] (33 bytes compressed)
+        const exp: u8 = 3; // ge.exp(k: BigInt) → GroupElement (already opcode)
+        const multiply: u8 = 4; // ge.multiply(other) → GroupElement (already opcode)
+        const negate: u8 = 5; // ge.negate → GroupElement
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ get_encoded, exp, multiply, negate };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("GroupElementMethodId collision detected");
+                }
+            }
+        }
+    };
+
+    /// SigmaProp type code from Scala SSigmaProp
+    /// Reference: sigmastate-interpreter SSigmaProp.scala
+    const SigmaPropTypeCode: u8 = 8; // TYPE_CODE for SigmaProp (0x08)
+
+    /// SigmaProp method IDs from Scala SSigmaPropMethods
+    /// Reference: sigmastate-interpreter methods.scala
+    const SigmaPropMethodId = struct {
+        const prop_bytes: u8 = 1; // sp.propBytes → Coll[Byte] (already opcode)
+        const is_proven: u8 = 2; // sp.isProven → Boolean (internal use only)
+
+        // Compile-time collision detection (ZIGMA_STYLE)
+        comptime {
+            const ids = [_]u8{ prop_bytes, is_proven };
+            for (ids, 0..) |id, i| {
+                for (ids[i + 1 ..]) |other| {
+                    if (id == other) @compileError("SigmaPropMethodId collision detected");
+                }
+            }
+        }
+    };
+
     /// Compute method call: dispatch based on type_code and method_id
     fn computeMethodCall(self: *Evaluator, node_idx: u16) EvalError!void {
         // PRECONDITIONS
@@ -5127,6 +5227,22 @@ pub const Evaluator = struct {
                 PreHeaderMethodId.height => try self.computePreHeaderHeight(),
                 PreHeaderMethodId.miner_pk => try self.computePreHeaderMinerPk(),
                 PreHeaderMethodId.votes => try self.computePreHeaderVotes(),
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == GroupElementTypeCode) {
+            // GroupElement methods
+            switch (method_id) {
+                GroupElementMethodId.get_encoded => try self.computeGroupElementGetEncoded(),
+                GroupElementMethodId.negate => try self.computeGroupElementNegate(),
+                // exp (id=3) and multiply (id=4) are handled as opcodes, not method calls
+                else => return self.handleUnsupported(),
+            }
+        } else if (type_code == SigmaPropTypeCode) {
+            // SigmaProp methods
+            switch (method_id) {
+                // propBytes (id=1) is already handled via sigma_prop_bytes opcode
+                // isProven (id=2) is for internal use only (frontend ErgoScript)
+                SigmaPropMethodId.prop_bytes => try self.computeSigmaPropBytes(),
                 else => return self.handleUnsupported(),
             }
         } else {

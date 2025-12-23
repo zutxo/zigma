@@ -175,6 +175,26 @@ pub fn multiplyGroup(point1_bytes: *const [33]u8, point2_bytes: *const [33]u8) G
     return result.encode();
 }
 
+/// Point negation: -point (inverse in the group)
+/// Input: GroupElement (33 bytes)
+/// Output: GroupElement (33 bytes)
+/// Reference: Scala SGroupElement.negate / Rust GroupElement.negate
+pub fn negatePoint(point_bytes: *const [33]u8) GroupOpError![group_element_size]u8 {
+    // Decode the point
+    const point = Point.decode(point_bytes) catch return error.InvalidPoint;
+
+    // INVARIANT: point is valid (on curve or infinity)
+    assert(point.is_infinity or point.isValid());
+
+    // Negate the point (-P has same x but negated y)
+    const result = point.neg();
+
+    // POSTCONDITION: result is valid (on curve or infinity)
+    assert(result.is_infinity or result.isValid());
+
+    return result.encode();
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
