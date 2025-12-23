@@ -2813,6 +2813,103 @@ pub const Evaluator = struct {
         assert(self.value_sp > 0);
     }
 
+    // ========================================================================
+    // Binary Operation Helpers
+    // ========================================================================
+
+    /// Index into collection (handles coll_byte, box_coll, token_coll)
+    fn binOpByIndex(self: *Evaluator, left: Value, idx: i32) EvalError!void {
+        if (idx < 0) return error.IndexOutOfBounds;
+
+        switch (left) {
+            .coll_byte => |arr| {
+                if (idx >= arr.len) return error.IndexOutOfBounds;
+                try self.pushValue(.{ .byte = @intCast(arr[@intCast(idx)]) });
+            },
+            .coll => |_| {
+                // Generic collection indexing requires ValuePool access
+                return error.UnsupportedExpression;
+            },
+            .box_coll => |bc| {
+                const boxes = switch (bc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (idx >= boxes.len) return error.IndexOutOfBounds;
+                try self.pushValue(.{ .box = .{
+                    .source = bc.source,
+                    .index = @intCast(idx),
+                } });
+            },
+            .token_coll => |tc| {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
+                const box = boxes[tc.box_index];
+                if (idx >= box.tokens.len) return error.IndexOutOfBounds;
+                const token = box.tokens[@intCast(idx)];
+
+                // Copy token id to arena
+                const token_id = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+                @memcpy(token_id, &token.id);
+
+                // Store tuple elements in values array
+                const start: u16 = @truncate(self.values_sp);
+                if (start + 2 > self.values.len) return error.OutOfMemory;
+
+                self.values[start] = .{ .coll_byte = token_id };
+                self.values[start + 1] = .{ .long = token.amount };
+                self.values_sp = start + 2;
+
+                try self.pushValue(.{
+                    .tuple = .{
+                        .start = start,
+                        .len = 2,
+                        .types = .{ 0, 0, 0, 0 },
+                        .values = .{ 0, 0, 0, 0 },
+                    },
+                });
+            },
+            else => return error.TypeMismatch,
+        }
+    }
+
+    /// Append two byte arrays
+    fn binOpAppend(self: *Evaluator, left: Value, right: Value) EvalError!void {
+        if (left != .coll_byte or right != .coll_byte) {
+            return error.UnsupportedExpression;
+        }
+        const left_bytes = left.coll_byte;
+        const right_bytes = right.coll_byte;
+        const total_len = left_bytes.len + right_bytes.len;
+        const result_bytes = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
+        @memcpy(result_bytes[0..left_bytes.len], left_bytes);
+        @memcpy(result_bytes[left_bytes.len..], right_bytes);
+        try self.pushValue(.{ .coll_byte = result_bytes });
+    }
+
+    /// XOR two byte arrays element-wise
+    fn binOpXorByteArray(self: *Evaluator, left: Value, right: Value) EvalError!void {
+        if (left != .coll_byte or right != .coll_byte) {
+            return error.TypeMismatch;
+        }
+        const left_bytes = left.coll_byte;
+        const right_bytes = right.coll_byte;
+        if (left_bytes.len != right_bytes.len) {
+            return error.TypeMismatch;
+        }
+        const len = left_bytes.len;
+        const result_bytes = self.arena.allocSlice(u8, len) catch return error.OutOfMemory;
+        for (0..len) |i| {
+            result_bytes[i] = left_bytes[i] ^ right_bytes[i];
+        }
+        try self.pushValue(.{ .coll_byte = result_bytes });
+    }
+
     /// Compute binary operation
     fn computeBinOp(self: *Evaluator, kind: BinOpKind) EvalError!void {
         // PRECONDITION: Need two operands on stack
@@ -2917,134 +3014,21 @@ pub const Evaluator = struct {
                 try self.pushValue(result);
             },
 
-            // Collection operations
+            // Collection operations - delegate to helpers
             .by_index => {
-                // collection[index]: get element at index
-                // Left is collection, right is index (Int)
                 if (right != .int) return error.TypeMismatch;
-                const idx = right.int;
-                if (idx < 0) return error.IndexOutOfBounds;
-
-                switch (left) {
-                    .coll_byte => |arr| {
-                        if (idx >= arr.len) return error.IndexOutOfBounds;
-                        try self.pushValue(.{ .byte = @intCast(arr[@intCast(idx)]) });
-                    },
-                    .coll => |_| {
-                        // Generic collection indexing requires ValuePool access
-                        // TODO: Implement when ValuePool is integrated
-                        return error.UnsupportedExpression;
-                    },
-                    .box_coll => |bc| {
-                        // Get box at index from inputs/outputs
-                        const boxes = switch (bc.source) {
-                            .inputs => self.ctx.inputs,
-                            .outputs => self.ctx.outputs,
-                            .data_inputs => self.ctx.data_inputs,
-                        };
-                        if (idx >= boxes.len) return error.IndexOutOfBounds;
-                        try self.pushValue(.{ .box = .{
-                            .source = bc.source,
-                            .index = @intCast(idx),
-                        } });
-                    },
-                    .token_coll => |tc| {
-                        // Get token at index from box's tokens collection
-                        // Returns tuple (Coll[Byte], Long) = (tokenId, amount)
-                        const boxes = switch (tc.source) {
-                            .inputs => self.ctx.inputs,
-                            .outputs => self.ctx.outputs,
-                            .data_inputs => self.ctx.data_inputs,
-                        };
-                        if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
-                        const box = boxes[tc.box_index];
-                        if (idx >= box.tokens.len) return error.IndexOutOfBounds;
-                        const token = box.tokens[@intCast(idx)];
-
-                        // Copy token id to arena
-                        const token_id = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
-                        @memcpy(token_id, &token.id);
-
-                        // Store tuple elements in values array
-                        const start: u16 = @truncate(self.values_sp);
-                        if (start + 2 > self.values.len) return error.OutOfMemory;
-
-                        self.values[start] = .{ .coll_byte = token_id };
-                        self.values[start + 1] = .{ .long = token.amount };
-                        self.values_sp = start + 2;
-
-                        // Return tuple (Coll[Byte], Long)
-                        try self.pushValue(.{
-                            .tuple = .{
-                                .start = start,
-                                .len = 2,
-                                .types = .{ 0, 0, 0, 0 }, // External storage
-                                .values = .{ 0, 0, 0, 0 }, // External storage
-                            },
-                        });
-                    },
-                    else => return error.TypeMismatch,
-                }
+                try self.binOpByIndex(left, right.int);
             },
-            .append => {
-                // collection ++ collection: concatenate
-                // Currently only supports Coll[Byte] ++ Coll[Byte]
-                if (left != .coll_byte or right != .coll_byte) {
-                    // Generic collection append not yet implemented
-                    return error.UnsupportedExpression;
-                }
-
-                const left_bytes = left.coll_byte;
-                const right_bytes = right.coll_byte;
-
-                const total_len = left_bytes.len + right_bytes.len;
-
-                // Allocate result in arena
-                const result_bytes = self.arena.allocSlice(u8, total_len) catch return error.OutOfMemory;
-
-                // Copy left then right
-                @memcpy(result_bytes[0..left_bytes.len], left_bytes);
-                @memcpy(result_bytes[left_bytes.len..], right_bytes);
-
-                try self.pushValue(.{ .coll_byte = result_bytes });
-            },
+            .append => try self.binOpAppend(left, right),
             .min => {
-                // min(a, b)
                 const cmp = try compareInts(left, right);
                 try self.pushValue(if (cmp <= 0) left else right);
             },
             .max => {
-                // max(a, b)
                 const cmp = try compareInts(left, right);
                 try self.pushValue(if (cmp >= 0) left else right);
             },
-            .xor_byte_array => {
-                // byte array XOR: xor(left, right) → element-wise XOR of two byte arrays
-                // Both operands must be Coll[Byte] of same length
-                if (left != .coll_byte or right != .coll_byte) {
-                    return error.TypeMismatch;
-                }
-
-                const left_bytes = left.coll_byte;
-                const right_bytes = right.coll_byte;
-
-                // Arrays must have same length
-                if (left_bytes.len != right_bytes.len) {
-                    return error.TypeMismatch;
-                }
-
-                const len = left_bytes.len;
-
-                // Allocate result in arena
-                const result_bytes = self.arena.allocSlice(u8, len) catch return error.OutOfMemory;
-
-                // XOR element by element
-                for (0..len) |i| {
-                    result_bytes[i] = left_bytes[i] ^ right_bytes[i];
-                }
-
-                try self.pushValue(.{ .coll_byte = result_bytes });
-            },
+            .xor_byte_array => try self.binOpXorByteArray(left, right),
         }
 
         // POSTCONDITION: Stack depth changed by -1 (popped 2, pushed 1)
