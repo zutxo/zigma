@@ -49,6 +49,13 @@ pub fn main() !void {
             return;
         }
         try hashCommand(args[2], args[3]);
+    } else if (std.mem.eql(u8, command, "eval-scenario")) {
+        if (args.len < 3) {
+            std.debug.print("Error: eval-scenario requires <file.json> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try evalScenarioCommand(args[2], allocator);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
     } else {
@@ -69,16 +76,18 @@ fn printUsage() void {
         \\Usage: zigma <command> [options]
         \\
         \\Commands:
-        \\  version            Print version information
-        \\  eval <hex>         Evaluate ErgoTree (hex-encoded)
-        \\    --height=<n>     Block height for context (default: 1000000)
-        \\  deserialize <hex>  Deserialize and display ErgoTree
+        \\  version                 Print version information
+        \\  eval <hex>              Evaluate ErgoTree (hex-encoded)
+        \\    --height=<n>          Block height for context (default: 1000000)
+        \\  eval-scenario <file>    Evaluate scenario from JSON file
+        \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
-        \\  help               Show this help message
+        \\  help                    Show this help message
         \\
         \\Examples:
         \\  zigma version
         \\  zigma eval 00d191a37300 --height=500000
+        \\  zigma eval-scenario scenario.json
         \\  zigma deserialize 00d191a37300
         \\  zigma hash blake2b256 616263
         \\
@@ -195,6 +204,441 @@ fn valueTypeName(value: Value) []const u8 {
         .hash32 => "Coll[Byte]",
         .soft_fork_placeholder => "SoftForkPlaceholder",
     };
+}
+
+fn evalScenarioCommand(path: []const u8, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Read the JSON file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"file_open_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+        return;
+    };
+    defer file.close();
+
+    const json_content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"file_read_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(json_content);
+
+    // Parse JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_content, .{}) catch |err| {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"json_parse_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+
+    // Extract height from version_context
+    var height: u32 = 1000000;
+    if (root.object.get("version_context")) |vc| {
+        if (vc.object.get("height")) |h| {
+            height = @intCast(h.integer);
+        }
+    }
+
+    // Get transaction object
+    const tx = root.object.get("transaction") orelse {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"missing_transaction\"\n}}\n", .{});
+        return;
+    };
+
+    // Parse inputs
+    const inputs_json = tx.object.get("inputs") orelse {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"missing_inputs\"\n}}\n", .{});
+        return;
+    };
+
+    // Build BoxViews from JSON
+    var inputs: [256]zigma.context.BoxView = undefined;
+    var input_count: usize = 0;
+
+    // Token storage (pre-allocated)
+    var all_tokens: [256 * 10]zigma.context.Token = undefined;
+    var token_idx: usize = 0;
+
+    // Proposition bytes storage (pre-allocated)
+    var prop_bytes_storage: [256 * 512]u8 = undefined;
+    var prop_bytes_idx: usize = 0;
+
+    // Register storage (pre-allocated)
+    var register_storage: [256 * 6 * 256]u8 = undefined;
+    var register_idx: usize = 0;
+
+    for (inputs_json.array.items) |input_obj| {
+        if (input_count >= 256) break;
+
+        const box = parseBoxFromJson(
+            input_obj,
+            &all_tokens,
+            &token_idx,
+            &prop_bytes_storage,
+            &prop_bytes_idx,
+            &register_storage,
+            &register_idx,
+        ) catch |err| {
+            try stdout.print("{{\n  \"success\": false,\n  \"error\": \"box_parse_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+            return;
+        };
+
+        inputs[input_count] = box;
+        input_count += 1;
+    }
+
+    if (input_count == 0) {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"no_inputs\"\n}}\n", .{});
+        return;
+    }
+
+    // Parse outputs
+    var outputs: [256]zigma.context.BoxView = undefined;
+    var output_count: usize = 0;
+
+    if (tx.object.get("outputs")) |outputs_json| {
+        for (outputs_json.array.items) |output_obj| {
+            if (output_count >= 256) break;
+
+            const box = parseBoxFromJson(
+                output_obj,
+                &all_tokens,
+                &token_idx,
+                &prop_bytes_storage,
+                &prop_bytes_idx,
+                &register_storage,
+                &register_idx,
+            ) catch |err| {
+                try stdout.print("{{\n  \"success\": false,\n  \"error\": \"output_parse_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+                return;
+            };
+
+            outputs[output_count] = box;
+            output_count += 1;
+        }
+    }
+
+    // Parse data_inputs
+    var data_inputs: [256]zigma.context.BoxView = undefined;
+    var data_input_count: usize = 0;
+
+    if (tx.object.get("data_inputs")) |data_inputs_json| {
+        for (data_inputs_json.array.items) |di_obj| {
+            if (data_input_count >= 256) break;
+
+            const box = parseBoxFromJson(
+                di_obj,
+                &all_tokens,
+                &token_idx,
+                &prop_bytes_storage,
+                &prop_bytes_idx,
+                &register_storage,
+                &register_idx,
+            ) catch |err| {
+                try stdout.print("{{\n  \"success\": false,\n  \"error\": \"data_input_parse_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+                return;
+            };
+
+            data_inputs[data_input_count] = box;
+            data_input_count += 1;
+        }
+    }
+
+    // Get ErgoTree from first input
+    const first_input = inputs_json.array.items[0];
+    const ergotree_hex = first_input.object.get("ergotree_hex") orelse {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"missing_ergotree_hex\"\n}}\n", .{});
+        return;
+    };
+
+    // Decode ErgoTree hex
+    var tree_bytes: [4096]u8 = undefined;
+    const decoded = std.fmt.hexToBytes(&tree_bytes, ergotree_hex.string) catch {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"invalid_ergotree_hex\"\n}}\n", .{});
+        return;
+    };
+
+    // Parse ErgoTree
+    var type_pool = TypePool.init();
+    var tree = ErgoTree.init(&type_pool);
+    var arena = BumpAllocator(4096).init();
+    ergotree.deserialize(&tree, decoded, &arena) catch |err| {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"parse_error\",\n  \"message\": \"{s}\"\n}}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Build context with full transaction
+    const ctx = Context{
+        .inputs = inputs[0..input_count],
+        .outputs = outputs[0..output_count],
+        .data_inputs = data_inputs[0..data_input_count],
+        .self_index = 0,
+        .height = height,
+        .headers = &[_]zigma.context.HeaderView{},
+        .pre_header = .{
+            .version = 2,
+            .parent_id = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .n_bits = 0,
+            .height = height,
+            .miner_pk = [_]u8{0} ** 33,
+            .votes = [_]u8{0} ** 3,
+        },
+        .context_vars = [_]?[]const u8{null} ** zigma.context.max_context_vars,
+        .extension_cache = null,
+    };
+
+    // Evaluate
+    var eval = Evaluator.init(&tree.expr_tree, &ctx);
+    const eval_result = eval.evaluate();
+
+    // Output result
+    const jit_cost = eval.cost_used;
+
+    if (eval_result) |raw_value| {
+        const value = reduceSigmaPropIfTrivial(raw_value);
+        try stdout.print("{{\n  \"success\": true,\n  \"result\": {{", .{});
+        try stdout.print("\n    \"type\": \"{s}\",", .{valueTypeName(value)});
+        try stdout.print("\n    \"value\": ", .{});
+        try printValueJson(value, stdout);
+        try stdout.print("\n  }},\n  \"cost\": {}\n}}\n", .{jit_cost});
+    } else |err| {
+        try stdout.print("{{\n  \"success\": false,\n  \"error\": \"{s}\",\n  \"cost\": {}\n}}\n", .{ @errorName(err), jit_cost });
+    }
+}
+
+fn parseBoxFromJson(
+    obj: std.json.Value,
+    all_tokens: *[256 * 10]zigma.context.Token,
+    token_idx: *usize,
+    prop_bytes_storage: *[256 * 512]u8,
+    prop_bytes_idx: *usize,
+    register_storage: *[256 * 6 * 256]u8,
+    register_idx: *usize,
+) !zigma.context.BoxView {
+    var box: zigma.context.BoxView = undefined;
+
+    // Parse box_id (32 bytes hex)
+    if (obj.object.get("box_id")) |id_val| {
+        _ = std.fmt.hexToBytes(&box.id, id_val.string) catch {
+            box.id = [_]u8{0} ** 32;
+        };
+    } else {
+        box.id = [_]u8{0} ** 32;
+    }
+
+    // Parse value (string to i64)
+    if (obj.object.get("value")) |val| {
+        box.value = switch (val) {
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+            .integer => |i| i,
+            else => 0,
+        };
+    } else {
+        box.value = 0;
+    }
+
+    // Parse creation_height
+    if (obj.object.get("creation_height")) |ch| {
+        box.creation_height = @intCast(ch.integer);
+    } else {
+        box.creation_height = 1;
+    }
+
+    // Parse ergotree_hex for proposition_bytes
+    if (obj.object.get("ergotree_hex")) |hex| {
+        const start = prop_bytes_idx.*;
+        const decoded = std.fmt.hexToBytes(prop_bytes_storage[start..], hex.string) catch {
+            // Default to TrueLeaf on parse error
+            box.proposition_bytes = &[_]u8{ 0x00, 0x7F };
+            return box;
+        };
+        box.proposition_bytes = decoded;
+        prop_bytes_idx.* += decoded.len;
+    } else {
+        box.proposition_bytes = &[_]u8{ 0x00, 0x7F }; // TrueLeaf default
+    }
+
+    // Parse tokens
+    const token_start = token_idx.*;
+    if (obj.object.get("tokens")) |tokens_arr| {
+        for (tokens_arr.array.items) |token_obj| {
+            if (token_idx.* >= all_tokens.len) break;
+
+            var token: zigma.context.Token = undefined;
+
+            if (token_obj.object.get("id")) |id| {
+                _ = std.fmt.hexToBytes(&token.id, id.string) catch {
+                    token.id = [_]u8{0} ** 32;
+                };
+            } else {
+                token.id = [_]u8{0} ** 32;
+            }
+
+            if (token_obj.object.get("amount")) |amt| {
+                token.amount = switch (amt) {
+                    .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+                    .integer => |i| i,
+                    else => 0,
+                };
+            } else {
+                token.amount = 0;
+            }
+
+            all_tokens[token_idx.*] = token;
+            token_idx.* += 1;
+        }
+    }
+    box.tokens = all_tokens[token_start..token_idx.*];
+
+    // Parse tx_id (default to zeros)
+    box.tx_id = [_]u8{0} ** 32;
+    box.index = 0;
+
+    // Parse registers (R4-R9 can be hex strings or {type_name, value} objects)
+    box.registers = [_]?[]const u8{null} ** 6;
+    if (obj.object.get("registers")) |regs| {
+        const reg_names = [6][]const u8{ "R4", "R5", "R6", "R7", "R8", "R9" };
+        for (reg_names, 0..) |reg_name, idx| {
+            if (regs.object.get(reg_name)) |reg_val| {
+                const start = register_idx.*;
+                switch (reg_val) {
+                    .string => |hex_str| {
+                        // Hex-encoded register value
+                        if (std.fmt.hexToBytes(register_storage[start..], hex_str)) |decoded| {
+                            box.registers[idx] = decoded;
+                            register_idx.* += decoded.len;
+                        } else |_| {}
+                    },
+                    .object => |obj_map| {
+                        // Structured register {type_name, value}
+                        if (obj_map.get("type_name")) |type_name_val| {
+                            const type_name = type_name_val.string;
+                            const value_field = obj_map.get("value");
+                            const encoded = encodeRegisterValue(type_name, value_field, register_storage[start..]);
+                            if (encoded.len > 0) {
+                                box.registers[idx] = register_storage[start .. start + encoded.len];
+                                register_idx.* += encoded.len;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    return box;
+}
+
+/// Encode a register value from JSON to binary format.
+/// Returns the encoded bytes (slice of output buffer).
+fn encodeRegisterValue(type_name: []const u8, value_opt: ?std.json.Value, output: []u8) []u8 {
+    if (value_opt == null) return output[0..0];
+    const value = value_opt.?;
+
+    // Type codes from Ergo serialization
+    const SByte: u8 = 0x01;
+    const SShort: u8 = 0x02;
+    const SInt: u8 = 0x04;
+    const SLong: u8 = 0x05;
+    const SBoolean: u8 = 0x01 | 0x80; // 0x81 for boolean
+    const SCollByte: u8 = 0x0C; // Coll[Byte]
+
+    // Simple integer types with VLQ ZigZag encoding
+    if (std.mem.eql(u8, type_name, "SByte")) {
+        const v: i8 = switch (value) {
+            .integer => |i| @truncate(i),
+            else => return output[0..0],
+        };
+        output[0] = SByte;
+        const zigzag: u8 = @bitCast((v << 1) ^ (v >> 7));
+        output[1] = zigzag;
+        return output[0..2];
+    }
+
+    if (std.mem.eql(u8, type_name, "SShort")) {
+        const v: i16 = switch (value) {
+            .integer => |i| @truncate(i),
+            else => return output[0..0],
+        };
+        output[0] = SShort;
+        const zigzag: u16 = @bitCast(@as(i16, v << 1) ^ @as(i16, v >> 15));
+        // VLQ encode
+        var len: usize = 1;
+        var val = zigzag;
+        while (val >= 0x80) : (val >>= 7) {
+            output[len] = @truncate((val & 0x7F) | 0x80);
+            len += 1;
+        }
+        output[len] = @truncate(val);
+        return output[0 .. len + 1];
+    }
+
+    if (std.mem.eql(u8, type_name, "SInt")) {
+        const v: i32 = switch (value) {
+            .integer => |i| @truncate(i),
+            else => return output[0..0],
+        };
+        output[0] = SInt;
+        const zigzag: u32 = @bitCast(@as(i32, v << 1) ^ @as(i32, v >> 31));
+        // VLQ encode
+        var len: usize = 1;
+        var val = zigzag;
+        while (val >= 0x80) : (val >>= 7) {
+            output[len] = @truncate((val & 0x7F) | 0x80);
+            len += 1;
+        }
+        output[len] = @truncate(val);
+        return output[0 .. len + 1];
+    }
+
+    if (std.mem.eql(u8, type_name, "SLong")) {
+        const v: i64 = switch (value) {
+            .integer => |i| i,
+            else => return output[0..0],
+        };
+        output[0] = SLong;
+        const zigzag: u64 = @bitCast(@as(i64, v << 1) ^ @as(i64, v >> 63));
+        // VLQ encode
+        var len: usize = 1;
+        var val = zigzag;
+        while (val >= 0x80) : (val >>= 7) {
+            output[len] = @truncate((val & 0x7F) | 0x80);
+            len += 1;
+        }
+        output[len] = @truncate(val);
+        return output[0 .. len + 1];
+    }
+
+    if (std.mem.eql(u8, type_name, "SBoolean")) {
+        output[0] = SBoolean;
+        output[1] = if (value.bool) 0x01 else 0x00;
+        return output[0..2];
+    }
+
+    // Coll[Byte] from hex string
+    if (std.mem.eql(u8, type_name, "Coll[SByte]") or std.mem.eql(u8, type_name, "Coll[Byte]")) {
+        const hex_str = switch (value) {
+            .string => |s| s,
+            else => return output[0..0],
+        };
+        output[0] = SCollByte;
+        const decoded = std.fmt.hexToBytes(output[2..], hex_str) catch return output[0..0];
+        // VLQ encode length
+        const coll_len = decoded.len;
+        if (coll_len < 0x80) {
+            output[1] = @truncate(coll_len);
+            // Shift bytes to make room for length
+            std.mem.copyBackwards(u8, output[2..], decoded);
+            return output[0 .. 2 + coll_len];
+        }
+        // For longer collections, need multi-byte VLQ
+        return output[0..0]; // Simplified for now
+    }
+
+    // Unsupported type
+    return output[0..0];
 }
 
 fn hashCommand(algorithm: []const u8, hex: []const u8) !void {
