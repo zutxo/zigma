@@ -11895,3 +11895,48 @@ test "evaluator: metrics null by default" {
     const result = try eval.evaluate();
     try std.testing.expectEqual(Value{ .boolean = true }, result);
 }
+
+test "evaluator: proveDHTuple produces correct sigma bytes" {
+    // Generator point G (compressed SEC1)
+    const G = [_]u8{
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62,
+        0x95, 0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28,
+        0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98,
+    };
+
+    // Build tree: proveDHTuple(const0, const1, const2, const3)
+    var tree = ExprTree.init();
+    tree.nodes[0] = .{ .tag = .prove_dh_tuple };
+    // 4 group element constants
+    tree.nodes[1] = .{ .tag = .constant_placeholder, .data = 0 };
+    tree.nodes[2] = .{ .tag = .constant_placeholder, .data = 1 };
+    tree.nodes[3] = .{ .tag = .constant_placeholder, .data = 2 };
+    tree.nodes[4] = .{ .tag = .constant_placeholder, .data = 3 };
+    tree.node_count = 5;
+
+    // All 4 constants are generator G
+    tree.constants[0] = .{ .group_element = G };
+    tree.constants[1] = .{ .group_element = G };
+    tree.constants[2] = .{ .group_element = G };
+    tree.constants[3] = .{ .group_element = G };
+    tree.constant_count = 4;
+
+    const test_inputs = [_]context.BoxView{context.testBox()};
+    var ctx = Context.forHeight(100, &test_inputs);
+
+    var eval = Evaluator.init(&tree, &ctx);
+    eval.cost_limit = 10000;
+
+    const result = try eval.evaluate();
+    try std.testing.expect(result == .sigma_prop);
+
+    const sigma_data = result.sigma_prop.data;
+
+    // Expected: 0xCE + 4×G = 133 bytes
+    try std.testing.expectEqual(@as(usize, 133), sigma_data.len);
+    try std.testing.expectEqual(@as(u8, 0xCE), sigma_data[0]); // ProveDHTuple opcode
+    try std.testing.expectEqualSlices(u8, &G, sigma_data[1..34]); // g
+    try std.testing.expectEqualSlices(u8, &G, sigma_data[34..67]); // h
+    try std.testing.expectEqualSlices(u8, &G, sigma_data[67..100]); // u
+    try std.testing.expectEqualSlices(u8, &G, sigma_data[100..133]); // v
+}
