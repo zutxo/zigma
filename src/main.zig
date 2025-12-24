@@ -15,10 +15,12 @@ const hash = zigma.hash;
 const pipeline = zigma.pipeline;
 const sigma_tree = zigma.sigma_tree;
 const private_input = zigma.private_input;
+const prover_mod = zigma.prover;
 const SigmaBoolean = sigma_tree.SigmaBoolean;
 const ProveDlog = sigma_tree.ProveDlog;
 const PrivateInput = private_input.PrivateInput;
 const DlogProverInput = private_input.DlogProverInput;
+const Prover = prover_mod.Prover;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -65,6 +67,13 @@ pub fn main() !void {
             return;
         }
         try evalScenarioCommand(args[2], allocator);
+    } else if (std.mem.eql(u8, command, "sign-tx")) {
+        if (args.len < 3) {
+            std.debug.print("Error: sign-tx requires <file.json> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try signTxCommand(args[2], args[3..], allocator);
     } else if (std.mem.eql(u8, command, "prove")) {
         if (args.len < 3) {
             std.debug.print("Error: prove requires <public_key_hex> argument\n", .{});
@@ -103,6 +112,9 @@ fn printUsage() void {
         \\  eval <hex>              Evaluate ErgoTree (hex-encoded)
         \\    --height=<n>          Block height for context (default: 1000000)
         \\  eval-scenario <file>    Evaluate scenario from JSON file
+        \\  sign-tx <file>          Sign transaction inputs from JSON file
+        \\    --secrets=<hex,...>   Comma-separated secret keys (32 bytes each)
+        \\    --message=<hex>       Transaction bytes to sign (hex)
         \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
         \\  prove <pk_hex>          Generate Schnorr proof for ProveDlog
@@ -117,6 +129,7 @@ fn printUsage() void {
         \\  zigma version
         \\  zigma eval 00d191a37300 --height=500000
         \\  zigma eval-scenario scenario.json
+        \\  zigma sign-tx tx.json --secrets=abc...,def... --message=deadbeef
         \\  zigma deserialize 00d191a37300
         \\  zigma hash blake2b256 616263
         \\  zigma prove 03... --secret=abc123... --message=deadbeef
@@ -960,4 +973,290 @@ fn verifyCommand(pk_hex: []const u8, extra_args: []const []const u8) !void {
     };
 
     try stdout.print("{{\"success\": true, \"valid\": {}, \"cost\": {}}}\n", .{ verify_result.valid, verify_result.cost });
+}
+
+/// Sign transaction command: Generate proofs for all inputs in a transaction
+/// Usage: zigma sign-tx <file.json> --secrets=<hex,...> --message=<hex>
+fn signTxCommand(path: []const u8, extra_args: []const []const u8, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse required arguments
+    var secrets_hex: ?[]const u8 = null;
+    var message_hex: ?[]const u8 = null;
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--secrets=")) {
+            secrets_hex = arg["--secrets=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--message=")) {
+            message_hex = arg["--message=".len..];
+        }
+    }
+
+    if (secrets_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_secrets\", \"message\": \"--secrets=<hex,...> required\"}}\n", .{});
+        return;
+    }
+
+    if (message_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_message\", \"message\": \"--message=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    // Decode message (transaction bytes to sign)
+    var message_bytes: [8192]u8 = undefined;
+    const message = std.fmt.hexToBytes(&message_bytes, message_hex.?) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_message_hex\"}}\n", .{});
+        return;
+    };
+
+    // Parse secrets (comma-separated hex strings)
+    var secrets: [16]PrivateInput = undefined;
+    var secret_count: usize = 0;
+
+    var secret_iter = std.mem.splitScalar(u8, secrets_hex.?, ',');
+    while (secret_iter.next()) |secret_hex| {
+        if (secret_count >= 16) {
+            try stdout.print("{{\"success\": false, \"error\": \"too_many_secrets\", \"message\": \"max 16 secrets\"}}\n", .{});
+            return;
+        }
+
+        var secret_bytes: [32]u8 = undefined;
+        if (std.fmt.hexToBytes(&secret_bytes, secret_hex)) |decoded| {
+            if (decoded.len != 32) {
+                try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_length\", \"message\": \"secret {} must be 32 bytes\"}}\n", .{secret_count});
+                return;
+            }
+        } else |_| {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_hex\", \"message\": \"secret {} invalid hex\"}}\n", .{secret_count});
+            return;
+        }
+
+        const dlog_input = DlogProverInput.init(secret_bytes) catch {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_key\", \"message\": \"secret {} invalid\"}}\n", .{secret_count});
+            return;
+        };
+
+        secrets[secret_count] = .{ .dlog = dlog_input };
+        secret_count += 1;
+    }
+
+    if (secret_count == 0) {
+        try stdout.print("{{\"success\": false, \"error\": \"no_secrets\"}}\n", .{});
+        return;
+    }
+
+    // Read the JSON file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"file_open_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer file.close();
+
+    const json_content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"file_read_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(json_content);
+
+    // Parse JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_content, .{}) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"json_parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+
+    // Extract height from version_context
+    var height: u32 = 1000000;
+    if (root.object.get("version_context")) |vc| {
+        if (vc.object.get("height")) |h| {
+            height = @intCast(h.integer);
+        }
+    }
+
+    // Get transaction object
+    const tx = root.object.get("transaction") orelse {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_transaction\"}}\n", .{});
+        return;
+    };
+
+    // Parse inputs
+    const inputs_json = tx.object.get("inputs") orelse {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_inputs\"}}\n", .{});
+        return;
+    };
+
+    // Pre-allocated storage (same as eval-scenario)
+    var inputs: [256]zigma.context.BoxView = undefined;
+    var input_count: usize = 0;
+    var all_tokens: [256 * 10]zigma.context.Token = undefined;
+    var token_idx: usize = 0;
+    var prop_bytes_storage: [256 * 512]u8 = undefined;
+    var prop_bytes_idx: usize = 0;
+    var register_storage: [256 * 6 * 256]u8 = undefined;
+    var register_idx: usize = 0;
+
+    for (inputs_json.array.items) |input_obj| {
+        if (input_count >= 256) break;
+
+        const box = parseBoxFromJson(
+            input_obj,
+            &all_tokens,
+            &token_idx,
+            &prop_bytes_storage,
+            &prop_bytes_idx,
+            &register_storage,
+            &register_idx,
+        ) catch |err| {
+            try stdout.print("{{\"success\": false, \"error\": \"box_parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+            return;
+        };
+
+        inputs[input_count] = box;
+        input_count += 1;
+    }
+
+    if (input_count == 0) {
+        try stdout.print("{{\"success\": false, \"error\": \"no_inputs\"}}\n", .{});
+        return;
+    }
+
+    // Parse outputs
+    var outputs: [256]zigma.context.BoxView = undefined;
+    var output_count: usize = 0;
+
+    if (tx.object.get("outputs")) |outputs_json| {
+        for (outputs_json.array.items) |output_obj| {
+            if (output_count >= 256) break;
+
+            const box = parseBoxFromJson(
+                output_obj,
+                &all_tokens,
+                &token_idx,
+                &prop_bytes_storage,
+                &prop_bytes_idx,
+                &register_storage,
+                &register_idx,
+            ) catch |err| {
+                try stdout.print("{{\"success\": false, \"error\": \"output_parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+                return;
+            };
+
+            outputs[output_count] = box;
+            output_count += 1;
+        }
+    }
+
+    // Parse data_inputs
+    var data_inputs: [256]zigma.context.BoxView = undefined;
+    var data_input_count: usize = 0;
+
+    if (tx.object.get("data_inputs")) |data_inputs_json| {
+        for (data_inputs_json.array.items) |di_obj| {
+            if (data_input_count >= 256) break;
+
+            const box = parseBoxFromJson(
+                di_obj,
+                &all_tokens,
+                &token_idx,
+                &prop_bytes_storage,
+                &prop_bytes_idx,
+                &register_storage,
+                &register_idx,
+            ) catch |err| {
+                try stdout.print("{{\"success\": false, \"error\": \"data_input_parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+                return;
+            };
+
+            data_inputs[data_input_count] = box;
+            data_input_count += 1;
+        }
+    }
+
+    // Output JSON start
+    try stdout.print("{{\"success\": true, \"proofs\": [\n", .{});
+
+    // Generate proof for each input
+    var total_cost: u64 = 0;
+
+    for (0..input_count) |i| {
+        // Get ErgoTree from input
+        const input_obj = inputs_json.array.items[i];
+        const ergotree_hex = input_obj.object.get("ergotree_hex") orelse {
+            try stdout.print("  {{\"input\": {}, \"error\": \"missing_ergotree_hex\"}}", .{i});
+            if (i < input_count - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            continue;
+        };
+
+        // Decode ErgoTree
+        var tree_bytes: [4096]u8 = undefined;
+        const decoded = std.fmt.hexToBytes(&tree_bytes, ergotree_hex.string) catch {
+            try stdout.print("  {{\"input\": {}, \"error\": \"invalid_ergotree_hex\"}}", .{i});
+            if (i < input_count - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            continue;
+        };
+
+        // Parse ErgoTree
+        var type_pool = TypePool.init();
+        var tree = ErgoTree.init(&type_pool);
+        var arena = BumpAllocator(4096).init();
+        ergotree.deserialize(&tree, decoded, &arena) catch |err| {
+            try stdout.print("  {{\"input\": {}, \"error\": \"parse_error\", \"message\": \"{s}\"}}", .{ i, @errorName(err) });
+            if (i < input_count - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            continue;
+        };
+
+        // Build context for this input
+        const ctx = Context{
+            .inputs = inputs[0..input_count],
+            .outputs = outputs[0..output_count],
+            .data_inputs = data_inputs[0..data_input_count],
+            .self_index = @intCast(i),
+            .height = height,
+            .headers = &[_]zigma.context.HeaderView{},
+            .pre_header = .{
+                .version = 2,
+                .parent_id = [_]u8{0} ** 32,
+                .timestamp = 0,
+                .n_bits = 0,
+                .height = height,
+                .miner_pk = [_]u8{0} ** 33,
+                .votes = [_]u8{0} ** 3,
+            },
+            .context_vars = [_]?[]const u8{null} ** zigma.context.max_context_vars,
+            .extension_cache = null,
+        };
+
+        // Create evaluator and generate proof
+        var eval = Evaluator.init(&tree.expr_tree, &ctx);
+
+        const prove_result = pipeline.reduceAndProve(
+            &eval,
+            secrets[0..secret_count],
+            message,
+            pipeline.DEFAULT_COST_LIMIT,
+        ) catch |err| {
+            try stdout.print("  {{\"input\": {}, \"error\": \"proving_failed\", \"message\": \"{s}\"}}", .{ i, @errorName(err) });
+            if (i < input_count - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            continue;
+        };
+
+        total_cost += prove_result.cost;
+
+        // Output proof as hex
+        try stdout.print("  {{\"input\": {}, \"proof\": \"", .{i});
+        for (prove_result.proofSlice()) |b| {
+            try stdout.print("{x:0>2}", .{b});
+        }
+        try stdout.print("\", \"proof_len\": {}, \"cost\": {}}}", .{ prove_result.proof_len, prove_result.cost });
+        if (i < input_count - 1) try stdout.print(",", .{});
+        try stdout.print("\n", .{});
+    }
+
+    try stdout.print("], \"total_cost\": {}}}\n", .{total_cost});
 }
