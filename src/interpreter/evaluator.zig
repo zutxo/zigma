@@ -8448,7 +8448,8 @@ pub const Evaluator = struct {
     }
 
     /// Parse SigmaBoolean from serialized bytes (convenience wrapper)
-    fn parseSigmaBoolean(self: *Evaluator, bytes: []const u8) EvalError!*const sigma_tree.SigmaBoolean {
+    /// Made public for use by reducer.zig
+    pub fn parseSigmaBoolean(self: *Evaluator, bytes: []const u8) EvalError!*const sigma_tree.SigmaBoolean {
         const result = try self.parseSigmaBooleanWithLen(bytes);
         return result.node;
     }

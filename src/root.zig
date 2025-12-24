@@ -48,6 +48,9 @@ pub const context_extension_cache = @import("interpreter/context_extension_cache
 /// Expression evaluator
 pub const evaluator = @import("interpreter/evaluator.zig");
 
+/// ErgoTree reduction (expression → SigmaBoolean)
+pub const reducer = @import("interpreter/reducer.zig");
+
 /// Modular operations (arithmetic, comparison, logical)
 pub const ops = @import("interpreter/ops.zig");
 
@@ -94,6 +97,7 @@ comptime {
     _ = context;
     _ = context_extension_cache;
     _ = evaluator;
+    _ = reducer;
     _ = ops;
     _ = hash;
     _ = bigint;
