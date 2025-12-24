@@ -345,13 +345,62 @@ test "pipeline: prove and verify ProveDlog" {
 }
 
 test "pipeline: prove and verify AND" {
-    // TODO: Fix compound proposition verification (see issue tracking)
-    return error.SkipZigTest;
+    const DlogProverInput = private_input.DlogProverInput;
+
+    // Create two secrets
+    var secret1: [32]u8 = [_]u8{0} ** 32;
+    secret1[31] = 1;
+    var secret2: [32]u8 = [_]u8{0} ** 32;
+    secret2[31] = 2;
+
+    const dlog1 = try DlogProverInput.init(secret1);
+    const dlog2 = try DlogProverInput.init(secret2);
+    const pk1 = dlog1.publicImage();
+    const pk2 = dlog2.publicImage();
+
+    // Create AND proposition
+    const child1 = SigmaBoolean{ .prove_dlog = pk1 };
+    const child2 = SigmaBoolean{ .prove_dlog = pk2 };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cand = .{ .children = &children } };
+
+    // Prove with both secrets
+    const message = "and test";
+    const secrets = [_]PrivateInput{ .{ .dlog = dlog1 }, .{ .dlog = dlog2 } };
+    const prove_result = try prove(prop, &secrets, message);
+
+    // Verify
+    const verify_result = try verify(prop, prove_result.proofSlice(), message);
+    try std.testing.expect(verify_result.valid);
 }
 
 test "pipeline: prove OR with one secret" {
-    // TODO: Fix compound proposition verification (see issue tracking)
-    return error.SkipZigTest;
+    const DlogProverInput = private_input.DlogProverInput;
+
+    // Create two secrets but only use one
+    var secret1: [32]u8 = [_]u8{0} ** 32;
+    secret1[31] = 10;
+    var secret2: [32]u8 = [_]u8{0} ** 32;
+    secret2[31] = 20;
+
+    const dlog1 = try DlogProverInput.init(secret1);
+    const dlog2 = try DlogProverInput.init(secret2);
+    const pk1 = dlog1.publicImage();
+    const pk2 = dlog2.publicImage();
+
+    // Create OR proposition
+    const child1 = SigmaBoolean{ .prove_dlog = pk1 };
+    const child2 = SigmaBoolean{ .prove_dlog = pk2 };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cor = .{ .children = &children } };
+
+    // Prove with only first secret
+    const message = "or test";
+    const prove_result = try prove(prop, &[_]PrivateInput{.{ .dlog = dlog1 }}, message);
+
+    // Verify
+    const verify_result = try verify(prop, prove_result.proofSlice(), message);
+    try std.testing.expect(verify_result.valid);
 }
 
 test "pipeline: trivial true needs no proof" {

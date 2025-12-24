@@ -587,15 +587,17 @@ pub const Prover = struct {
                     buffer[pos] = @intFromEnum(conj_type);
                     pos += 1;
 
-                    // For threshold, also write k
+                    // Write number of children as big-endian i16 (matches verifier)
+                    const count_i16: i16 = @intCast(children.len);
+                    buffer[pos] = @intCast((count_i16 >> 8) & 0xFF);
+                    buffer[pos + 1] = @intCast(count_i16 & 0xFF);
+                    pos += 2;
+
+                    // For threshold, write k after children count (matches verifier)
                     if (conj == .cthreshold) {
                         buffer[pos] = conj.cthreshold.k;
                         pos += 1;
                     }
-
-                    // Write number of children
-                    buffer[pos] = @intCast(children.len);
-                    pos += 1;
 
                     // Push children onto stack (in reverse order)
                     var i: usize = children.len;
@@ -1173,20 +1175,112 @@ test "Prover-Verifier: wrong message fails verification" {
 }
 
 test "Prover-Verifier: AND(pk1, pk2) roundtrip with both secrets" {
-    // TODO: Fix compound proposition verification - Fiat-Shamir mismatch
-    // between prover and verifier for AND/OR/THRESHOLD nodes.
-    // Single ProveDlog roundtrip works correctly.
-    return error.SkipZigTest;
+    const verifier = @import("verifier.zig");
+
+    // Create two secrets
+    var secret1: [32]u8 = [_]u8{0} ** 32;
+    secret1[31] = 1;
+    var secret2: [32]u8 = [_]u8{0} ** 32;
+    secret2[31] = 2;
+
+    const dlog1 = try DlogProverInput.init(secret1);
+    const dlog2 = try DlogProverInput.init(secret2);
+    const pk1 = dlog1.publicImage();
+    const pk2 = dlog2.publicImage();
+
+    // Create prover with both secrets
+    var prover = Prover.initWithSeed(&[_]PrivateInput{
+        .{ .dlog = dlog1 },
+        .{ .dlog = dlog2 },
+    }, 12345);
+
+    // Create proposition: AND(pk1, pk2)
+    const child1 = SigmaBoolean{ .prove_dlog = pk1 };
+    const child2 = SigmaBoolean{ .prove_dlog = pk2 };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cand = .{ .children = &children } };
+
+    // Generate proof
+    const message = "test message for AND";
+    const proof = try prover.prove(prop, message);
+
+    // Verify the proof
+    const is_valid = try verifier.verifySignature(prop, proof.toSlice(), message);
+    try std.testing.expect(is_valid);
 }
 
 test "Prover-Verifier: OR(pk1, pk2) roundtrip with one secret" {
-    // TODO: Fix compound proposition verification - Fiat-Shamir mismatch
-    return error.SkipZigTest;
+    const verifier = @import("verifier.zig");
+
+    // Create two secrets but only use one
+    var secret1: [32]u8 = [_]u8{0} ** 32;
+    secret1[31] = 10;
+    var secret2: [32]u8 = [_]u8{0} ** 32;
+    secret2[31] = 20;
+
+    const dlog1 = try DlogProverInput.init(secret1);
+    const dlog2 = try DlogProverInput.init(secret2);
+    const pk1 = dlog1.publicImage();
+    const pk2 = dlog2.publicImage();
+
+    // Create prover with only first secret
+    var prover = Prover.initWithSeed(&[_]PrivateInput{
+        .{ .dlog = dlog1 },
+    }, 54321);
+
+    // Create proposition: OR(pk1, pk2)
+    const child1 = SigmaBoolean{ .prove_dlog = pk1 };
+    const child2 = SigmaBoolean{ .prove_dlog = pk2 };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cor = .{ .children = &children } };
+
+    // Generate proof (only have secret for pk1)
+    const message = "test message for OR";
+    const proof = try prover.prove(prop, message);
+
+    // Verify the proof
+    const is_valid = try verifier.verifySignature(prop, proof.toSlice(), message);
+    try std.testing.expect(is_valid);
 }
 
 test "Prover-Verifier: THRESHOLD(2, [pk1, pk2, pk3]) roundtrip with 2 secrets" {
-    // TODO: Fix compound proposition verification - Fiat-Shamir mismatch
-    return error.SkipZigTest;
+    const verifier = @import("verifier.zig");
+
+    // Create three secrets but only use two
+    var secret1: [32]u8 = [_]u8{0} ** 32;
+    secret1[31] = 100;
+    var secret2: [32]u8 = [_]u8{0} ** 32;
+    secret2[31] = 101;
+    var secret3: [32]u8 = [_]u8{0} ** 32;
+    secret3[31] = 102;
+
+    const dlog1 = try DlogProverInput.init(secret1);
+    const dlog2 = try DlogProverInput.init(secret2);
+    const dlog3 = try DlogProverInput.init(secret3);
+    const pk1 = dlog1.publicImage();
+    const pk2 = dlog2.publicImage();
+    const pk3 = dlog3.publicImage();
+
+    // Create prover with first two secrets (need 2 of 3)
+    var prover = Prover.initWithSeed(&[_]PrivateInput{
+        .{ .dlog = dlog1 },
+        .{ .dlog = dlog2 },
+    }, 99999);
+
+    // Create proposition: THRESHOLD(2, [pk1, pk2, pk3])
+    const child1 = SigmaBoolean{ .prove_dlog = pk1 };
+    const child2 = SigmaBoolean{ .prove_dlog = pk2 };
+    const child3 = SigmaBoolean{ .prove_dlog = pk3 };
+    const children = [_]*const SigmaBoolean{ &child1, &child2, &child3 };
+    const prop = SigmaBoolean{ .cthreshold = .{ .k = 2, .children = &children } };
+
+    // Generate proof (have 2 of 3 secrets)
+    const message = "test message for THRESHOLD";
+    const proof = try prover.prove(prop, message);
+
+    // Verify the proof
+    const is_valid = try verifier.verifySignature(prop, proof.toSlice(), message);
+    try std.testing.expect(is_valid);
 }
 
 test "Prover-Verifier: AND fails without all secrets" {
