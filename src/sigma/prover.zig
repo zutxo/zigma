@@ -145,8 +145,8 @@ pub const Prover = struct {
     work_stack: [MAX_TREE_DEPTH * MAX_CHILDREN]WorkItem,
     work_sp: u16,
 
-    /// Unproven tree being processed
-    tree: ?UnprovenTree,
+    /// Pre-allocated node pool for UnprovenTree
+    ctx: unproven_tree.ProverContext,
 
     /// Initialize prover with secrets
     pub fn init(secrets: []const PrivateInput) Prover {
@@ -158,7 +158,7 @@ pub const Prover = struct {
             .rng_state = .{ 0x853c49e6748fea9b, 0xda3e39cb94b95bdb }, // Default seed
             .work_stack = undefined,
             .work_sp = 0,
-            .tree = null,
+            .ctx = .{},
         };
 
         for (secrets, 0..) |s, i| {
@@ -175,6 +175,12 @@ pub const Prover = struct {
         prover.rng_state[0] = seed ^ 0x853c49e6748fea9b;
         prover.rng_state[1] = (seed *% 0x5851f42d4c957f2d) ^ 0xda3e39cb94b95bdb;
         return prover;
+    }
+
+    /// Reset context for reuse (O(1))
+    pub fn reset(self: *Prover) void {
+        self.ctx.reset();
+        self.work_sp = 0;
     }
 
     /// Generate random scalar using xorshift128+
@@ -256,27 +262,18 @@ pub const Prover = struct {
                             // Push self for compute phase, then children
                             self.pushWork(.{ .node = work.node, .phase = .compute });
 
+                            // Get children slice based on conjecture type
+                            const children: []UnprovenTree = switch (conj.*) {
+                                .cand => |*c| c.children,
+                                .cor => |*c| c.children,
+                                .cthreshold => |*c| c.children,
+                            };
+
                             // Push children in reverse order (so first child is processed first)
-                            var i: usize = conj.childCount();
+                            var i: usize = children.len;
                             while (i > 0) {
                                 i -= 1;
-                                switch (conj.*) {
-                                    .cand => |*c| {
-                                        if (c.children[i]) |*child| {
-                                            self.pushWork(.{ .node = child, .phase = .descend });
-                                        }
-                                    },
-                                    .cor => |*c| {
-                                        if (c.children[i]) |*child| {
-                                            self.pushWork(.{ .node = child, .phase = .descend });
-                                        }
-                                    },
-                                    .cthreshold => |*c| {
-                                        if (c.children[i]) |*child| {
-                                            self.pushWork(.{ .node = child, .phase = .descend });
-                                        }
-                                    },
-                                }
+                                self.pushWork(.{ .node = &children[i], .phase = .descend });
                             }
                         },
                     }
@@ -287,9 +284,9 @@ pub const Prover = struct {
                         .leaf => {}, // Already handled in descend
                         .conjecture => |*conj| {
                             const is_real = switch (conj.*) {
-                                .cand => |c| self.allChildrenReal(&c),
-                                .cor => |c| self.anyChildReal(&c),
-                                .cthreshold => |c| self.kChildrenReal(&c),
+                                .cand => |c| self.allChildrenReal(c.children),
+                                .cor => |c| self.anyChildReal(c.children),
+                                .cthreshold => |c| self.kChildrenReal(c.children, c.k),
                             };
                             work.node.* = work.node.withSimulated(!is_real);
                         },
@@ -299,35 +296,29 @@ pub const Prover = struct {
         }
     }
 
-    fn allChildrenReal(self: *const Prover, cand: *const CandUnproven) bool {
+    fn allChildrenReal(self: *const Prover, children: []const UnprovenTree) bool {
         _ = self;
-        for (cand.children[0..cand.child_count]) |maybe_child| {
-            if (maybe_child) |child| {
-                if (child.simulated()) return false;
-            }
+        for (children) |child| {
+            if (child.simulated()) return false;
         }
         return true;
     }
 
-    fn anyChildReal(self: *const Prover, cor: *const CorUnproven) bool {
+    fn anyChildReal(self: *const Prover, children: []const UnprovenTree) bool {
         _ = self;
-        for (cor.children[0..cor.child_count]) |maybe_child| {
-            if (maybe_child) |child| {
-                if (child.isReal()) return true;
-            }
+        for (children) |child| {
+            if (child.isReal()) return true;
         }
         return false;
     }
 
-    fn kChildrenReal(self: *const Prover, ct: *const CthresholdUnproven) bool {
+    fn kChildrenReal(self: *const Prover, children: []const UnprovenTree, k: u8) bool {
         _ = self;
         var real_count: u8 = 0;
-        for (ct.children[0..ct.child_count]) |maybe_child| {
-            if (maybe_child) |child| {
-                if (child.isReal()) {
-                    real_count += 1;
-                    if (real_count >= ct.k) return true;
-                }
+        for (children) |child| {
+            if (child.isReal()) {
+                real_count += 1;
+                if (real_count >= k) return true;
             }
         }
         return false;
@@ -353,43 +344,37 @@ pub const Prover = struct {
                     switch (conj.*) {
                         .cand => |*c| {
                             // AND: recurse into children
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
+                            for (c.children) |*child| {
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                         .cor => |*c| {
                             // OR: keep only ONE real child, make rest simulated
                             var found_real = false;
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    if (child.isReal()) {
-                                        if (found_real) {
-                                            // Already found one real, make this simulated
-                                            child.* = child.withSimulated(true);
-                                        } else {
-                                            found_real = true;
-                                        }
+                            for (c.children) |*child| {
+                                if (child.isReal()) {
+                                    if (found_real) {
+                                        // Already found one real, make this simulated
+                                        child.* = child.withSimulated(true);
+                                    } else {
+                                        found_real = true;
                                     }
-                                    self.pushWork(.{ .node = child, .phase = .descend });
                                 }
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                         .cthreshold => |*c| {
                             // THRESHOLD(k,n): keep only k real children
                             var real_count: u8 = 0;
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    if (child.isReal()) {
-                                        real_count += 1;
-                                        if (real_count > c.k) {
-                                            // Exceeded k, make this simulated
-                                            child.* = child.withSimulated(true);
-                                        }
+                            for (c.children) |*child| {
+                                if (child.isReal()) {
+                                    real_count += 1;
+                                    if (real_count > c.k) {
+                                        // Exceeded k, make this simulated
+                                        child.* = child.withSimulated(true);
                                     }
-                                    self.pushWork(.{ .node = child, .phase = .descend });
                                 }
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                     }
@@ -446,28 +431,18 @@ pub const Prover = struct {
                     }
                 },
                 .conjecture => |*conj| {
-                    // Process children first
-                    const child_count = conj.childCount();
-                    var i: usize = child_count;
+                    // Get children slice based on conjecture type
+                    const children: []UnprovenTree = switch (conj.*) {
+                        .cand => |*c| c.children,
+                        .cor => |*c| c.children,
+                        .cthreshold => |*c| c.children,
+                    };
+
+                    // Process children in reverse order
+                    var i: usize = children.len;
                     while (i > 0) {
                         i -= 1;
-                        switch (conj.*) {
-                            .cand => |*c| {
-                                if (c.children[i]) |*child| {
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
-                            },
-                            .cor => |*c| {
-                                if (c.children[i]) |*child| {
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
-                            },
-                            .cthreshold => |*c| {
-                                if (c.children[i]) |*child| {
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
-                            },
-                        }
+                        self.pushWork(.{ .node = &children[i], .phase = .descend });
                     }
                 },
             }
@@ -568,10 +543,10 @@ pub const Prover = struct {
                         .cor => .or_connective,
                         .cthreshold => .threshold,
                     };
-                    const child_count: u8 = switch (conj) {
-                        .cand => |c| c.child_count,
-                        .cor => |c| c.child_count,
-                        .cthreshold => |c| c.child_count,
+                    const children: []const UnprovenTree = switch (conj) {
+                        .cand => |c| c.children,
+                        .cor => |c| c.children,
+                        .cthreshold => |c| c.children,
                     };
 
                     buffer[pos] = @intFromEnum(conj_type);
@@ -584,23 +559,16 @@ pub const Prover = struct {
                     }
 
                     // Write number of children
-                    buffer[pos] = child_count;
+                    buffer[pos] = @intCast(children.len);
                     pos += 1;
 
                     // Push children onto stack (in reverse order)
-                    var i: usize = child_count;
+                    var i: usize = children.len;
                     while (i > 0) {
                         i -= 1;
-                        const maybe_child = switch (conj) {
-                            .cand => |c| c.children[i],
-                            .cor => |c| c.children[i],
-                            .cthreshold => |c| c.children[i],
-                        };
-                        if (maybe_child) |*child| {
-                            if (sp >= MAX_TREE_DEPTH) return error.TreeTooDeep;
-                            stack[sp] = .{ .node = child, .child_idx = 0 };
-                            sp += 1;
-                        }
+                        if (sp >= MAX_TREE_DEPTH) return error.TreeTooDeep;
+                        stack[sp] = .{ .node = &children[i], .child_idx = 0 };
+                        sp += 1;
                     }
                 },
             }
@@ -684,11 +652,9 @@ pub const Prover = struct {
                     switch (conj.*) {
                         .cand => |*c| {
                             // AND: all children get same challenge as parent
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    child.* = child.withChallenge(parent_challenge);
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
+                            for (c.children) |*child| {
+                                child.* = child.withChallenge(parent_challenge);
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                         .cor => |*c| {
@@ -697,14 +663,12 @@ pub const Prover = struct {
                             var simulated_xor = Challenge.zero;
                             var real_child: ?*UnprovenTree = null;
 
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    if (child.simulated()) {
-                                        const child_challenge = child.challenge() orelse return error.ChallengeFailed;
-                                        simulated_xor = simulated_xor.xor(child_challenge);
-                                    } else {
-                                        real_child = child;
-                                    }
+                            for (c.children) |*child| {
+                                if (child.simulated()) {
+                                    const child_challenge = child.challenge() orelse return error.ChallengeFailed;
+                                    simulated_xor = simulated_xor.xor(child_challenge);
+                                } else {
+                                    real_child = child;
                                 }
                             }
 
@@ -714,10 +678,8 @@ pub const Prover = struct {
                             }
 
                             // Push all children for processing
-                            for (c.children[0..c.child_count]) |*maybe_child| {
-                                if (maybe_child.*) |*child| {
-                                    self.pushWork(.{ .node = child, .phase = .descend });
-                                }
+                            for (c.children) |*child| {
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                         .cthreshold => |*c| {
@@ -732,14 +694,12 @@ pub const Prover = struct {
                             var sim_values: [MAX_CHILDREN]Gf2_192 = undefined;
                             var sim_count: usize = 0;
 
-                            for (c.children[0..c.child_count], 0..) |maybe_child, idx| {
-                                if (maybe_child) |child| {
-                                    if (child.simulated()) {
-                                        const ch = child.challenge() orelse return error.ChallengeFailed;
-                                        sim_points[sim_count] = @intCast(idx + 1); // 1-indexed
-                                        sim_values[sim_count] = Gf2_192.fromChallenge(ch);
-                                        sim_count += 1;
-                                    }
+                            for (c.children, 0..) |child, idx| {
+                                if (child.simulated()) {
+                                    const ch = child.challenge() orelse return error.ChallengeFailed;
+                                    sim_points[sim_count] = @intCast(idx + 1); // 1-indexed
+                                    sim_values[sim_count] = Gf2_192.fromChallenge(ch);
+                                    sim_count += 1;
                                 }
                             }
 
@@ -753,22 +713,20 @@ pub const Prover = struct {
 
                             // Store polynomial for serialization
                             const poly_bytes = poly.toBytes();
-                            const n_coeff = c.child_count - c.k;
+                            const n_coeff: usize = c.children.len - c.k;
                             const coeff_bytes = n_coeff * SOUNDNESS_BYTES;
                             var poly_storage: [MAX_CHILDREN * SOUNDNESS_BYTES]u8 = [_]u8{0} ** (MAX_CHILDREN * SOUNDNESS_BYTES);
                             @memcpy(poly_storage[0..coeff_bytes], poly_bytes[0..coeff_bytes]);
                             c.polynomial_opt = poly_storage;
 
                             // Assign challenges to real children by evaluating polynomial
-                            for (c.children[0..c.child_count], 0..) |*maybe_child, idx| {
-                                if (maybe_child.*) |*child| {
-                                    if (!child.simulated()) {
-                                        // Real child: evaluate Q at x = idx+1
-                                        const child_ch = poly.evaluate(@intCast(idx + 1)).toChallenge();
-                                        child.* = child.withChallenge(child_ch);
-                                    }
-                                    self.pushWork(.{ .node = child, .phase = .descend });
+                            for (c.children, 0..) |*child, idx| {
+                                if (!child.simulated()) {
+                                    // Real child: evaluate Q at x = idx+1
+                                    const child_ch = poly.evaluate(@intCast(idx + 1)).toChallenge();
+                                    child.* = child.withChallenge(child_ch);
                                 }
+                                self.pushWork(.{ .node = child, .phase = .descend });
                             }
                         },
                     }
@@ -783,6 +741,9 @@ pub const Prover = struct {
 
     /// Prove a SigmaBoolean proposition
     pub fn prove(self: *Prover, proposition: SigmaBoolean, message: []const u8) ProverError!Proof {
+        // Reset context for this proof
+        self.reset();
+
         // Handle trivial cases
         switch (proposition) {
             .trivial_true => {
@@ -796,9 +757,9 @@ pub const Prover = struct {
             else => {},
         }
 
-        // Convert to UnprovenTree
-        var tree = unproven_tree.convertToUnproven(proposition);
-        self.tree = tree;
+        // Convert to UnprovenTree using pre-allocated context
+        var tree = unproven_tree.convertToUnproven(&self.ctx, proposition) catch
+            return error.TreeTooDeep;
 
         // Step 1: Mark real nodes
         self.markReal(&tree);
@@ -885,43 +846,35 @@ pub const Prover = struct {
                 switch (conj) {
                     .cand => |c| {
                         // AND: children don't write their challenges (they inherit parent's)
-                        for (c.children[0..c.child_count]) |maybe_child| {
-                            if (maybe_child) |*child| {
-                                pos = try self.serializeNode(child, buffer, pos, false);
-                            }
+                        for (c.children) |*child| {
+                            pos = try self.serializeNode(child, buffer, pos, false);
                         }
                     },
                     .cor => |c| {
                         // OR: all children except last write their challenges
                         // Last child's challenge is computed via XOR by verifier
-                        if (c.child_count > 0) {
+                        if (c.children.len > 0) {
                             // Write all but last with challenge
-                            for (c.children[0 .. c.child_count - 1]) |maybe_child| {
-                                if (maybe_child) |*child| {
-                                    pos = try self.serializeNode(child, buffer, pos, true);
-                                }
+                            for (c.children[0 .. c.children.len - 1]) |*child| {
+                                pos = try self.serializeNode(child, buffer, pos, true);
                             }
                             // Write last without challenge
-                            if (c.children[c.child_count - 1]) |*last_child| {
-                                pos = try self.serializeNode(last_child, buffer, pos, false);
-                            }
+                            pos = try self.serializeNode(&c.children[c.children.len - 1], buffer, pos, false);
                         }
                     },
                     .cthreshold => |c| {
                         // THRESHOLD: write polynomial coefficients first, then children (no challenges)
                         // Polynomial has (n-k) coefficients (excluding degree-0 which is the challenge)
                         if (c.polynomial_opt) |poly| {
-                            const n_coeff = c.child_count - c.k;
+                            const n_coeff: usize = c.children.len - c.k;
                             const poly_bytes = n_coeff * SOUNDNESS_BYTES;
                             if (pos + poly_bytes > buffer.len) return error.BufferTooSmall;
                             @memcpy(buffer[pos .. pos + poly_bytes], poly[0..poly_bytes]);
                             pos += poly_bytes;
                         }
                         // Children don't write challenges (computed from polynomial)
-                        for (c.children[0..c.child_count]) |maybe_child| {
-                            if (maybe_child) |*child| {
-                                pos = try self.serializeNode(child, buffer, pos, false);
-                            }
+                        for (c.children) |*child| {
+                            pos = try self.serializeNode(child, buffer, pos, false);
                         }
                     },
                 }

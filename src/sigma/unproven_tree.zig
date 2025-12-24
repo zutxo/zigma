@@ -24,6 +24,46 @@ const Challenge = challenge_mod.Challenge;
 pub const SOUNDNESS_BYTES = challenge_mod.SOUNDNESS_BYTES;
 pub const SCALAR_SIZE = 32;
 pub const MAX_CHILDREN = 16;
+pub const MAX_TREE_NODES: u16 = 512;
+
+// ============================================================================
+// ProverContext - Pre-allocated Node Pool
+// ============================================================================
+
+/// Pre-allocated proving context for UnprovenTree nodes.
+/// Follows TigerBeetle-style pattern: no dynamic allocation during proving.
+pub const ProverContext = struct {
+    /// Pre-allocated node storage
+    tree_nodes: [MAX_TREE_NODES]UnprovenTree = undefined,
+    /// Number of nodes allocated
+    node_count: u16 = 0,
+
+    /// Allocate space for tree nodes from pre-allocated pool.
+    /// Returns a slice into the pool for storing child nodes.
+    pub fn allocateNodes(self: *ProverContext, count: u16) error{TreeTooLarge}![]UnprovenTree {
+        // PRECONDITION: Request is bounded
+        assert(count <= MAX_CHILDREN);
+        // PRECONDITION: Current count is valid
+        assert(self.node_count <= MAX_TREE_NODES);
+
+        if (self.node_count + count > MAX_TREE_NODES) {
+            return error.TreeTooLarge;
+        }
+
+        const start = self.node_count;
+        self.node_count += count;
+
+        // POSTCONDITION: Returned slice has requested size
+        const result = self.tree_nodes[start..self.node_count];
+        assert(result.len == count);
+        return result;
+    }
+
+    /// Reset for reuse (O(1), no memory zeroing)
+    pub fn reset(self: *ProverContext) void {
+        self.node_count = 0;
+    }
+};
 
 // ============================================================================
 // First Prover Messages (Commitments)
@@ -240,10 +280,8 @@ pub const UnprovenLeaf = union(enum) {
 
 /// Unproven AND node
 pub const CandUnproven = struct {
-    /// Children (pointers into node pool)
-    children: [MAX_CHILDREN]?*UnprovenTree,
-    /// Number of children
-    child_count: u8,
+    /// Children (slice into ProverContext pool)
+    children: []UnprovenTree,
     /// Challenge assigned to this node
     challenge_opt: ?Challenge,
     /// True if simulated
@@ -268,16 +306,14 @@ pub const CandUnproven = struct {
     }
 
     pub fn childCount(self: CandUnproven) u8 {
-        return self.child_count;
+        return @intCast(self.children.len);
     }
 };
 
 /// Unproven OR node
 pub const CorUnproven = struct {
-    /// Children (pointers into node pool)
-    children: [MAX_CHILDREN]?*UnprovenTree,
-    /// Number of children
-    child_count: u8,
+    /// Children (slice into ProverContext pool)
+    children: []UnprovenTree,
     /// Challenge assigned to this node
     challenge_opt: ?Challenge,
     /// True if simulated
@@ -302,7 +338,7 @@ pub const CorUnproven = struct {
     }
 
     pub fn childCount(self: CorUnproven) u8 {
-        return self.child_count;
+        return @intCast(self.children.len);
     }
 };
 
@@ -310,10 +346,8 @@ pub const CorUnproven = struct {
 pub const CthresholdUnproven = struct {
     /// Required number of children to prove
     k: u8,
-    /// Children (pointers into node pool)
-    children: [MAX_CHILDREN]?*UnprovenTree,
-    /// Number of children
-    child_count: u8,
+    /// Children (slice into ProverContext pool)
+    children: []UnprovenTree,
     /// Challenge assigned to this node
     challenge_opt: ?Challenge,
     /// Polynomial for challenge distribution (THRESHOLD specific)
@@ -340,7 +374,7 @@ pub const CthresholdUnproven = struct {
     }
 
     pub fn childCount(self: CthresholdUnproven) u8 {
-        return self.child_count;
+        return @intCast(self.children.len);
     }
 };
 
@@ -404,9 +438,9 @@ pub const UnprovenConjecture = union(enum) {
 
     pub fn childCount(self: UnprovenConjecture) u8 {
         return switch (self) {
-            .cand => |c| c.child_count,
-            .cor => |c| c.child_count,
-            .cthreshold => |c| c.child_count,
+            .cand => |c| @intCast(c.children.len),
+            .cor => |c| @intCast(c.children.len),
+            .cthreshold => |c| @intCast(c.children.len),
         };
     }
 };
@@ -471,13 +505,23 @@ pub const UnprovenTree = union(enum) {
 // Conversion from SigmaBoolean
 // ============================================================================
 
-/// Convert SigmaBoolean to UnprovenTree
-/// All nodes start as simulated (not marked real yet)
-pub fn convertToUnproven(sb: SigmaBoolean) UnprovenTree {
-    return convertToUnprovenWithPosition(sb, NodePosition.ROOT);
+/// Convert SigmaBoolean to UnprovenTree using ProverContext for allocation.
+/// All nodes start as simulated (not marked real yet).
+/// Returns error if tree is too large for the pre-allocated pool.
+pub fn convertToUnproven(ctx: *ProverContext, sb: SigmaBoolean) error{TreeTooLarge}!UnprovenTree {
+    return convertToUnprovenWithPosition(ctx, sb, NodePosition.ROOT);
 }
 
-fn convertToUnprovenWithPosition(sb: SigmaBoolean, pos: NodePosition) UnprovenTree {
+fn convertToUnprovenWithPosition(
+    ctx: *ProverContext,
+    sb: SigmaBoolean,
+    pos: NodePosition,
+) error{TreeTooLarge}!UnprovenTree {
+    // PRECONDITION: context has valid state
+    assert(ctx.node_count <= MAX_TREE_NODES);
+    // PRECONDITION: position depth is valid
+    assert(pos.depth < 32);
+
     return switch (sb) {
         .trivial_true, .trivial_false => unreachable, // Should be handled before
         .prove_dlog => |prop| .{
@@ -507,45 +551,74 @@ fn convertToUnprovenWithPosition(sb: SigmaBoolean, pos: NodePosition) UnprovenTr
             },
         },
         .and_node => |children| blk: {
-            var cand = CandUnproven{
-                .children = [_]?UnprovenTree{null} ** MAX_CHILDREN,
-                .child_count = @intCast(children.len),
-                .challenge_opt = null,
-                .simulated = true,
-                .position = pos,
-            };
+            // Allocate children from pool
+            const child_slice = try ctx.allocateNodes(@intCast(children.len));
+
+            // Convert each child recursively
             for (children, 0..) |child, i| {
-                cand.children[i] = convertToUnprovenWithPosition(child, pos.child(@intCast(i)));
+                child_slice[i] = try convertToUnprovenWithPosition(
+                    ctx,
+                    child.*,
+                    pos.child(@intCast(i)),
+                );
             }
-            break :blk .{ .conjecture = .{ .cand = cand } };
+
+            break :blk .{
+                .conjecture = .{
+                    .cand = .{
+                        .children = child_slice,
+                        .challenge_opt = null,
+                        .simulated = true,
+                        .position = pos,
+                    },
+                },
+            };
         },
         .or_node => |children| blk: {
-            var cor = CorUnproven{
-                .children = [_]?UnprovenTree{null} ** MAX_CHILDREN,
-                .child_count = @intCast(children.len),
-                .challenge_opt = null,
-                .simulated = true,
-                .position = pos,
-            };
+            const child_slice = try ctx.allocateNodes(@intCast(children.len));
+
             for (children, 0..) |child, i| {
-                cor.children[i] = convertToUnprovenWithPosition(child, pos.child(@intCast(i)));
+                child_slice[i] = try convertToUnprovenWithPosition(
+                    ctx,
+                    child.*,
+                    pos.child(@intCast(i)),
+                );
             }
-            break :blk .{ .conjecture = .{ .cor = cor } };
+
+            break :blk .{
+                .conjecture = .{
+                    .cor = .{
+                        .children = child_slice,
+                        .challenge_opt = null,
+                        .simulated = true,
+                        .position = pos,
+                    },
+                },
+            };
         },
         .threshold => |t| blk: {
-            var ct = CthresholdUnproven{
-                .k = t.k,
-                .children = [_]?UnprovenTree{null} ** MAX_CHILDREN,
-                .child_count = @intCast(t.children.len),
-                .challenge_opt = null,
-                .polynomial_opt = null,
-                .simulated = true,
-                .position = pos,
-            };
+            const child_slice = try ctx.allocateNodes(@intCast(t.children.len));
+
             for (t.children, 0..) |child, i| {
-                ct.children[i] = convertToUnprovenWithPosition(child, pos.child(@intCast(i)));
+                child_slice[i] = try convertToUnprovenWithPosition(
+                    ctx,
+                    child.*,
+                    pos.child(@intCast(i)),
+                );
             }
-            break :blk .{ .conjecture = .{ .cthreshold = ct } };
+
+            break :blk .{
+                .conjecture = .{
+                    .cthreshold = .{
+                        .k = t.k,
+                        .children = child_slice,
+                        .challenge_opt = null,
+                        .polynomial_opt = null,
+                        .simulated = true,
+                        .position = pos,
+                    },
+                },
+            };
         },
     };
 }
@@ -572,12 +645,40 @@ test "NodePosition: child positions" {
     try std.testing.expectEqual(@as(u8, 5), grandchild.path[1]);
 }
 
+test "ProverContext: allocateNodes respects bounds" {
+    var ctx = ProverContext{};
+
+    // Allocate some nodes
+    const slice1 = try ctx.allocateNodes(5);
+    try std.testing.expectEqual(@as(usize, 5), slice1.len);
+    try std.testing.expectEqual(@as(u16, 5), ctx.node_count);
+
+    // Allocate more
+    const slice2 = try ctx.allocateNodes(3);
+    try std.testing.expectEqual(@as(usize, 3), slice2.len);
+    try std.testing.expectEqual(@as(u16, 8), ctx.node_count);
+
+    // Reset
+    ctx.reset();
+    try std.testing.expectEqual(@as(u16, 0), ctx.node_count);
+}
+
+test "ProverContext: rejects overflow" {
+    var ctx = ProverContext{};
+    ctx.node_count = MAX_TREE_NODES - 1;
+
+    // Should fail - only 1 slot left but requesting 5
+    const result = ctx.allocateNodes(5);
+    try std.testing.expectError(error.TreeTooLarge, result);
+}
+
 test "UnprovenTree: convert from ProveDlog" {
     const pk = [_]u8{0x02} ++ [_]u8{0xAB} ** 32;
     const prop = ProveDlog.init(pk);
     const sb = SigmaBoolean{ .prove_dlog = prop };
 
-    const tree = convertToUnproven(sb);
+    var ctx = ProverContext{};
+    const tree = try convertToUnproven(&ctx, sb);
     try std.testing.expect(tree == .leaf);
     try std.testing.expect(tree.leaf == .schnorr);
     try std.testing.expect(tree.simulated()); // Default is simulated
