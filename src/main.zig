@@ -11,6 +11,15 @@ const TypePool = zigma.TypePool;
 const BumpAllocator = zigma.memory.BumpAllocator;
 const hash = zigma.hash;
 
+// Sigma protocol imports
+const pipeline = zigma.pipeline;
+const sigma_tree = zigma.sigma_tree;
+const private_input = zigma.private_input;
+const SigmaBoolean = sigma_tree.SigmaBoolean;
+const ProveDlog = sigma_tree.ProveDlog;
+const PrivateInput = private_input.PrivateInput;
+const DlogProverInput = private_input.DlogProverInput;
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -56,6 +65,20 @@ pub fn main() !void {
             return;
         }
         try evalScenarioCommand(args[2], allocator);
+    } else if (std.mem.eql(u8, command, "prove")) {
+        if (args.len < 3) {
+            std.debug.print("Error: prove requires <public_key_hex> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try proveCommand(args[2], args[3..]);
+    } else if (std.mem.eql(u8, command, "verify")) {
+        if (args.len < 3) {
+            std.debug.print("Error: verify requires <public_key_hex> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try verifyCommand(args[2], args[3..]);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         printUsage();
     } else {
@@ -82,6 +105,12 @@ fn printUsage() void {
         \\  eval-scenario <file>    Evaluate scenario from JSON file
         \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
+        \\  prove <pk_hex>          Generate Schnorr proof for ProveDlog
+        \\    --secret=<hex>        Secret key (32 bytes hex)
+        \\    --message=<hex>       Message to sign (hex)
+        \\  verify <pk_hex>         Verify Schnorr proof for ProveDlog
+        \\    --proof=<hex>         Proof bytes (hex)
+        \\    --message=<hex>       Message that was signed (hex)
         \\  help                    Show this help message
         \\
         \\Examples:
@@ -90,6 +119,8 @@ fn printUsage() void {
         \\  zigma eval-scenario scenario.json
         \\  zigma deserialize 00d191a37300
         \\  zigma hash blake2b256 616263
+        \\  zigma prove 03... --secret=abc123... --message=deadbeef
+        \\  zigma verify 03... --proof=abc... --message=deadbeef
         \\
     , .{}) catch {};
 }
@@ -772,4 +803,161 @@ fn printValueJson(value: Value, writer: anytype) !void {
         .soft_fork_placeholder => try writer.print("\"<SoftForkPlaceholder>\"", .{}),
         .func_ref => try writer.print("\"<Function>\"", .{}),
     }
+}
+
+// ============================================================================
+// Sigma Protocol Commands
+// ============================================================================
+
+/// Prove command: Generate a Schnorr proof for a ProveDlog proposition
+/// Usage: zigma prove <pk_hex> --secret=<hex> --message=<hex>
+fn proveCommand(pk_hex: []const u8, extra_args: []const []const u8) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse required arguments
+    var secret_hex: ?[]const u8 = null;
+    var message_hex: ?[]const u8 = null;
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--secret=")) {
+            secret_hex = arg["--secret=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--message=")) {
+            message_hex = arg["--message=".len..];
+        }
+    }
+
+    if (secret_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_secret\", \"message\": \"--secret=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    if (message_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_message\", \"message\": \"--message=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    // Decode public key (33 bytes compressed)
+    var pk_bytes: [33]u8 = undefined;
+    if (std.fmt.hexToBytes(&pk_bytes, pk_hex)) |decoded| {
+        if (decoded.len != 33) {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_pk_length\", \"message\": \"public key must be 33 bytes\"}}\n", .{});
+            return;
+        }
+    } else |_| {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_pk_hex\"}}\n", .{});
+        return;
+    }
+
+    // Decode secret key (32 bytes)
+    var secret_bytes: [32]u8 = undefined;
+    if (std.fmt.hexToBytes(&secret_bytes, secret_hex.?)) |decoded| {
+        if (decoded.len != 32) {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_length\", \"message\": \"secret must be 32 bytes\"}}\n", .{});
+            return;
+        }
+    } else |_| {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_hex\"}}\n", .{});
+        return;
+    }
+
+    // Decode message
+    var message_bytes: [4096]u8 = undefined;
+    const message = std.fmt.hexToBytes(&message_bytes, message_hex.?) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_message_hex\"}}\n", .{});
+        return;
+    };
+
+    // Create DlogProverInput from secret
+    const dlog_input = DlogProverInput.init(secret_bytes) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_secret_key\"}}\n", .{});
+        return;
+    };
+
+    // Verify the public key matches the secret
+    const derived_pk = dlog_input.publicImage();
+    if (!std.mem.eql(u8, &derived_pk.public_key, &pk_bytes)) {
+        try stdout.print("{{\"success\": false, \"error\": \"pk_secret_mismatch\", \"message\": \"public key does not match secret\"}}\n", .{});
+        return;
+    }
+
+    // Create proposition
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk_bytes) };
+
+    // Generate proof
+    const prove_result = pipeline.prove(prop, &[_]PrivateInput{.{ .dlog = dlog_input }}, message) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"proving_failed\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Output proof as hex
+    try stdout.print("{{\"success\": true, \"proof\": \"", .{});
+    for (prove_result.proofSlice()) |b| {
+        try stdout.print("{x:0>2}", .{b});
+    }
+    try stdout.print("\", \"proof_len\": {}}}\n", .{prove_result.proof_len});
+}
+
+/// Verify command: Verify a Schnorr proof for a ProveDlog proposition
+/// Usage: zigma verify <pk_hex> --proof=<hex> --message=<hex>
+fn verifyCommand(pk_hex: []const u8, extra_args: []const []const u8) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse required arguments
+    var proof_hex: ?[]const u8 = null;
+    var message_hex: ?[]const u8 = null;
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--proof=")) {
+            proof_hex = arg["--proof=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--message=")) {
+            message_hex = arg["--message=".len..];
+        }
+    }
+
+    if (proof_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_proof\", \"message\": \"--proof=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    if (message_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_message\", \"message\": \"--message=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    // Decode public key (33 bytes compressed)
+    var pk_bytes: [33]u8 = undefined;
+    if (std.fmt.hexToBytes(&pk_bytes, pk_hex)) |decoded| {
+        if (decoded.len != 33) {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_pk_length\", \"message\": \"public key must be 33 bytes\"}}\n", .{});
+            return;
+        }
+    } else |_| {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_pk_hex\"}}\n", .{});
+        return;
+    }
+
+    // Decode proof
+    var proof_bytes: [1024]u8 = undefined;
+    const proof = std.fmt.hexToBytes(&proof_bytes, proof_hex.?) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_proof_hex\"}}\n", .{});
+        return;
+    };
+
+    // Decode message
+    var message_bytes: [4096]u8 = undefined;
+    const message = std.fmt.hexToBytes(&message_bytes, message_hex.?) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_message_hex\"}}\n", .{});
+        return;
+    };
+
+    // Create proposition
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk_bytes) };
+
+    // Verify proof
+    const verify_result = pipeline.verify(prop, proof, message) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"verification_failed\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+
+    try stdout.print("{{\"success\": true, \"valid\": {}, \"cost\": {}}}\n", .{ verify_result.valid, verify_result.cost });
 }

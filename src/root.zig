@@ -78,6 +78,9 @@ pub const verifier = @import("sigma/verifier.zig");
 /// Sigma protocol prover (proof generation)
 pub const prover = @import("sigma/prover.zig");
 
+/// Private inputs (secret keys) for proving
+pub const private_input = @import("sigma/private_input.zig");
+
 /// Sigma protocol pipeline (reduction + prove/verify)
 pub const pipeline = @import("sigma/pipeline.zig");
 
