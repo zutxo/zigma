@@ -74,6 +74,13 @@ pub fn main() !void {
             return;
         }
         try signTxCommand(args[2], args[3..], allocator);
+    } else if (std.mem.eql(u8, command, "verify-tx")) {
+        if (args.len < 3) {
+            std.debug.print("Error: verify-tx requires <file.json> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try verifyTxCommand(args[2], args[3..], allocator);
     } else if (std.mem.eql(u8, command, "prove")) {
         if (args.len < 3) {
             std.debug.print("Error: prove requires <public_key_hex> argument\n", .{});
@@ -115,6 +122,8 @@ fn printUsage() void {
         \\  sign-tx <file>          Sign transaction inputs from JSON file
         \\    --secrets=<hex,...>   Comma-separated secret keys (32 bytes each)
         \\    --message=<hex>       Transaction bytes to sign (hex)
+        \\  verify-tx <file>        Verify transaction proofs from JSON file
+        \\    --message=<hex>       Transaction bytes that were signed (hex)
         \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
         \\  prove <pk_hex>          Generate Schnorr proof for ProveDlog
@@ -130,6 +139,7 @@ fn printUsage() void {
         \\  zigma eval 00d191a37300 --height=500000
         \\  zigma eval-scenario scenario.json
         \\  zigma sign-tx tx.json --secrets=abc...,def... --message=deadbeef
+        \\  zigma verify-tx tx.json --message=deadbeef
         \\  zigma deserialize 00d191a37300
         \\  zigma hash blake2b256 616263
         \\  zigma prove 03... --secret=abc123... --message=deadbeef
@@ -1259,4 +1269,173 @@ fn signTxCommand(path: []const u8, extra_args: []const []const u8, allocator: st
     }
 
     try stdout.print("], \"total_cost\": {}}}\n", .{total_cost});
+}
+
+/// Verify transaction command: Verify proofs for all inputs in a transaction
+/// Usage: zigma verify-tx <file.json> --message=<hex>
+///
+/// JSON format:
+/// {
+///   "inputs": [
+///     { "ergotree_hex": "08cd...", "proof_hex": "abc123..." },
+///     ...
+///   ]
+/// }
+fn verifyTxCommand(path: []const u8, extra_args: []const []const u8, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse required arguments
+    var message_hex: ?[]const u8 = null;
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--message=")) {
+            message_hex = arg["--message=".len..];
+        }
+    }
+
+    if (message_hex == null) {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_message\", \"message\": \"--message=<hex> required\"}}\n", .{});
+        return;
+    }
+
+    // Decode message (transaction bytes)
+    var message_bytes: [8192]u8 = undefined;
+    const message = std.fmt.hexToBytes(&message_bytes, message_hex.?) catch {
+        try stdout.print("{{\"success\": false, \"error\": \"invalid_message_hex\"}}\n", .{});
+        return;
+    };
+
+    // Read the JSON file
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"file_open_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer file.close();
+
+    const json_content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"file_read_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(json_content);
+
+    // Parse JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_content, .{}) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"json_parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+
+    // Get inputs array
+    const inputs_json = root.object.get("inputs") orelse {
+        try stdout.print("{{\"success\": false, \"error\": \"missing_inputs\"}}\n", .{});
+        return;
+    };
+
+    // Output JSON start
+    try stdout.print("{{\"success\": true, \"results\": [\n", .{});
+
+    var all_valid = true;
+    var total_cost: u64 = 0;
+
+    for (inputs_json.array.items, 0..) |input_obj, i| {
+        // Get ergotree_hex
+        const ergotree_hex = input_obj.object.get("ergotree_hex") orelse {
+            try stdout.print("  {{\"input\": {}, \"error\": \"missing_ergotree_hex\"}}", .{i});
+            if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            all_valid = false;
+            continue;
+        };
+
+        // Get proof_hex
+        const proof_hex = input_obj.object.get("proof_hex") orelse {
+            try stdout.print("  {{\"input\": {}, \"error\": \"missing_proof_hex\"}}", .{i});
+            if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            all_valid = false;
+            continue;
+        };
+
+        // Decode ErgoTree
+        var tree_bytes: [4096]u8 = undefined;
+        const decoded_tree = std.fmt.hexToBytes(&tree_bytes, ergotree_hex.string) catch {
+            try stdout.print("  {{\"input\": {}, \"error\": \"invalid_ergotree_hex\"}}", .{i});
+            if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            all_valid = false;
+            continue;
+        };
+
+        // Decode proof
+        var proof_bytes: [1024]u8 = undefined;
+        const proof = std.fmt.hexToBytes(&proof_bytes, proof_hex.string) catch {
+            try stdout.print("  {{\"input\": {}, \"error\": \"invalid_proof_hex\"}}", .{i});
+            if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+            all_valid = false;
+            continue;
+        };
+
+        // Try to parse as simple SigmaProp constant first (0x08cd... format)
+        // Format: 0x08 (header) + 0xcd (SigmaPropConstant) + 33-byte public key
+        var verify_result: pipeline.VerifyResult = undefined;
+
+        if (decoded_tree.len >= 35 and decoded_tree[0] == 0x08 and decoded_tree[1] == 0xcd) {
+            // Simple ProveDlog constant - verify directly
+            var pk_bytes: [33]u8 = undefined;
+            @memcpy(&pk_bytes, decoded_tree[2..35]);
+            const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk_bytes) };
+
+            verify_result = pipeline.verify(prop, proof, message) catch |err| {
+                try stdout.print("  {{\"input\": {}, \"error\": \"verify_error\", \"message\": \"{s}\"}}", .{ i, @errorName(err) });
+                if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+                try stdout.print("\n", .{});
+                all_valid = false;
+                continue;
+            };
+        } else {
+            // Complex script - parse and reduce
+            var type_pool = TypePool.init();
+            var tree = ErgoTree.init(&type_pool);
+            var arena = BumpAllocator(4096).init();
+            ergotree.deserialize(&tree, decoded_tree, &arena) catch |err| {
+                try stdout.print("  {{\"input\": {}, \"error\": \"parse_error\", \"message\": \"{s}\"}}", .{ i, @errorName(err) });
+                if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+                try stdout.print("\n", .{});
+                all_valid = false;
+                continue;
+            };
+
+            // Build minimal context
+            const dummy_box = zigma.context.testBox();
+            const ctx_inputs = [_]zigma.context.BoxView{dummy_box};
+            const ctx = Context.forHeight(1000000, &ctx_inputs);
+
+            // Reduce and verify
+            var eval = Evaluator.init(&tree.expr_tree, &ctx);
+            verify_result = pipeline.reduceAndVerify(
+                &eval,
+                proof,
+                message,
+                pipeline.DEFAULT_COST_LIMIT,
+            ) catch |err| {
+                try stdout.print("  {{\"input\": {}, \"error\": \"verify_error\", \"message\": \"{s}\"}}", .{ i, @errorName(err) });
+                if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+                try stdout.print("\n", .{});
+                all_valid = false;
+                continue;
+            };
+        }
+
+        total_cost += verify_result.cost;
+        if (!verify_result.valid) all_valid = false;
+
+        try stdout.print("  {{\"input\": {}, \"valid\": {}, \"cost\": {}}}", .{ i, verify_result.valid, verify_result.cost });
+        if (i < inputs_json.array.items.len - 1) try stdout.print(",", .{});
+        try stdout.print("\n", .{});
+    }
+
+    try stdout.print("], \"all_valid\": {}, \"total_cost\": {}}}\n", .{ all_valid, total_cost });
 }
