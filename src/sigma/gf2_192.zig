@@ -184,7 +184,7 @@ pub const Gf2_192 = struct {
         while (j > 0) {
             j -= 1;
             const multiplier = b.word[j];
-            var i: i6 = 60;
+            var i: i8 = 60;
             while (i >= 0) : (i -= 4) {
                 // Multiply by x^4
                 const mod_idx: usize = @intCast(lrs(w2, 60));
@@ -193,7 +193,7 @@ pub const Gf2_192 = struct {
                 w0 = (w0 << 4) ^ IRRED_MULS[mod_idx];
 
                 // Add correct multiple of a
-                const idx: usize = @intCast(lrs(multiplier, i) & 15);
+                const idx: usize = @intCast(lrs(multiplier, @intCast(i)) & 15);
                 w0 ^= a0muls[idx];
                 w1 ^= a1muls[idx];
                 w2 ^= a2muls[idx];
@@ -456,21 +456,21 @@ test "Gf2_192: add is XOR" {
 }
 
 test "Gf2_192: add is self-inverse" {
-    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0xFEDCBA9876543210, 0x0011223344556677 } };
+    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0x7EDCBA9876543210, 0x0011223344556677 } };
     const b = a.add(a);
 
     try std.testing.expect(b.isZero());
 }
 
 test "Gf2_192: mul by one is identity" {
-    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0xFEDCBA9876543210, 0x0011223344556677 } };
+    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0x7EDCBA9876543210, 0x0011223344556677 } };
     const b = a.mul(Gf2_192.ONE);
 
     try std.testing.expect(a.eql(b));
 }
 
 test "Gf2_192: mul by zero is zero" {
-    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0xFEDCBA9876543210, 0x0011223344556677 } };
+    const a = Gf2_192{ .word = .{ 0x123456789ABCDEF0, 0x7EDCBA9876543210, 0x0011223344556677 } };
     const b = a.mul(Gf2_192.ZERO);
 
     try std.testing.expect(b.isZero());

@@ -436,6 +436,39 @@ pub const UnprovenConjecture = union(enum) {
         }
     }
 
+    /// Return a copy with simulated flag set (for UnprovenTree.withSimulated)
+    pub fn withSimulated(self: UnprovenConjecture, sim: bool) UnprovenConjecture {
+        var copy = self;
+        switch (copy) {
+            .cand => |*c| c.simulated = sim,
+            .cor => |*c| c.simulated = sim,
+            .cthreshold => |*c| c.simulated = sim,
+        }
+        return copy;
+    }
+
+    /// Return a copy with challenge set (for UnprovenTree.withChallenge)
+    pub fn withChallenge(self: UnprovenConjecture, ch: Challenge) UnprovenConjecture {
+        var copy = self;
+        switch (copy) {
+            .cand => |*c| c.challenge_opt = ch,
+            .cor => |*c| c.challenge_opt = ch,
+            .cthreshold => |*c| c.challenge_opt = ch,
+        }
+        return copy;
+    }
+
+    /// Return a copy with position set (for UnprovenTree.withPosition)
+    pub fn withPosition(self: UnprovenConjecture, pos: NodePosition) UnprovenConjecture {
+        var copy = self;
+        switch (copy) {
+            .cand => |*c| c.position = pos,
+            .cor => |*c| c.position = pos,
+            .cthreshold => |*c| c.position = pos,
+        }
+        return copy;
+    }
+
     pub fn childCount(self: UnprovenConjecture) u8 {
         return switch (self) {
             .cand => |c| @intCast(c.children.len),
@@ -550,12 +583,12 @@ fn convertToUnprovenWithPosition(
                 },
             },
         },
-        .and_node => |children| blk: {
+        .cand => |cand_node| blk: {
             // Allocate children from pool
-            const child_slice = try ctx.allocateNodes(@intCast(children.len));
+            const child_slice = try ctx.allocateNodes(@intCast(cand_node.children.len));
 
             // Convert each child recursively
-            for (children, 0..) |child, i| {
+            for (cand_node.children, 0..) |child, i| {
                 child_slice[i] = try convertToUnprovenWithPosition(
                     ctx,
                     child.*,
@@ -574,10 +607,10 @@ fn convertToUnprovenWithPosition(
                 },
             };
         },
-        .or_node => |children| blk: {
-            const child_slice = try ctx.allocateNodes(@intCast(children.len));
+        .cor => |cor_node| blk: {
+            const child_slice = try ctx.allocateNodes(@intCast(cor_node.children.len));
 
-            for (children, 0..) |child, i| {
+            for (cor_node.children, 0..) |child, i| {
                 child_slice[i] = try convertToUnprovenWithPosition(
                     ctx,
                     child.*,
@@ -596,10 +629,10 @@ fn convertToUnprovenWithPosition(
                 },
             };
         },
-        .threshold => |t| blk: {
-            const child_slice = try ctx.allocateNodes(@intCast(t.children.len));
+        .cthreshold => |th_node| blk: {
+            const child_slice = try ctx.allocateNodes(@intCast(th_node.children.len));
 
-            for (t.children, 0..) |child, i| {
+            for (th_node.children, 0..) |child, i| {
                 child_slice[i] = try convertToUnprovenWithPosition(
                     ctx,
                     child.*,
@@ -610,7 +643,7 @@ fn convertToUnprovenWithPosition(
             break :blk .{
                 .conjecture = .{
                     .cthreshold = .{
-                        .k = t.k,
+                        .k = @intCast(th_node.k),
                         .children = child_slice,
                         .challenge_opt = null,
                         .polynomial_opt = null,

@@ -441,6 +441,13 @@ pub const Scalar = struct {
         return Scalar{ .limbs = result };
     }
 
+    /// Negation mod n: returns -a mod n
+    pub fn neg(self: Scalar) Scalar {
+        if (self.isZero()) return zero;
+        // -a = n - a
+        return Scalar{ .limbs = subLimbs(N, self.limbs) };
+    }
+
     /// Multiplication mod n
     pub fn mul(a: Scalar, b: Scalar) Scalar {
         // Schoolbook multiplication

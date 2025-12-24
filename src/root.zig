@@ -75,6 +75,12 @@ pub const schnorr = @import("sigma/schnorr.zig");
 /// Sigma protocol verifier (AND/OR/THRESHOLD)
 pub const verifier = @import("sigma/verifier.zig");
 
+/// Sigma protocol prover (proof generation)
+pub const prover = @import("sigma/prover.zig");
+
+/// Sigma protocol pipeline (reduction + prove/verify)
+pub const pipeline = @import("sigma/pipeline.zig");
+
 /// AVL+ tree data structure and proof verification
 pub const avl_tree = @import("crypto/avl_tree.zig");
 
@@ -106,6 +112,8 @@ comptime {
     _ = challenge;
     _ = schnorr;
     _ = verifier;
+    _ = prover;
+    _ = pipeline;
     _ = avl_tree;
 }
 
