@@ -8,6 +8,11 @@
 const std = @import("std");
 const zigma = @import("zigma");
 const hash = zigma.hash;
+const verifier = zigma.verifier;
+const sigma_tree = zigma.sigma_tree;
+const SigmaBoolean = sigma_tree.SigmaBoolean;
+const ProveDlog = sigma_tree.ProveDlog;
+const ProveDHTuple = sigma_tree.ProveDHTuple;
 
 // ============================================================================
 // Vector Types
@@ -306,4 +311,143 @@ test "vectors: hexToBytes comptime" {
 test "vectors: empty hex" {
     const result = hexToBytes("");
     try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+// ============================================================================
+// Sigma Protocol Verification Conformance Tests
+// Reference: SigningSpecification.scala from sigmastate-interpreter
+// ============================================================================
+
+test "conformance: ProveDlog signature verification" {
+    // From SigningSpecification.scala:15-32
+    // secret: BigInt("109749205800194830127901595352600384558037183218698112947062497909408298157746")
+    // public key derived from secret
+    const message = hexToBytes("1dc01772ee0171f5f614c673e3c7fa1107a8cf727bdf5a6dadb379e93c0d1d00");
+    const pk_bytes = hexToBytes("03cb0d49e4eae7e57059a3da8ac52626d26fc11330af8fb093fa597d8b93deb7b1");
+    const signature = hexToBytes("bcb866ba434d5c77869ddcbc3f09ddd62dd2d2539bf99076674d1ae0c32338ea95581fdc18a3b66789904938ac641eba1a66d234070207a2");
+
+    // Create ProveDlog proposition
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk_bytes) };
+
+    // Verify signature
+    const is_valid = verifier.verifySignature(prop, &signature, &message) catch |err| {
+        std.debug.print("Verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    try std.testing.expect(is_valid);
+}
+
+test "conformance: ProveDHTuple signature verification" {
+    // From SigningSpecification.scala:35-44
+    // DHT: (g, h, u, v) where g is generator, secret x, h = g^y, u = g^x, v = h^x
+    const message = hexToBytes("1dc01772ee0171f5f614c673e3c7fa1107a8cf727bdf5a6dadb379e93c0d1d00");
+
+    // DHT bytes: g || h || u || v (4 * 33 = 132 bytes)
+    const dht_bytes = hexToBytes("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817980280c66feee88d56e47bf3f47c4109d9218c60c373a472a0d9537507c7ee828c4802a96f19e97df31606183c1719400682d1d40b1ce50c9a1ed1b19845e2b1b551bf0255ac02191cb229891fb1b674ea9df7fc8426350131d821fc4a53f29c3b1cb21a");
+    const signature = hexToBytes("eba93a69b28cfdea261e9ea8914fca9a0b3868d50ce68c94f32e875730f8ca361bd3783c5d3e25802e54f49bd4fb9fafe51f4e8aafbf9815");
+
+    // Parse DHT: g(33) || h(33) || u(33) || v(33)
+    const g = dht_bytes[0..33];
+    const h = dht_bytes[33..66];
+    const u = dht_bytes[66..99];
+    const v = dht_bytes[99..132];
+
+    // Create ProveDHTuple proposition
+    const prop = SigmaBoolean{
+        .prove_dh_tuple = ProveDHTuple{
+            .g = g.*,
+            .h = h.*,
+            .u = u.*,
+            .v = v.*,
+        },
+    };
+
+    // Verify signature
+    const is_valid = verifier.verifySignature(prop, &signature, &message) catch |err| {
+        std.debug.print("DHT Verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    try std.testing.expect(is_valid);
+}
+
+test "conformance: AND signature verification" {
+    // From SigningSpecification.scala:55-65
+    // AND of two ProveDlog propositions
+    const message = hexToBytes("1dc01772ee0171f5f614c673e3c7fa1107a8cf727bdf5a6dadb379e93c0d1d00");
+    const pk1_bytes = hexToBytes("03cb0d49e4eae7e57059a3da8ac52626d26fc11330af8fb093fa597d8b93deb7b1");
+    const pk2_bytes = hexToBytes("0226abfc071cd6a44cf8457e48c8b17fca46f7b596b3dc70d7e5a7be3d9621f428");
+    const signature = hexToBytes("9b2ebb226be42df67817e9c56541de061997c3ea84e7e72dbb69edb7318d7bb525f9c16ccb1adc0ede4700a046d0a4ab1e239245460c1ba45e5637f7a2d4cc4cc460e5895125be73a2ca16091db2dcf51d3028043c2b9340");
+
+    // Create AND(pk1, pk2) proposition
+    const child1 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk1_bytes) };
+    const child2 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk2_bytes) };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cand = .{ .children = &children } };
+
+    // Verify signature
+    const is_valid = verifier.verifySignature(prop, &signature, &message) catch |err| {
+        std.debug.print("AND Verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    try std.testing.expect(is_valid);
+}
+
+test "conformance: OR signature verification" {
+    // From SigningSpecification.scala:67-77
+    // OR of two ProveDlog propositions (only one secret known)
+    const message = hexToBytes("1dc01772ee0171f5f614c673e3c7fa1107a8cf727bdf5a6dadb379e93c0d1d00");
+    const pk1_bytes = hexToBytes("03cb0d49e4eae7e57059a3da8ac52626d26fc11330af8fb093fa597d8b93deb7b1");
+    const pk2_bytes = hexToBytes("0226abfc071cd6a44cf8457e48c8b17fca46f7b596b3dc70d7e5a7be3d9621f428");
+    const signature = hexToBytes("ec94d2d5ef0e1e638237f53fd883c339f9771941f70020742a7dc85130aaee535c61321aa1e1367befb500256567b3e6f9c7a3720baa75ba6056305d7595748a93f23f9fc0eb9c1aaabc24acc4197030834d76d3c95ede60c5b59b4b306cd787d010e8217f34677d046646778877c669");
+
+    // Create OR(pk1, pk2) proposition
+    const child1 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk1_bytes) };
+    const child2 = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk2_bytes) };
+    const children = [_]*const SigmaBoolean{ &child1, &child2 };
+    const prop = SigmaBoolean{ .cor = .{ .children = &children } };
+
+    // Verify signature
+    const is_valid = verifier.verifySignature(prop, &signature, &message) catch |err| {
+        std.debug.print("OR Verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    try std.testing.expect(is_valid);
+}
+
+test "conformance: ProveDlog wrong message fails" {
+    // Same signature as provedlog_basic but different message
+    const wrong_message = hexToBytes("0000000000000000000000000000000000000000000000000000000000000000");
+    const pk_bytes = hexToBytes("03cb0d49e4eae7e57059a3da8ac52626d26fc11330af8fb093fa597d8b93deb7b1");
+    const signature = hexToBytes("bcb866ba434d5c77869ddcbc3f09ddd62dd2d2539bf99076674d1ae0c32338ea95581fdc18a3b66789904938ac641eba1a66d234070207a2");
+
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(pk_bytes) };
+
+    const is_valid = verifier.verifySignature(prop, &signature, &wrong_message) catch |err| {
+        std.debug.print("Expected failure verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Should fail with wrong message
+    try std.testing.expect(!is_valid);
+}
+
+test "conformance: ProveDlog wrong public key fails" {
+    // Correct message and signature but wrong public key
+    const message = hexToBytes("1dc01772ee0171f5f614c673e3c7fa1107a8cf727bdf5a6dadb379e93c0d1d00");
+    const wrong_pk = hexToBytes("0226abfc071cd6a44cf8457e48c8b17fca46f7b596b3dc70d7e5a7be3d9621f428"); // pk2 instead of pk1
+    const signature = hexToBytes("bcb866ba434d5c77869ddcbc3f09ddd62dd2d2539bf99076674d1ae0c32338ea95581fdc18a3b66789904938ac641eba1a66d234070207a2");
+
+    const prop = SigmaBoolean{ .prove_dlog = ProveDlog.init(wrong_pk) };
+
+    const is_valid = verifier.verifySignature(prop, &signature, &message) catch |err| {
+        std.debug.print("Expected failure verification error: {s}\n", .{@errorName(err)});
+        return err;
+    };
+
+    // Should fail with wrong public key
+    try std.testing.expect(!is_valid);
 }
