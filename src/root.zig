@@ -87,6 +87,9 @@ pub const pipeline = @import("sigma/pipeline.zig");
 /// AVL+ tree data structure and proof verification
 pub const avl_tree = @import("crypto/avl_tree.zig");
 
+/// Block verification module (transactions, consensus, UTXO)
+pub const block = @import("block/mod.zig");
+
 // Re-export commonly used types
 pub const SType = types.SType;
 pub const TypePool = types.TypePool;
@@ -118,6 +121,7 @@ comptime {
     _ = prover;
     _ = pipeline;
     _ = avl_tree;
+    _ = block;
 }
 
 /// Protocol version constants
