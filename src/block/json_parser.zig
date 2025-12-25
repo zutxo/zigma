@@ -356,29 +356,56 @@ fn parseTransactionValue(value: std.json.Value, storage: *TransactionStorage) Pa
 
 /// Parse input from JSON value
 fn parseInputValue(value: std.json.Value, storage: *TransactionStorage) ParseError!Input {
-    _ = storage;
-
     // Box ID
     var box_id: [32]u8 = undefined;
     if (getString(value, "boxId")) |box_id_hex| {
         box_id = try parseHex(32, box_id_hex);
     } else return ParseError.MissingField;
 
-    // Spending proof
+    // Spending proof and extension
     var proof = SpendingProof.empty();
+    var extension = transaction.ContextExtension.empty();
+
     if (getObject(value, "spendingProof")) |proof_obj| {
+        // Parse proof bytes
         if (getString(proof_obj, "proofBytes")) |proof_hex| {
             var proof_buf: [transaction.MAX_PROOF_SIZE]u8 = undefined;
             if (parseHexDynamic(proof_hex, &proof_buf)) |bytes| {
                 proof = SpendingProof.fromSlice(bytes) catch SpendingProof.empty();
             } else |_| {}
         }
+
+        // Parse context extension
+        if (getObject(proof_obj, "extension")) |ext_obj| {
+            if (ext_obj == .object) {
+                var iter = ext_obj.object.iterator();
+                while (iter.next()) |entry| {
+                    // Parse key as variable ID
+                    const var_id = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+
+                    // Parse value as hex bytes
+                    if (entry.value_ptr.* == .string) {
+                        const hex_str = entry.value_ptr.string;
+                        if (hex_str.len >= 2 and hex_str.len <= 1024) {
+                            const bytes = storage.allocBytes(hex_str.len / 2) catch continue;
+                            if (parseHexDynamic(hex_str, bytes)) |data| {
+                                // First byte is type code, rest is value
+                                extension.set(var_id, .{
+                                    .data = data,
+                                    .type_code = if (data.len > 0) data[0] else 0,
+                                });
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     return Input{
         .box_id = box_id,
         .spending_proof = proof,
-        .extension = transaction.ContextExtension.empty(),
+        .extension = extension,
     };
 }
 

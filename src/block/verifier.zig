@@ -660,8 +660,16 @@ pub const BlockVerifier = struct {
         self.context.height = height;
         self.context.headers = &[_]HeaderView{};
         self.context.pre_header = std.mem.zeroes(PreHeaderView);
-        // context_vars already zeroed from init
         self.context.extension_cache = null;
+
+        // Populate context_vars from input's context extension
+        // Reset all vars first, then copy from extension
+        self.context.context_vars = [_]?[]const u8{null} ** 256;
+        for (input.extension.values, 0..) |maybe_val, i| {
+            if (maybe_val) |val| {
+                self.context.context_vars[i] = val.data;
+            }
+        }
 
         // Deserialize ErgoTree (reuse pre-allocated pools)
         self.type_pool = types_mod.TypePool.init(); // Reset for this input

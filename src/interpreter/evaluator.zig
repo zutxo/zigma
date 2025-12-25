@@ -6440,7 +6440,9 @@ pub const Evaluator = struct {
         };
 
         // INVARIANT: Script bytes should not be empty
-        if (script_bytes.len == 0) return error.InvalidData;
+        if (script_bytes.len == 0) {
+            return error.InvalidData;
+        }
 
         // Type validation: positions must be collection (Coll[Int])
         const positions_coll = switch (positions_val) {
@@ -6528,15 +6530,11 @@ pub const Evaluator = struct {
         var i: u32 = 0;
         while (i < num_constants) : (i += 1) {
             // Parse type using type_serializer (handles all type codes including generics)
-            const type_idx = type_serializer.deserialize(&const_type_pool, &reader) catch {
-                return error.InvalidData;
-            };
+            const type_idx = type_serializer.deserialize(&const_type_pool, &reader) catch return error.InvalidData;
             original_types[i] = type_idx;
 
             // Skip value data using the proper type pool
-            skipValueForType(&const_type_pool, &reader, type_idx) catch {
-                return error.InvalidData;
-            };
+            skipValueForType(&const_type_pool, &reader, type_idx) catch return error.InvalidData;
             original_offsets[i + 1] = reader.pos;
         }
 
@@ -7024,14 +7022,12 @@ pub const Evaluator = struct {
     fn getCollectionElementFromRef(self: *const Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
         if (idx >= coll.len) return error.IndexOutOfBounds;
 
-        // Get from value pool
+        // Get from values array (where computeConcreteCollection stores elements)
         const start_idx = coll.start;
         const val_idx = start_idx + idx;
 
-        if (self.pools.values.get(val_idx)) |pooled| {
-            return pooledValueToValue(pooled, &self.pools.type_pool);
-        }
-        return error.InvalidData;
+        if (val_idx >= max_value_stack) return error.IndexOutOfBounds;
+        return self.values[val_idx];
     }
 
     /// Serialize a constant (type + value) to bytes
@@ -9035,12 +9031,14 @@ pub const Evaluator = struct {
     /// Capture diagnostic state when an error occurs.
     /// Called before returning an error to preserve debugging info.
     fn captureEvalDiagnostics(self: *Evaluator, err: EvalError, node_idx: ?u16) void {
+        const opcode: ?u8 = if (node_idx) |idx|
+            if (idx < self.tree.node_count) @intFromEnum(self.tree.nodes[idx].tag) else null
+        else
+            null;
+
         self.diag = .{
             .error_code = EvalErrorCode.fromEvalError(err),
-            .failed_opcode = if (node_idx) |idx|
-                if (idx < self.tree.node_count) @intFromEnum(self.tree.nodes[idx].tag) else null
-            else
-                null,
+            .failed_opcode = opcode,
             .failed_node_idx = node_idx,
             .stack_depth = self.value_sp,
             .cost_at_failure = self.cost_used,
