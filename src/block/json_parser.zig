@@ -297,7 +297,11 @@ fn parseHeaderValue(value: std.json.Value) ParseError!HeaderView {
 
 /// Parse transaction from JSON value
 fn parseTransactionValue(value: std.json.Value, storage: *TransactionStorage) ParseError!Transaction {
-    storage.reset();
+    // DON'T reset - accumulate inputs/outputs across all transactions
+    // Track start indices for this transaction's slices
+    const input_start = storage.input_count;
+    const output_start = storage.output_count;
+    const data_input_start = storage.data_input_count;
 
     // Transaction ID
     var tx_id: [32]u8 = undefined;
@@ -340,11 +344,12 @@ fn parseTransactionValue(value: std.json.Value, storage: *TransactionStorage) Pa
     // Size (optional)
     const size = getInt(u32, value, "size") orelse 0;
 
+    // Create slices from start indices to current counts
     return Transaction{
         .id = tx_id,
-        .inputs = storage.getInputs(),
-        .data_inputs = storage.getDataInputs(),
-        .outputs = storage.getOutputs(),
+        .inputs = storage.inputs[input_start..storage.input_count],
+        .data_inputs = storage.data_inputs[data_input_start..storage.data_input_count],
+        .outputs = storage.outputs[output_start..storage.output_count],
         .size = size,
     };
 }

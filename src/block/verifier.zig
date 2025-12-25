@@ -491,8 +491,8 @@ pub const BlockVerifier = struct {
             return result;
         }
 
-        // Verify Merkle root
-        const merkle_valid = merkle.verifyTxMerkleRoot(blk);
+        // Verify Merkle root (v2+ blocks include witness hashes)
+        const merkle_valid = merkle.verifyTxMerkleRootVersioned(blk, blk.header.version);
         result.setMerkleResult(merkle_valid);
 
         // Verify each transaction

@@ -33,6 +33,12 @@ pub const MAX_TREE_DEPTH: u16 = 10; // 2^10 = 1024 transactions
 /// Maximum nodes at any level
 pub const MAX_LEVEL_NODES: u16 = 512;
 
+/// Prefix byte for leaf nodes (scrypto MerkleTree.LeafPrefix)
+pub const LEAF_PREFIX: u8 = 0;
+
+/// Prefix byte for internal nodes (scrypto MerkleTree.InternalNodePrefix)
+pub const INTERNAL_NODE_PREFIX: u8 = 1;
+
 // ============================================================================
 // Witness ID Computation (v2+)
 // ============================================================================
@@ -79,21 +85,19 @@ pub fn computeWitnessIds(
 /// Returns Blake2b256 hash at the root.
 ///
 /// Algorithm:
-/// 1. If empty, return all zeros
-/// 2. If single tx, return its ID
+/// 1. If empty, return all zeros (EmptyRootHash)
+/// 2. If single leaf, return hash(LeafPrefix || data)
 /// 3. Otherwise, build tree bottom-up:
-///    - Hash pairs: Blake2b256(left || right)
-///    - Odd node at end is promoted unchanged
+///    - Each leaf: hash(LeafPrefix || data)
+///    - Internal nodes: hash(InternalNodePrefix || left || right)
+///    - Odd node paired with empty node (all zeros)
 ///    - Repeat until single root
-pub fn computeTxMerkleRoot(tx_ids: []const [32]u8) [32]u8 {
-    // Empty case
-    if (tx_ids.len == 0) {
+///
+/// Reference: scrypto MerkleTree.scala, Node.scala
+pub fn computeTxMerkleRoot(leaf_data: []const [32]u8) [32]u8 {
+    // Empty case - return EmptyRootHash (all zeros)
+    if (leaf_data.len == 0) {
         return [_]u8{0} ** 32;
-    }
-
-    // Single transaction case
-    if (tx_ids.len == 1) {
-        return tx_ids[0];
     }
 
     // Pre-allocated work buffer for Merkle computation
@@ -103,27 +107,39 @@ pub fn computeTxMerkleRoot(tx_ids: []const [32]u8) [32]u8 {
     var current: *[MAX_LEVEL_NODES][32]u8 = &level_a;
     var next: *[MAX_LEVEL_NODES][32]u8 = &level_b;
 
-    // Copy initial leaves (truncate if too many)
-    const initial_count = @min(tx_ids.len, MAX_LEVEL_NODES);
-    @memcpy(current[0..initial_count], tx_ids[0..initial_count]);
+    // Hash each leaf with LeafPrefix (truncate if too many)
+    const initial_count = @min(leaf_data.len, MAX_LEVEL_NODES);
+    for (leaf_data[0..initial_count], 0..) |leaf, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&leaf);
+        current[i] = hasher.finalize();
+    }
     var level_size: usize = initial_count;
 
     // Build tree bottom-up
+    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+
     while (level_size > 1) {
         const pairs = level_size / 2;
         const has_odd = (level_size % 2) == 1;
 
-        // Hash pairs
+        // Hash pairs with InternalNodePrefix
         for (0..pairs) |i| {
             var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[i * 2]);
             hasher.update(&current[i * 2 + 1]);
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node (promote to next level)
+        // Handle odd node - pair with empty node
         if (has_odd) {
-            next[pairs] = current[level_size - 1];
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[level_size - 1]);
+            hasher.update(&empty_node_hash);
+            next[pairs] = hasher.finalize();
             level_size = pairs + 1;
         } else {
             level_size = pairs;
@@ -139,11 +155,15 @@ pub fn computeTxMerkleRoot(tx_ids: []const [32]u8) [32]u8 {
 }
 
 /// Compute Merkle root for v2+ blocks using txIds ++ witnessIds.
-/// Witness IDs are padded to 32 bytes (prepending a zero byte).
+/// Witness IDs are 31 bytes (248 bits) - hashed directly without padding.
+///
+/// The merkle tree structure is:
+///   leaves[0..n] = hash(0 || txId[i])         for each txId (32 bytes)
+///   leaves[n..2n] = hash(0 || witnessId[i])   for each witnessId (31 bytes)
 ///
 /// For v1 blocks, call computeTxMerkleRoot directly with just tx_ids.
 ///
-/// Reference: BlockTransactions.scala:59-63
+/// Reference: BlockTransactions.scala:59-63, scrypto MerkleTree.scala
 pub fn computeTxMerkleRootV2(
     tx_ids: []const [32]u8,
     witness_ids: []const [WITNESS_ID_SIZE]u8,
@@ -155,26 +175,71 @@ pub fn computeTxMerkleRootV2(
         return [_]u8{0} ** 32;
     }
 
-    // Build combined leaf array: txIds ++ witnessIds
-    // Witness IDs are padded to 32 bytes with leading zero
     const total_leaves = tx_ids.len * 2;
     if (total_leaves > MAX_LEVEL_NODES) {
         // Truncate if too many (shouldn't happen in practice)
         return computeTxMerkleRootV2(tx_ids[0 .. MAX_LEVEL_NODES / 2], witness_ids[0 .. MAX_LEVEL_NODES / 2]);
     }
 
-    var leaves: [MAX_LEVEL_NODES][32]u8 = undefined;
+    // Pre-allocated work buffer for Merkle computation
+    var level_a: [MAX_LEVEL_NODES][32]u8 = undefined;
+    var level_b: [MAX_LEVEL_NODES][32]u8 = undefined;
+    var current: *[MAX_LEVEL_NODES][32]u8 = &level_a;
+    var next: *[MAX_LEVEL_NODES][32]u8 = &level_b;
 
-    // First half: transaction IDs (32 bytes each)
-    @memcpy(leaves[0..tx_ids.len], tx_ids);
-
-    // Second half: witness IDs padded to 32 bytes (0x00 || witnessId)
-    for (witness_ids, 0..) |wid, i| {
-        leaves[tx_ids.len + i][0] = 0x00; // Leading zero byte
-        @memcpy(leaves[tx_ids.len + i][1..32], &wid);
+    // Hash txId leaves: hash(0 || txId)
+    for (tx_ids, 0..) |tx_id, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&tx_id);
+        current[i] = hasher.finalize();
     }
 
-    return computeTxMerkleRoot(leaves[0..total_leaves]);
+    // Hash witnessId leaves: hash(0 || witnessId) - 31 bytes, no padding
+    for (witness_ids, 0..) |wid, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&wid);
+        current[tx_ids.len + i] = hasher.finalize();
+    }
+
+    var level_size: usize = total_leaves;
+
+    // Build tree bottom-up
+    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+
+    while (level_size > 1) {
+        const pairs = level_size / 2;
+        const has_odd = (level_size % 2) == 1;
+
+        // Hash pairs with InternalNodePrefix
+        for (0..pairs) |i| {
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[i * 2]);
+            hasher.update(&current[i * 2 + 1]);
+            next[i] = hasher.finalize();
+        }
+
+        // Handle odd node - pair with empty node
+        if (has_odd) {
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[level_size - 1]);
+            hasher.update(&empty_node_hash);
+            next[pairs] = hasher.finalize();
+            level_size = pairs + 1;
+        } else {
+            level_size = pairs;
+        }
+
+        // Swap buffers
+        const tmp = current;
+        current = next;
+        next = tmp;
+    }
+
+    return current[0];
 }
 
 /// Compute Merkle root based on block version.
@@ -244,11 +309,16 @@ pub const MerkleProof = struct {
 
     /// Verify that tx_id is included with this proof producing expected root
     pub fn verify(self: *const MerkleProof, tx_id: [32]u8, expected_root: [32]u8) bool {
-        var current = tx_id;
+        // First hash the leaf with LEAF_PREFIX
+        var leaf_hasher = hash.Blake2b256Hasher.init();
+        leaf_hasher.update(&[_]u8{LEAF_PREFIX});
+        leaf_hasher.update(&tx_id);
+        var current = leaf_hasher.finalize();
         var index = self.leaf_index;
 
         for (0..self.depth) |i| {
             var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
 
             // Order depends on position: left child (even index) or right child (odd index)
             if (index % 2 == 0) {
@@ -295,9 +365,16 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
     var current: *[MAX_LEVEL_NODES][32]u8 = &level_a;
     var next: *[MAX_LEVEL_NODES][32]u8 = &level_b;
 
-    // Copy initial leaves
+    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+
+    // Hash leaves with LEAF_PREFIX
     const initial_count = @min(tx_ids.len, MAX_LEVEL_NODES);
-    @memcpy(current[0..initial_count], tx_ids[0..initial_count]);
+    for (tx_ids[0..initial_count], 0..) |tx_id, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&tx_id);
+        current[i] = hasher.finalize();
+    }
     var level_size: usize = initial_count;
     var target_index: usize = tx_index;
 
@@ -312,8 +389,8 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
             if (target_index + 1 < level_size) {
                 proof.siblings[proof.depth] = current[target_index + 1];
             } else {
-                // No sibling (we're the odd one)
-                proof.siblings[proof.depth] = current[target_index];
+                // No sibling (we're the odd one), sibling is empty node
+                proof.siblings[proof.depth] = empty_node_hash;
             }
         } else {
             // We're right child, sibling is left
@@ -321,16 +398,22 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
         }
         proof.depth += 1;
 
-        // Hash pairs for next level
+        // Hash pairs for next level with INTERNAL_NODE_PREFIX
         for (0..pairs) |i| {
             var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[i * 2]);
             hasher.update(&current[i * 2 + 1]);
             next[i] = hasher.finalize();
         }
 
         if (has_odd) {
-            next[pairs] = current[level_size - 1];
+            // Hash odd node with empty sibling
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[level_size - 1]);
+            hasher.update(&empty_node_hash);
+            next[pairs] = hasher.finalize();
             level_size = pairs + 1;
         } else {
             level_size = pairs;
@@ -358,20 +441,39 @@ test "merkle: empty input returns zero" {
     try std.testing.expectEqualSlices(u8, &expected, &result);
 }
 
-test "merkle: single tx returns tx id" {
+test "merkle: single tx returns leaf hash" {
     const tx_id = [_]u8{0xAB} ** 32;
+
+    // Single leaf: hash(0 || tx_id)
+    var hasher = hash.Blake2b256Hasher.init();
+    hasher.update(&[_]u8{LEAF_PREFIX});
+    hasher.update(&tx_id);
+    const expected = hasher.finalize();
+
     const result = computeTxMerkleRoot(&[_][32]u8{tx_id});
-    try std.testing.expectEqualSlices(u8, &tx_id, &result);
+    try std.testing.expectEqualSlices(u8, &expected, &result);
 }
 
 test "merkle: two txs computes hash" {
     const tx1 = [_]u8{0x11} ** 32;
     const tx2 = [_]u8{0x22} ** 32;
 
-    // Manual computation: Blake2b256(tx1 || tx2)
+    // Hash leaves with prefix
+    var hl1 = hash.Blake2b256Hasher.init();
+    hl1.update(&[_]u8{LEAF_PREFIX});
+    hl1.update(&tx1);
+    const leaf1 = hl1.finalize();
+
+    var hl2 = hash.Blake2b256Hasher.init();
+    hl2.update(&[_]u8{LEAF_PREFIX});
+    hl2.update(&tx2);
+    const leaf2 = hl2.finalize();
+
+    // Root: hash(1 || leaf1 || leaf2)
     var hasher = hash.Blake2b256Hasher.init();
-    hasher.update(&tx1);
-    hasher.update(&tx2);
+    hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    hasher.update(&leaf1);
+    hasher.update(&leaf2);
     const expected = hasher.finalize();
 
     const result = computeTxMerkleRoot(&[_][32]u8{ tx1, tx2 });
@@ -382,17 +484,42 @@ test "merkle: three txs handles odd node" {
     const tx1 = [_]u8{0x11} ** 32;
     const tx2 = [_]u8{0x22} ** 32;
     const tx3 = [_]u8{0x33} ** 32;
+    const empty_hash = [_]u8{0} ** 32;
 
-    // Level 1: hash(tx1, tx2), tx3 (promoted)
+    // Hash leaves with prefix
+    var hl1 = hash.Blake2b256Hasher.init();
+    hl1.update(&[_]u8{LEAF_PREFIX});
+    hl1.update(&tx1);
+    const leaf1 = hl1.finalize();
+
+    var hl2 = hash.Blake2b256Hasher.init();
+    hl2.update(&[_]u8{LEAF_PREFIX});
+    hl2.update(&tx2);
+    const leaf2 = hl2.finalize();
+
+    var hl3 = hash.Blake2b256Hasher.init();
+    hl3.update(&[_]u8{LEAF_PREFIX});
+    hl3.update(&tx3);
+    const leaf3 = hl3.finalize();
+
+    // Level 1: hash(1 || leaf1 || leaf2), hash(1 || leaf3 || empty)
     var h12 = hash.Blake2b256Hasher.init();
-    h12.update(&tx1);
-    h12.update(&tx2);
+    h12.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    h12.update(&leaf1);
+    h12.update(&leaf2);
     const node12 = h12.finalize();
 
-    // Level 2: hash(node12, tx3)
+    var h3e = hash.Blake2b256Hasher.init();
+    h3e.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    h3e.update(&leaf3);
+    h3e.update(&empty_hash);
+    const node3e = h3e.finalize();
+
+    // Level 2 (root): hash(1 || node12 || node3e)
     var h_root = hash.Blake2b256Hasher.init();
+    h_root.update(&[_]u8{INTERNAL_NODE_PREFIX});
     h_root.update(&node12);
-    h_root.update(&tx3);
+    h_root.update(&node3e);
     const expected = h_root.finalize();
 
     const result = computeTxMerkleRoot(&[_][32]u8{ tx1, tx2, tx3 });
@@ -405,19 +532,43 @@ test "merkle: four txs balanced tree" {
     const tx3 = [_]u8{0x33} ** 32;
     const tx4 = [_]u8{0x44} ** 32;
 
-    // Level 1
+    // Hash leaves with prefix
+    var hl1 = hash.Blake2b256Hasher.init();
+    hl1.update(&[_]u8{LEAF_PREFIX});
+    hl1.update(&tx1);
+    const leaf1 = hl1.finalize();
+
+    var hl2 = hash.Blake2b256Hasher.init();
+    hl2.update(&[_]u8{LEAF_PREFIX});
+    hl2.update(&tx2);
+    const leaf2 = hl2.finalize();
+
+    var hl3 = hash.Blake2b256Hasher.init();
+    hl3.update(&[_]u8{LEAF_PREFIX});
+    hl3.update(&tx3);
+    const leaf3 = hl3.finalize();
+
+    var hl4 = hash.Blake2b256Hasher.init();
+    hl4.update(&[_]u8{LEAF_PREFIX});
+    hl4.update(&tx4);
+    const leaf4 = hl4.finalize();
+
+    // Level 1: internal nodes with prefix
     var h12 = hash.Blake2b256Hasher.init();
-    h12.update(&tx1);
-    h12.update(&tx2);
+    h12.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    h12.update(&leaf1);
+    h12.update(&leaf2);
     const node12 = h12.finalize();
 
     var h34 = hash.Blake2b256Hasher.init();
-    h34.update(&tx3);
-    h34.update(&tx4);
+    h34.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    h34.update(&leaf3);
+    h34.update(&leaf4);
     const node34 = h34.finalize();
 
-    // Level 2 (root)
+    // Level 2 (root): internal node with prefix
     var h_root = hash.Blake2b256Hasher.init();
+    h_root.update(&[_]u8{INTERNAL_NODE_PREFIX});
     h_root.update(&node12);
     h_root.update(&node34);
     const expected = h_root.finalize();
@@ -536,20 +687,29 @@ test "merkle: v2 merkle root includes witness IDs" {
 }
 
 test "merkle: v2 merkle root structure" {
-    // Single tx case: merkle tree of [txId, paddedWitnessId]
+    // Single tx case: merkle tree of [txId, witnessId]
+    // Structure: leaf0 = hash(0 || txId), leaf1 = hash(0 || wid)
+    //            root = hash(1 || leaf0 || leaf1)
     const tx_id = [_]u8{0x11} ** 32;
     const wid = [_]u8{0xAA} ** WITNESS_ID_SIZE;
 
-    // Build padded witness ID (0x00 || wid)
-    var padded_wid: [32]u8 = undefined;
-    padded_wid[0] = 0x00;
-    @memcpy(padded_wid[1..32], &wid);
+    // Compute expected leaf hashes
+    var leaf0_hasher = hash.Blake2b256Hasher.init();
+    leaf0_hasher.update(&[_]u8{LEAF_PREFIX});
+    leaf0_hasher.update(&tx_id);
+    const leaf0 = leaf0_hasher.finalize();
 
-    // v2 root should be hash(tx_id || padded_wid)
-    var hasher = hash.Blake2b256Hasher.init();
-    hasher.update(&tx_id);
-    hasher.update(&padded_wid);
-    const expected = hasher.finalize();
+    var leaf1_hasher = hash.Blake2b256Hasher.init();
+    leaf1_hasher.update(&[_]u8{LEAF_PREFIX});
+    leaf1_hasher.update(&wid); // 31 bytes, no padding
+    const leaf1 = leaf1_hasher.finalize();
+
+    // Expected root = hash(1 || leaf0 || leaf1)
+    var root_hasher = hash.Blake2b256Hasher.init();
+    root_hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+    root_hasher.update(&leaf0);
+    root_hasher.update(&leaf1);
+    const expected = root_hasher.finalize();
 
     const v2_root = computeTxMerkleRootV2(&[_][32]u8{tx_id}, &[_][WITNESS_ID_SIZE]u8{wid});
     try std.testing.expectEqualSlices(u8, &expected, &v2_root);
