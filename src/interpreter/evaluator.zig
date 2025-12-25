@@ -68,8 +68,9 @@ const max_var_bindings: usize = 64;
 /// Default cost limit per evaluation
 const default_cost_limit: u64 = 1_000_000;
 
-/// Arena size for temporary allocations (hash results, etc.)
-const eval_arena_size: usize = 4096;
+/// Arena size for temporary allocations (hash results, sigma bytes, etc.)
+/// 16KB handles complex DeFi contracts with many operations
+const eval_arena_size: usize = 16384;
 
 /// How often to check wall-clock timeout (every N operations).
 /// Checking every operation is too expensive, so we amortize.
