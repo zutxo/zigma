@@ -1,13 +1,18 @@
 //! Consensus Rule Verification
 //!
-//! Validates transaction consensus rules:
+//! Validates transaction consensus rules per Ergo protocol:
 //! - Value conservation: sum(inputs) == sum(outputs) (ERG exactly preserved)
 //! - Token conservation: per-token balance >= 0 (output <= input)
 //! - Token minting: only from first input's box ID
+//! - Dust prevention: minimum box value based on size
+//! - Creation height: must be valid relative to current height
+//! - Box size limits: max 4KB per box, max 4KB proposition
+//! - Token limits: max 127 tokens per box, positive amounts only
 
 const std = @import("std");
 const context = @import("../interpreter/context.zig");
 const transaction = @import("transaction.zig");
+const vlq = @import("../serialization/vlq.zig");
 
 pub const BoxView = context.BoxView;
 pub const Token = context.Token;
@@ -15,8 +20,25 @@ pub const Input = transaction.Input;
 pub const Output = transaction.Output;
 pub const Transaction = transaction.Transaction;
 
+// ============================================================================
+// Protocol Constants
+// ============================================================================
+
 /// Maximum distinct tokens across inputs/outputs
 pub const MAX_DISTINCT_TOKENS: u16 = 256;
+
+/// Maximum tokens per box (ValidationRules.scala:109 - txAssetsInOneBox)
+pub const MAX_TOKENS_PER_BOX: u8 = 127;
+
+/// Maximum box size in bytes (ValidationRules.scala:121 - txBoxSize)
+pub const MAX_BOX_SIZE: usize = 4096;
+
+/// Maximum proposition (ErgoTree) size in bytes (ValidationRules.scala:122 - txBoxPropositionSize)
+pub const MAX_PROPOSITION_SIZE: usize = 4096;
+
+/// Minimum value per byte in nanoErgs (BoxUtils.scala:40-41)
+/// Default from Ergo parameters
+pub const MIN_VALUE_PER_BYTE: i64 = 360;
 
 // ============================================================================
 // Consensus Result
@@ -93,8 +115,24 @@ pub const ConsensusError = error{
     NegativeValue,
     /// Value overflow during summation
     ValueOverflow,
-    /// Too many distinct tokens
+    /// Too many distinct tokens across transaction
     TooManyTokens,
+    /// Box value below minimum (dust) - txDust
+    DustOutput,
+    /// Output creation height is in the future - txFuture
+    FutureCreationHeight,
+    /// Output creation height is negative - txNegHeight (v1 only)
+    NegativeCreationHeight,
+    /// Output creation height below max input height - txMonotonicHeight (v5+)
+    NonMonotonicHeight,
+    /// Box exceeds maximum size - txBoxSize
+    BoxTooLarge,
+    /// Proposition exceeds maximum size - txBoxPropositionSize
+    PropositionTooLarge,
+    /// Too many tokens in single box - txAssetsInOneBox
+    TooManyTokensInBox,
+    /// Token amount is not positive - txPositiveAssets
+    NonPositiveTokenAmount,
 };
 
 // ============================================================================
@@ -254,6 +292,154 @@ pub fn verifyTokenConservation(
     }
 
     return .{ .ok = true, .err = null };
+}
+
+// ============================================================================
+// Dust Prevention (txDust)
+// ============================================================================
+
+/// Estimate serialized box size for dust calculation.
+/// This is an approximation based on box contents.
+pub fn estimateBoxSize(output: *const Output) usize {
+    var size: usize = 0;
+
+    // Value: VLQ encoded (1-9 bytes typically)
+    var vlq_buf: [vlq.max_vlq_bytes]u8 = undefined;
+    size += vlq.encodeU64(@bitCast(output.value), &vlq_buf);
+
+    // ErgoTree: length prefix + bytes
+    size += vlq.encodeU64(output.ergo_tree.len, &vlq_buf);
+    size += output.ergo_tree.len;
+
+    // Creation height: VLQ encoded
+    size += vlq.encodeU64(output.creation_height, &vlq_buf);
+
+    // Token count (1 byte) + tokens
+    size += 1;
+    for (output.tokens) |token| {
+        size += 32; // token ID
+        size += vlq.encodeU64(@bitCast(token.amount), &vlq_buf);
+    }
+
+    // Register count (1 byte) + register bytes
+    size += 1;
+    for (output.registers) |reg| {
+        if (reg) |reg_bytes| {
+            size += reg_bytes.len;
+        }
+    }
+
+    return size;
+}
+
+/// Calculate minimum ERG value for a box based on its size.
+/// Reference: BoxUtils.scala:40-41 - minimalErgoAmount
+pub fn minimalErgoAmount(box_size: usize) i64 {
+    return @as(i64, @intCast(box_size)) * MIN_VALUE_PER_BYTE;
+}
+
+/// Verify no outputs are dust (below minimum value for their size).
+/// Reference: ValidationRules.scala:111 - txDust
+pub fn verifyNoDust(outputs: []const Output) struct { ok: bool, err: ?ConsensusError, output_index: ?usize } {
+    for (outputs, 0..) |*out, i| {
+        const box_size = estimateBoxSize(out);
+        const min_value = minimalErgoAmount(box_size);
+        if (out.value < min_value) {
+            return .{ .ok = false, .err = ConsensusError.DustOutput, .output_index = i };
+        }
+    }
+    return .{ .ok = true, .err = null, .output_index = null };
+}
+
+// ============================================================================
+// Creation Height Validation
+// ============================================================================
+
+/// Verify output creation heights are valid.
+/// - txFuture: creation height must not exceed current block height
+/// - txMonotonicHeight (v5+): creation height must be >= max input creation height
+///
+/// Reference: ErgoTransaction.scala:171-173
+pub fn verifyCreationHeights(
+    outputs: []const Output,
+    input_boxes: []const BoxView,
+    current_height: u32,
+    protocol_version: u8,
+) struct { ok: bool, err: ?ConsensusError, output_index: ?usize } {
+    // Find max input creation height for monotonic check
+    var max_input_height: u32 = 0;
+    for (input_boxes) |box| {
+        if (box.creation_height > max_input_height) {
+            max_input_height = box.creation_height;
+        }
+    }
+
+    for (outputs, 0..) |out, i| {
+        // txFuture: creation height cannot be in the future
+        if (out.creation_height > current_height) {
+            return .{ .ok = false, .err = ConsensusError.FutureCreationHeight, .output_index = i };
+        }
+
+        // txMonotonicHeight (v5+): creation height must be monotonically increasing
+        if (protocol_version >= 5 and out.creation_height < max_input_height) {
+            return .{ .ok = false, .err = ConsensusError.NonMonotonicHeight, .output_index = i };
+        }
+    }
+
+    return .{ .ok = true, .err = null, .output_index = null };
+}
+
+// ============================================================================
+// Box Size Limits
+// ============================================================================
+
+/// Verify box and proposition size limits.
+/// - txBoxSize: box must not exceed MAX_BOX_SIZE (4KB)
+/// - txBoxPropositionSize: proposition must not exceed MAX_PROPOSITION_SIZE (4KB)
+///
+/// Reference: ValidationRules.scala:121-122
+pub fn verifyBoxSizes(outputs: []const Output) struct { ok: bool, err: ?ConsensusError, output_index: ?usize } {
+    for (outputs, 0..) |*out, i| {
+        // Check proposition size
+        if (out.ergo_tree.len > MAX_PROPOSITION_SIZE) {
+            return .{ .ok = false, .err = ConsensusError.PropositionTooLarge, .output_index = i };
+        }
+
+        // Check total box size
+        const box_size = estimateBoxSize(out);
+        if (box_size > MAX_BOX_SIZE) {
+            return .{ .ok = false, .err = ConsensusError.BoxTooLarge, .output_index = i };
+        }
+    }
+
+    return .{ .ok = true, .err = null, .output_index = null };
+}
+
+// ============================================================================
+// Token Limits
+// ============================================================================
+
+/// Verify token constraints on outputs.
+/// - txAssetsInOneBox: max 127 tokens per box
+/// - txPositiveAssets: all token amounts must be positive
+///
+/// Reference: ValidationRules.scala:108-109
+pub fn verifyTokenConstraints(outputs: []const Output) struct { ok: bool, err: ?ConsensusError, output_index: ?usize } {
+    for (outputs, 0..) |out, i| {
+        // Check token count per box
+        if (out.tokens.len > MAX_TOKENS_PER_BOX) {
+            return .{ .ok = false, .err = ConsensusError.TooManyTokensInBox, .output_index = i };
+        }
+
+        // Check all token amounts are positive
+        for (out.tokens) |token| {
+            if (token.amount <= 0) {
+                return .{ .ok = false, .err = ConsensusError.NonPositiveTokenAmount, .output_index = i };
+            }
+        }
+    }
+
+    return .{ .ok = true, .err = null, .output_index = null };
 }
 
 // ============================================================================
@@ -435,4 +621,150 @@ test "consensus: full verification success" {
     try std.testing.expect(result.value_balance_ok);
     try std.testing.expect(result.token_conservation_ok);
     try std.testing.expectEqual(@as(i64, 0), result.fee); // Fee is always 0 with ERG preservation
+}
+
+// ============================================================================
+// Dust Prevention Tests
+// ============================================================================
+
+test "consensus: dust check passes for sufficient value" {
+    const ergo_tree = [_]u8{0x00} ** 10; // Small ErgoTree
+    // Box size estimate: ~15 bytes, min value ~5400 nanoErgs
+    const outputs = [_]Output{Output.init(10000, &ergo_tree, 100)};
+
+    const result = verifyNoDust(&outputs);
+    try std.testing.expect(result.ok);
+}
+
+test "consensus: dust check fails for insufficient value" {
+    const ergo_tree = [_]u8{0x00} ** 100; // Larger ErgoTree
+    // Box size estimate: ~105 bytes, min value ~37800 nanoErgs
+    const outputs = [_]Output{Output.init(100, &ergo_tree, 100)}; // Way below minimum
+
+    const result = verifyNoDust(&outputs);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.DustOutput, result.err.?);
+    try std.testing.expectEqual(@as(usize, 0), result.output_index.?);
+}
+
+test "consensus: minimalErgoAmount calculation" {
+    const min_100 = minimalErgoAmount(100);
+    try std.testing.expectEqual(@as(i64, 36000), min_100); // 100 * 360
+
+    const min_1000 = minimalErgoAmount(1000);
+    try std.testing.expectEqual(@as(i64, 360000), min_1000); // 1000 * 360
+}
+
+// ============================================================================
+// Creation Height Tests
+// ============================================================================
+
+test "consensus: creation height valid" {
+    const ergo_tree = [_]u8{0x00};
+    const outputs = [_]Output{Output.init(1000000, &ergo_tree, 100)};
+    var inputs = [_]BoxView{std.mem.zeroes(BoxView)};
+    inputs[0].creation_height = 50;
+
+    // Current height 200, output height 100 - valid
+    const result = verifyCreationHeights(&outputs, &inputs, 200, 5);
+    try std.testing.expect(result.ok);
+}
+
+test "consensus: creation height in future rejected" {
+    const ergo_tree = [_]u8{0x00};
+    const outputs = [_]Output{Output.init(1000000, &ergo_tree, 500)}; // Height 500
+    const inputs = [_]BoxView{std.mem.zeroes(BoxView)};
+
+    // Current height 100, output height 500 - invalid (future)
+    const result = verifyCreationHeights(&outputs, &inputs, 100, 5);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.FutureCreationHeight, result.err.?);
+}
+
+test "consensus: non-monotonic height rejected (v5+)" {
+    const ergo_tree = [_]u8{0x00};
+    const outputs = [_]Output{Output.init(1000000, &ergo_tree, 50)}; // Height 50
+    var inputs = [_]BoxView{std.mem.zeroes(BoxView)};
+    inputs[0].creation_height = 100; // Input from height 100
+
+    // Output height 50 < input height 100 - invalid for v5+
+    const result = verifyCreationHeights(&outputs, &inputs, 200, 5);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.NonMonotonicHeight, result.err.?);
+}
+
+test "consensus: non-monotonic height allowed (v4)" {
+    const ergo_tree = [_]u8{0x00};
+    const outputs = [_]Output{Output.init(1000000, &ergo_tree, 50)}; // Height 50
+    var inputs = [_]BoxView{std.mem.zeroes(BoxView)};
+    inputs[0].creation_height = 100; // Input from height 100
+
+    // Output height 50 < input height 100 - allowed for v4
+    const result = verifyCreationHeights(&outputs, &inputs, 200, 4);
+    try std.testing.expect(result.ok);
+}
+
+// ============================================================================
+// Box Size Tests
+// ============================================================================
+
+test "consensus: box size within limit" {
+    const ergo_tree = [_]u8{0x00} ** 100; // 100 byte ErgoTree
+    const outputs = [_]Output{Output.init(1000000, &ergo_tree, 100)};
+
+    const result = verifyBoxSizes(&outputs);
+    try std.testing.expect(result.ok);
+}
+
+test "consensus: proposition too large rejected" {
+    // Create ErgoTree larger than 4KB
+    var large_tree: [4097]u8 = undefined;
+    @memset(&large_tree, 0x00);
+    const outputs = [_]Output{Output.init(1000000, &large_tree, 100)};
+
+    const result = verifyBoxSizes(&outputs);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.PropositionTooLarge, result.err.?);
+}
+
+// ============================================================================
+// Token Constraint Tests
+// ============================================================================
+
+test "consensus: token constraints valid" {
+    const token_id = [_]u8{0xAA} ** 32;
+    const tokens = [_]Token{.{ .id = token_id, .amount = 100 }};
+
+    const ergo_tree = [_]u8{0x00};
+    var outputs = [_]Output{Output.init(1000000, &ergo_tree, 100)};
+    outputs[0].tokens = &tokens;
+
+    const result = verifyTokenConstraints(&outputs);
+    try std.testing.expect(result.ok);
+}
+
+test "consensus: non-positive token amount rejected" {
+    const token_id = [_]u8{0xAA} ** 32;
+    const tokens = [_]Token{.{ .id = token_id, .amount = 0 }}; // Zero amount
+
+    const ergo_tree = [_]u8{0x00};
+    var outputs = [_]Output{Output.init(1000000, &ergo_tree, 100)};
+    outputs[0].tokens = &tokens;
+
+    const result = verifyTokenConstraints(&outputs);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.NonPositiveTokenAmount, result.err.?);
+}
+
+test "consensus: negative token amount rejected" {
+    const token_id = [_]u8{0xAA} ** 32;
+    const tokens = [_]Token{.{ .id = token_id, .amount = -50 }}; // Negative amount
+
+    const ergo_tree = [_]u8{0x00};
+    var outputs = [_]Output{Output.init(1000000, &ergo_tree, 100)};
+    outputs[0].tokens = &tokens;
+
+    const result = verifyTokenConstraints(&outputs);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.NonPositiveTokenAmount, result.err.?);
 }

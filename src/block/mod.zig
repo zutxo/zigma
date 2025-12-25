@@ -40,6 +40,21 @@ pub const BlockVerifyResult = verifier.BlockVerifyResult;
 pub const TxVerifyResult = verifier.TxVerifyResult;
 pub const ErgoNodeClient = http.ErgoNodeClient;
 
+// Consensus validation exports
+pub const ConsensusError = consensus.ConsensusError;
+pub const verifyNoDust = consensus.verifyNoDust;
+pub const verifyCreationHeights = consensus.verifyCreationHeights;
+pub const verifyBoxSizes = consensus.verifyBoxSizes;
+pub const verifyTokenConstraints = consensus.verifyTokenConstraints;
+pub const minimalErgoAmount = consensus.minimalErgoAmount;
+pub const estimateBoxSize = consensus.estimateBoxSize;
+
+// Protocol constants
+pub const MAX_TOKENS_PER_BOX = consensus.MAX_TOKENS_PER_BOX;
+pub const MAX_BOX_SIZE = consensus.MAX_BOX_SIZE;
+pub const MAX_PROPOSITION_SIZE = consensus.MAX_PROPOSITION_SIZE;
+pub const MIN_VALUE_PER_BYTE = consensus.MIN_VALUE_PER_BYTE;
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
