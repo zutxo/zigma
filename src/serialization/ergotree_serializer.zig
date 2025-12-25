@@ -179,6 +179,61 @@ pub const DeserializeError = error{
 };
 
 // ============================================================================
+// Deserialization Diagnostics
+// ============================================================================
+
+/// Phase of deserialization where an error occurred
+pub const DeserializePhase = enum {
+    header,
+    constants,
+    constant_type,
+    constant_value,
+    expression,
+};
+
+/// Diagnostic information for deserialization failures.
+/// Captures context to help identify the root cause of errors.
+pub const DeserializeDiagnostics = struct {
+    /// The error that occurred
+    err: DeserializeError,
+    /// Byte offset where the error occurred
+    byte_offset: u32,
+    /// The byte value at the error location (if available)
+    failed_byte: ?u8,
+    /// Phase of deserialization
+    phase: DeserializePhase,
+    /// Index of the constant being parsed (if in constants phase)
+    constant_index: ?u16,
+
+    /// Format diagnostics as a human-readable string
+    pub fn format(self: DeserializeDiagnostics, buf: []u8) []const u8 {
+        const phase_str = switch (self.phase) {
+            .header => "header",
+            .constants => "constants",
+            .constant_type => "constant_type",
+            .constant_value => "constant_value",
+            .expression => "expression",
+        };
+
+        const err_str = @errorName(self.err);
+
+        return if (self.failed_byte) |byte|
+            std.fmt.bufPrint(buf, "{s} at offset {d} (byte 0x{X:0>2}) in {s}", .{
+                err_str,
+                self.byte_offset,
+                byte,
+                phase_str,
+            }) catch "format error"
+        else
+            std.fmt.bufPrint(buf, "{s} at offset {d} in {s}", .{
+                err_str,
+                self.byte_offset,
+                phase_str,
+            }) catch "format error";
+    }
+};
+
+// ============================================================================
 // Deserialize Functions
 // ============================================================================
 
@@ -234,6 +289,207 @@ pub fn deserialize(
         // Extra bytes - could be padding or error
         // For now, don't fail - some trees may have padding
     }
+}
+
+/// Deserialize an ErgoTree with detailed diagnostics on failure.
+/// Use this for debugging deserialization errors - provides byte offset,
+/// failed byte value, and phase information.
+pub fn deserializeWithDiagnostics(
+    tree: *ErgoTree,
+    data: []const u8,
+    arena: anytype,
+    diag: *?DeserializeDiagnostics,
+) DeserializeError!void {
+    diag.* = null;
+
+    // SECURITY: Enforce 4KB size limit
+    if (data.len > max_ergo_tree_size) {
+        diag.* = .{
+            .err = error.TreeTooBig,
+            .byte_offset = 0,
+            .failed_byte = if (data.len > 0) data[0] else null,
+            .phase = .header,
+            .constant_index = null,
+        };
+        return error.TreeTooBig;
+    }
+
+    var reader = vlq.Reader.init(data);
+
+    // Parse header byte
+    const header_byte = reader.readByte() catch {
+        diag.* = .{
+            .err = error.UnexpectedEndOfInput,
+            .byte_offset = @intCast(reader.pos),
+            .failed_byte = null,
+            .phase = .header,
+            .constant_index = null,
+        };
+        return error.UnexpectedEndOfInput;
+    };
+
+    // Check for reserved bits
+    if (header_byte & HeaderFlags.reserved_mask != 0) {
+        diag.* = .{
+            .err = error.InvalidHeader,
+            .byte_offset = 0,
+            .failed_byte = header_byte,
+            .phase = .header,
+            .constant_index = null,
+        };
+        return error.InvalidHeader;
+    }
+
+    tree.header = ErgoTreeHeader.parse(header_byte) catch {
+        diag.* = .{
+            .err = error.InvalidHeader,
+            .byte_offset = 0,
+            .failed_byte = header_byte,
+            .phase = .header,
+            .constant_index = null,
+        };
+        return error.InvalidHeader;
+    };
+
+    // Parse optional size field
+    if (tree.header.has_size) {
+        tree.size = reader.readU32() catch |e| {
+            const err = mapVlqError(e);
+            diag.* = .{
+                .err = err,
+                .byte_offset = @intCast(reader.pos),
+                .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
+                .phase = .header,
+                .constant_index = null,
+            };
+            return err;
+        };
+    }
+
+    // Parse constants if segregation enabled
+    if (tree.header.constant_segregation) {
+        parseConstantsWithDiagnostics(tree, &reader, arena, data, diag) catch |e| {
+            return e;
+        };
+    }
+
+    // Copy constants to expression tree for ConstantPlaceholder resolution
+    for (0..tree.constant_count) |i| {
+        tree.expr_tree.constants[i] = tree.constant_values[i];
+    }
+    tree.expr_tree.constant_count = tree.constant_count;
+
+    // Parse root expression
+    const expr_start = reader.pos;
+    expr_serializer.deserialize(&tree.expr_tree, &reader, arena) catch |e| {
+        const err: DeserializeError = switch (e) {
+            error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
+            error.Overflow => error.Overflow,
+            error.InvalidOpcode => error.InvalidOpcode,
+            error.ExpressionTooComplex => error.ExpressionTooComplex,
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidTypeCode => error.InvalidTypeCode,
+            error.PoolFull => error.PoolFull,
+            error.NestingTooDeep => error.NestingTooDeep,
+            error.InvalidTupleLength => error.InvalidTupleLength,
+            error.InvalidData => error.InvalidData,
+            error.TypeMismatch => error.TypeMismatch,
+            error.NotSupported => error.NotSupported,
+        };
+        diag.* = .{
+            .err = err,
+            .byte_offset = @intCast(reader.pos),
+            .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
+            .phase = .expression,
+            .constant_index = null,
+        };
+        _ = expr_start;
+        return err;
+    };
+}
+
+fn parseConstantsWithDiagnostics(
+    tree: *ErgoTree,
+    reader: *vlq.Reader,
+    arena: anytype,
+    data: []const u8,
+    diag: *?DeserializeDiagnostics,
+) DeserializeError!void {
+    // Read constant count (VLQ u32)
+    const count = reader.readU32() catch |e| {
+        const err = mapVlqError(e);
+        diag.* = .{
+            .err = err,
+            .byte_offset = @intCast(reader.pos),
+            .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
+            .phase = .constants,
+            .constant_index = null,
+        };
+        return err;
+    };
+
+    if (count > max_constants) {
+        diag.* = .{
+            .err = error.TooManyConstants,
+            .byte_offset = @intCast(reader.pos),
+            .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
+            .phase = .constants,
+            .constant_index = null,
+        };
+        return error.TooManyConstants;
+    }
+
+    // Parse each constant: type + value
+    var i: u16 = 0;
+    while (i < count) : (i += 1) {
+        const type_start = reader.pos;
+
+        // Parse type
+        const type_idx = type_serializer.deserialize(tree.type_pool, reader) catch |e| {
+            const err: DeserializeError = switch (e) {
+                error.InvalidTypeCode => error.InvalidTypeCode,
+                error.PoolFull => error.PoolFull,
+                error.NestingTooDeep => error.NestingTooDeep,
+                error.InvalidTupleLength => error.InvalidTupleLength,
+                else => error.InvalidData,
+            };
+            diag.* = .{
+                .err = err,
+                .byte_offset = @intCast(type_start),
+                .failed_byte = if (type_start < data.len) data[type_start] else null,
+                .phase = .constant_type,
+                .constant_index = i,
+            };
+            return err;
+        };
+
+        const value_start = reader.pos;
+
+        // Parse value
+        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, null) catch |e| {
+            const err: DeserializeError = switch (e) {
+                error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
+                error.Overflow => error.Overflow,
+                error.InvalidData, error.InvalidGroupElement => error.InvalidData,
+                error.OutOfMemory => error.OutOfMemory,
+                error.TypeMismatch => error.TypeMismatch,
+                error.NotSupported => error.NotSupported,
+            };
+            diag.* = .{
+                .err = err,
+                .byte_offset = @intCast(value_start),
+                .failed_byte = if (value_start < data.len) data[value_start] else null,
+                .phase = .constant_value,
+                .constant_index = i,
+            };
+            return err;
+        };
+
+        tree.constant_types[i] = type_idx;
+        tree.constant_values[i] = value;
+    }
+
+    tree.constant_count = @truncate(count);
 }
 
 fn parseConstants(

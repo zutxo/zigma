@@ -140,6 +140,8 @@ pub const InputVerifyResult = struct {
     err: ?VerificationError,
     /// Cost consumed
     cost: u64,
+    /// Deserialization diagnostics (if script deserialization failed)
+    deser_diag: ?ergotree_serializer.DeserializeDiagnostics,
 
     /// Create success result
     pub fn success(input_index: u16, cost: u64) InputVerifyResult {
@@ -148,6 +150,7 @@ pub const InputVerifyResult = struct {
             .valid = true,
             .err = null,
             .cost = cost,
+            .deser_diag = null,
         };
     }
 
@@ -158,6 +161,22 @@ pub const InputVerifyResult = struct {
             .valid = false,
             .err = err,
             .cost = 0,
+            .deser_diag = null,
+        };
+    }
+
+    /// Create failure result with deserialization diagnostics
+    pub fn failureWithDiag(
+        input_index: u16,
+        err: VerificationError,
+        diag: ?ergotree_serializer.DeserializeDiagnostics,
+    ) InputVerifyResult {
+        return .{
+            .input_index = input_index,
+            .valid = false,
+            .err = err,
+            .cost = 0,
+            .deser_diag = diag,
         };
     }
 };
@@ -616,8 +635,18 @@ pub const BlockVerifier = struct {
         self.arena = memory_mod.BumpAllocator(4096).init(); // Reset for this input
         self.ergo_tree = ergotree_serializer.ErgoTree.init(&self.type_pool);
 
-        ergotree_serializer.deserialize(&self.ergo_tree, input_box.proposition_bytes, &self.arena) catch {
-            return InputVerifyResult.failure(input_index, VerificationError.ScriptDeserializationFailed);
+        var deser_diag: ?ergotree_serializer.DeserializeDiagnostics = null;
+        ergotree_serializer.deserializeWithDiagnostics(
+            &self.ergo_tree,
+            input_box.proposition_bytes,
+            &self.arena,
+            &deser_diag,
+        ) catch {
+            return InputVerifyResult.failureWithDiag(
+                input_index,
+                VerificationError.ScriptDeserializationFailed,
+                deser_diag,
+            );
         };
 
         // Initialize evaluator (update pointers only to avoid stack copy)

@@ -1869,6 +1869,26 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
                                 try stdout.print(": {s}", .{@errorName(in_err)});
                             }
                             try stdout.print("\n", .{});
+
+                            // Print deserialization diagnostics if available
+                            if (input_result.deser_diag) |diag| {
+                                var diag_buf: [256]u8 = undefined;
+                                const diag_str = diag.format(&diag_buf);
+                                try stdout.print("  Diagnostics: {s}\n", .{diag_str});
+
+                                // Show the phase and constant index if applicable
+                                const phase_str = switch (diag.phase) {
+                                    .header => "header parsing",
+                                    .constants => "constant count",
+                                    .constant_type => "constant type",
+                                    .constant_value => "constant value",
+                                    .expression => "expression parsing",
+                                };
+                                try stdout.print("  Phase: {s}\n", .{phase_str});
+                                if (diag.constant_index) |ci| {
+                                    try stdout.print("  Constant index: {}\n", .{ci});
+                                }
+                            }
                             break;
                         }
                     }
