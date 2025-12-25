@@ -271,7 +271,7 @@ pub const TransactionStorage = struct {
     byte_arena: [64 * 1024]u8,
     byte_pos: usize,
 
-    /// Initialize empty storage
+    /// Initialize empty storage (WARNING: may overflow stack for large structs)
     pub fn init() TransactionStorage {
         return .{
             .inputs = undefined,
@@ -285,6 +285,15 @@ pub const TransactionStorage = struct {
             .byte_arena = undefined,
             .byte_pos = 0,
         };
+    }
+
+    /// Initialize in-place (avoids stack overflow for large struct)
+    pub fn initInPlace(self: *TransactionStorage) void {
+        self.input_count = 0;
+        self.output_count = 0;
+        self.data_input_count = 0;
+        self.token_count = 0;
+        self.byte_pos = 0;
     }
 
     /// Reset for reuse

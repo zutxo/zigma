@@ -376,6 +376,41 @@ pub const TypePool = struct {
         return pool;
     }
 
+    /// Initialize pool in-place (avoids stack copy of large struct)
+    pub fn initInPlace(self: *TypePool) void {
+        self.count = first_dynamic;
+
+        // Primitives
+        self.types[BOOLEAN] = .boolean;
+        self.types[BYTE] = .byte;
+        self.types[SHORT] = .short;
+        self.types[INT] = .int;
+        self.types[LONG] = .long;
+        self.types[BIG_INT] = .big_int;
+        self.types[GROUP_ELEMENT] = .group_element;
+        self.types[SIGMA_PROP] = .sigma_prop;
+        self.types[UNSIGNED_BIG_INT] = .unsigned_big_int;
+
+        // Objects
+        self.types[ANY] = .any;
+        self.types[UNIT] = .unit;
+        self.types[BOX] = .box;
+        self.types[AVL_TREE] = .avl_tree;
+        self.types[CONTEXT] = .context;
+        self.types[HEADER] = .header;
+        self.types[PRE_HEADER] = .pre_header;
+        self.types[GLOBAL] = .global;
+
+        // Common composites
+        self.types[COLL_BYTE] = .{ .coll = BYTE };
+        self.types[COLL_INT] = .{ .coll = INT };
+        self.types[COLL_LONG] = .{ .coll = LONG };
+        self.types[COLL_COLL_BYTE] = .{ .coll = COLL_BYTE };
+        self.types[OPTION_INT] = .{ .option = INT };
+        self.types[OPTION_LONG] = .{ .option = LONG };
+        self.types[OPTION_COLL_BYTE] = .{ .option = COLL_BYTE };
+    }
+
     /// Get type at index
     pub fn get(self: *const TypePool, idx: TypeIndex) SType {
         assert(idx < self.count);

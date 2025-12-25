@@ -42,10 +42,10 @@ const Value = data.Value;
 const TypePool = types.TypePool;
 const TypeIndex = types.TypeIndex;
 const BumpAllocator = memory.BumpAllocator;
-const ValuePool = value_pool.ValuePool;
+pub const ValuePool = value_pool.ValuePool;
 const PooledValue = value_pool.PooledValue;
 const null_value_idx = value_pool.null_value_idx;
-const RegisterCache = register_cache.RegisterCache;
+pub const RegisterCache = register_cache.RegisterCache;
 const RegisterCacheEntry = register_cache.RegisterCacheEntry;
 const BoxSource = register_cache.BoxSource;
 const BigInt256 = crypto_bigint.BigInt256;
@@ -607,12 +607,12 @@ pub const Evaluator = struct {
     deserialize_depth: u8 = 0,
 
     /// Memory pools container
-    const MemoryPools = struct {
+    pub const MemoryPools = struct {
         values: ValuePool = ValuePool.init(),
         register_cache: RegisterCache = RegisterCache.init(),
         type_pool: TypePool = TypePool.init(),
 
-        fn init() MemoryPools {
+        pub fn init() MemoryPools {
             return .{};
         }
 

@@ -39,6 +39,11 @@ pub const SingleBoxStorage = struct {
         };
     }
 
+    pub fn initInPlace(self: *SingleBoxStorage) void {
+        self.byte_pos = 0;
+        self.token_count = 0;
+    }
+
     pub fn reset(self: *SingleBoxStorage) void {
         self.byte_pos = 0;
         self.token_count = 0;
@@ -80,7 +85,7 @@ pub const HttpUtxoSource = struct {
     /// Fetch errors
     errors: u64,
 
-    /// Initialize HTTP UTXO source
+    /// Initialize HTTP UTXO source (WARNING: may overflow stack)
     pub fn init(client: *ErgoNodeClient, allocator: std.mem.Allocator) HttpUtxoSource {
         return HttpUtxoSource{
             .client = client,
@@ -89,6 +94,15 @@ pub const HttpUtxoSource = struct {
             .misses = 0,
             .errors = 0,
         };
+    }
+
+    /// Initialize in-place (avoids stack overflow for large struct)
+    pub fn initInPlace(self: *HttpUtxoSource, client: *ErgoNodeClient, allocator: std.mem.Allocator) void {
+        self.client = client;
+        self.allocator = allocator;
+        self.storage.initInPlace();
+        self.misses = 0;
+        self.errors = 0;
     }
 
     /// Deinitialize (no-op, no heap allocations)

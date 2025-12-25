@@ -1739,7 +1739,7 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
         return;
     };
     defer allocator.destroy(http_utxo);
-    http_utxo.* = block_mod.http_utxo.HttpUtxoSource.init(client, allocator);
+    http_utxo.initInPlace(client, allocator);
     const utxo_source = http_utxo.asSource();
 
     // Initialize verifier on heap (struct is too large for stack)
@@ -1756,7 +1756,14 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
         return;
     };
     defer allocator.destroy(block_storage);
-    block_storage.* = block_mod.BlockStorage.init();
+    block_storage.initInPlace();
+
+    // Allocate result on heap (struct is 5MB+ due to tx_results array)
+    const result = allocator.create(block_mod.BlockVerifyResult) catch {
+        try stdout.print("Error: Failed to allocate block verify result\n", .{});
+        return;
+    };
+    defer allocator.destroy(result);
 
     // Scan blocks
     var verified: u32 = 0;
@@ -1830,7 +1837,7 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
 
         // Verify block
         http_utxo.reset(); // Clear storage for new block
-        const result = verifier.verifyBlock(&blk);
+        verifier.verifyBlockInPlace(&blk, result);
 
         if (result.valid) {
             verified += 1;

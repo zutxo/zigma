@@ -161,7 +161,7 @@ pub const BlockStorage = struct {
     ad_proofs: [256 * 1024]u8,
     ad_proofs_len: usize,
 
-    /// Initialize empty storage
+    /// Initialize empty storage (WARNING: may overflow stack for large structs)
     pub fn init() BlockStorage {
         return .{
             .transactions = undefined,
@@ -174,6 +174,15 @@ pub const BlockStorage = struct {
             .ad_proofs = undefined,
             .ad_proofs_len = 0,
         };
+    }
+
+    /// Initialize in-place (avoids stack overflow for large struct)
+    pub fn initInPlace(self: *BlockStorage) void {
+        self.tx_count = 0;
+        self.ext_count = 0;
+        self.tx_storage.initInPlace();
+        self.ext_pos = 0;
+        self.ad_proofs_len = 0;
     }
 
     /// Reset for reuse

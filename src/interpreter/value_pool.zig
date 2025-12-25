@@ -191,6 +191,11 @@ pub const ValuePool = struct {
         };
     }
 
+    /// Initialize pool in-place (avoids stack copy)
+    pub fn initInPlace(self: *Self) void {
+        self.count = 0;
+    }
+
     /// Allocate a slot and return its index.
     /// Returns error if pool exhausted.
     pub fn alloc(self: *Self) error{PoolExhausted}!u16 {

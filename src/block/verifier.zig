@@ -10,6 +10,7 @@ const pipeline_mod = @import("../sigma/pipeline.zig");
 const ergotree_serializer = @import("../serialization/ergotree_serializer.zig");
 const types_mod = @import("../core/types.zig");
 const memory_mod = @import("../interpreter/memory.zig");
+const data_serializer = @import("../serialization/data_serializer.zig");
 const transaction = @import("transaction.zig");
 const block_mod = @import("block.zig");
 const utxo_mod = @import("utxo.zig");
@@ -394,8 +395,8 @@ pub const BlockVerifier = struct {
         // output_boxes left undefined (populated per-tx)
         self.output_count = 0;
         // expr_buffer left undefined (used during deserialization)
-        self.type_pool = types_mod.TypePool.init();
-        self.arena = memory_mod.BumpAllocator(4096).init();
+        self.type_pool.initInPlace();
+        self.arena.reset();
         // Zero context fields individually to avoid std.mem.zeroes stack temp
         self.context.inputs = &[_]BoxView{};
         self.context.outputs = &[_]BoxView{};
@@ -430,8 +431,13 @@ pub const BlockVerifier = struct {
         self.evaluator.cost_limit = DEFAULT_TX_COST_LIMIT;
         self.evaluator.deadline_ns = null;
         self.evaluator.ops_since_timeout_check = 0;
-        self.evaluator.arena = memory_mod.BumpAllocator(4096).init();
+        self.evaluator.arena.reset();
+        self.evaluator.var_bindings = [_]?data_serializer.Value{null} ** 64;
         self.evaluator.values_sp = 0;
+        // Initialize pools fields directly to avoid stack temp from MemoryPools.init()
+        self.evaluator.pools.values.initInPlace();
+        self.evaluator.pools.register_cache.reset();
+        self.evaluator.pools.type_pool.initInPlace();
         self.evaluator.metrics = null;
         self.evaluator.deserialize_depth = 0;
         // Statistics
@@ -491,23 +497,30 @@ pub const BlockVerifier = struct {
     // Block Verification
     // ========================================================================
 
-    /// Verify a complete block
+    /// Verify a complete block (WARNING: returns 5MB+ struct, may overflow stack)
     pub fn verifyBlock(self: *BlockVerifier, blk: *const Block) BlockVerifyResult {
+        var result: BlockVerifyResult = undefined;
+        self.verifyBlockInPlace(blk, &result);
+        return result;
+    }
+
+    /// Verify a complete block with out-parameter (avoids 5MB stack allocation)
+    pub fn verifyBlockInPlace(self: *BlockVerifier, blk: *const Block, result: *BlockVerifyResult) void {
         const start_time = std.time.nanoTimestamp();
-        var result = BlockVerifyResult.init(blk);
+        result.* = BlockVerifyResult.init(blk);
 
         // Check for empty block
         if (blk.transactions.len == 0) {
             result.valid = false;
             result.first_error = VerificationError.EmptyBlock;
-            return result;
+            return;
         }
 
         // Check transaction count
         if (blk.transactions.len > MAX_TRANSACTIONS) {
             result.valid = false;
             result.first_error = VerificationError.TooManyTransactions;
-            return result;
+            return;
         }
 
         // Verify Merkle root (v2+ blocks include witness hashes)
@@ -529,8 +542,6 @@ pub const BlockVerifier = struct {
         self.blocks_verified += 1;
         self.txs_verified += blk.transactions.len;
         self.total_cost += result.total_cost;
-
-        return result;
     }
 
     // ========================================================================
