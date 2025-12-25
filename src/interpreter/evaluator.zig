@@ -6388,29 +6388,24 @@ pub const Evaluator = struct {
         }
 
         // Step 2: Parse original constant types and offsets
+        // Use a local type pool for parsing complex types
+        var const_type_pool = TypePool.init();
         var original_types: [max_subst_constants]TypeIndex = undefined;
         var original_offsets: [max_subst_constants + 1]usize = undefined;
         original_offsets[0] = reader.pos;
 
         var i: u32 = 0;
         while (i < num_constants) : (i += 1) {
-            // Parse type code - for SubstConstants we only support primitive types
-            const type_code = reader.readByte() catch return error.InvalidData;
-
-            // Primitive types: type_code 1-111 maps directly to TypeIndex
-            // Generic types (Coll, Option, Tuple) need additional bytes
-            var type_idx: TypeIndex = undefined;
-            if (type_code <= 111) {
-                type_idx = type_code;
-            } else {
-                // Generic type - for now only handle simple cases
-                // This is a limitation; full support would need type pool
-                return error.UnsupportedExpression;
-            }
+            // Parse type using type_serializer (handles all type codes including generics)
+            const type_idx = type_serializer.deserialize(&const_type_pool, &reader) catch {
+                return error.InvalidData;
+            };
             original_types[i] = type_idx;
 
-            // Skip value data (don't materialize)
-            try skipValueData(type_idx, &reader);
+            // Skip value data using the proper type pool
+            skipValueForType(&const_type_pool, &reader, type_idx) catch {
+                return error.InvalidData;
+            };
             original_offsets[i + 1] = reader.pos;
         }
 
@@ -6482,13 +6477,14 @@ pub const Evaluator = struct {
                 // TYPE CHECK: new value must match original type
                 const expected_type = original_types[i];
                 const actual_type = self.valueTypeIndex(new_val);
-                if (!typesCompatible(expected_type, actual_type, &self.tree.type_pool)) {
+                if (!typesCompatible(expected_type, actual_type, &const_type_pool)) {
                     return error.TypeMismatch;
                 }
 
-                // Serialize type + value
-                const bytes_written = try self.serializeConstant(
+                // Serialize type + value using full serializers
+                const bytes_written = try self.serializeConstantFull(
                     expected_type,
+                    &const_type_pool,
                     new_val,
                     output[out_pos..],
                 );
@@ -6648,37 +6644,226 @@ pub const Evaluator = struct {
         return result;
     }
 
-    /// Skip over serialized value data without parsing
-    fn skipValueData(type_idx: TypeIndex, reader: *vlq.Reader) EvalError!void {
-        switch (type_idx) {
-            TypePool.BOOLEAN => _ = reader.readByte() catch return error.InvalidData,
-            TypePool.BYTE => _ = reader.readByte() catch return error.InvalidData,
-            TypePool.SHORT => _ = reader.readI16() catch return error.InvalidData,
-            TypePool.INT => _ = reader.readI32() catch return error.InvalidData,
-            TypePool.LONG => _ = reader.readI64() catch return error.InvalidData,
-            TypePool.BIG_INT => {
-                const len = reader.readU32() catch return error.InvalidData;
-                if (reader.pos + len > reader.data.len) return error.InvalidData;
-                reader.pos += len;
-            },
-            TypePool.GROUP_ELEMENT => {
+    /// Skip over serialized value data without parsing.
+    /// Uses work stack for complex types (no recursion per ZIGMA_STYLE).
+    fn skipValueForType(pool: *const TypePool, reader: *vlq.Reader, start_type: TypeIndex) EvalError!void {
+        const max_skip_depth: usize = 64;
+
+        // Work stack: each entry is a type index to skip
+        var work_stack: [max_skip_depth]SkipWork = undefined;
+        var stack_len: usize = 0;
+
+        // Push initial type
+        work_stack[0] = .{ .type_idx = start_type, .count = 1 };
+        stack_len = 1;
+
+        // Process work stack iteratively
+        while (stack_len > 0) {
+            stack_len -= 1;
+            var work = work_stack[stack_len];
+
+            while (work.count > 0) {
+                work.count -= 1;
+
+                const stype = pool.get(work.type_idx);
+
+                switch (stype) {
+                    .unit => {}, // 0 bytes
+
+                    .boolean, .byte => {
+                        _ = reader.readByte() catch return error.InvalidData;
+                    },
+
+                    .short => {
+                        _ = reader.readI16() catch return error.InvalidData;
+                    },
+
+                    .int => {
+                        _ = reader.readI32() catch return error.InvalidData;
+                    },
+
+                    .long => {
+                        _ = reader.readI64() catch return error.InvalidData;
+                    },
+
+                    .big_int, .unsigned_big_int => {
+                        // VLQ u16 length + bytes
+                        const len = reader.readU16() catch return error.InvalidData;
+                        if (reader.pos + len > reader.data.len) return error.InvalidData;
+                        reader.pos += len;
+                    },
+
+                    .group_element => {
+                        // 33 bytes compressed SEC1
+                        if (reader.pos + 33 > reader.data.len) return error.InvalidData;
+                        reader.pos += 33;
+                    },
+
+                    .sigma_prop => {
+                        // Skip SigmaBoolean tree
+                        try skipSigmaProp(reader);
+                    },
+
+                    .avl_tree => {
+                        // digest(33) + flags(1) + key_len(VLQ) + opt_val_len
+                        if (reader.pos + 34 > reader.data.len) return error.InvalidData;
+                        reader.pos += 34; // digest + flags
+
+                        _ = reader.readU32() catch return error.InvalidData; // key_length
+
+                        const opt_flag = reader.readByte() catch return error.InvalidData;
+                        if (opt_flag != 0) {
+                            _ = reader.readU32() catch return error.InvalidData; // value_length
+                        }
+                    },
+
+                    .coll => |elem_idx| {
+                        const len = reader.readU16() catch return error.InvalidData;
+                        if (len == 0) continue;
+
+                        const elem_type = pool.get(elem_idx);
+
+                        // Special case: Coll[Byte] - raw bytes
+                        if (elem_type == .byte) {
+                            if (reader.pos + len > reader.data.len) return error.InvalidData;
+                            reader.pos += len;
+                            continue;
+                        }
+
+                        // Special case: Coll[Boolean] - bit-packed
+                        if (elem_type == .boolean) {
+                            const byte_len = (len + 7) / 8;
+                            if (reader.pos + byte_len > reader.data.len) return error.InvalidData;
+                            reader.pos += byte_len;
+                            continue;
+                        }
+
+                        // Generic collection - push elements to skip
+                        if (stack_len >= max_skip_depth) return error.InvalidData;
+                        work_stack[stack_len] = .{ .type_idx = elem_idx, .count = len };
+                        stack_len += 1;
+                    },
+
+                    .option => |inner_idx| {
+                        const flag = reader.readByte() catch return error.InvalidData;
+                        if (flag == 0) continue; // None - nothing more to skip
+
+                        // Some - skip inner value
+                        if (stack_len >= max_skip_depth) return error.InvalidData;
+                        work_stack[stack_len] = .{ .type_idx = inner_idx, .count = 1 };
+                        stack_len += 1;
+                    },
+
+                    .pair => |p| {
+                        // Push both elements (in reverse order so first is processed first)
+                        if (stack_len + 2 > max_skip_depth) return error.InvalidData;
+                        work_stack[stack_len] = .{ .type_idx = p.second, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = p.first, .count = 1 };
+                        stack_len += 1;
+                    },
+
+                    .triple => |tr| {
+                        if (stack_len + 3 > max_skip_depth) return error.InvalidData;
+                        work_stack[stack_len] = .{ .type_idx = tr.c, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = tr.b, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = tr.a, .count = 1 };
+                        stack_len += 1;
+                    },
+
+                    .quadruple => |q| {
+                        if (stack_len + 4 > max_skip_depth) return error.InvalidData;
+                        work_stack[stack_len] = .{ .type_idx = q.d, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = q.c, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = q.b, .count = 1 };
+                        stack_len += 1;
+                        work_stack[stack_len] = .{ .type_idx = q.a, .count = 1 };
+                        stack_len += 1;
+                    },
+
+                    .tuple => |tuple_n| {
+                        const elems = tuple_n.slice();
+                        if (stack_len + elems.len > max_skip_depth) return error.InvalidData;
+
+                        // Push in reverse order
+                        var j: usize = elems.len;
+                        while (j > 0) {
+                            j -= 1;
+                            work_stack[stack_len] = .{ .type_idx = elems[j], .count = 1 };
+                            stack_len += 1;
+                        }
+                    },
+
+                    // Object types (Box, Context, Header) cannot be serialized as constants
+                    .box, .context, .header, .pre_header, .global, .any => {
+                        return error.UnsupportedExpression;
+                    },
+
+                    // Function types shouldn't appear in constants
+                    .func, .type_var => {
+                        return error.UnsupportedExpression;
+                    },
+                }
+            }
+        }
+    }
+
+    /// Work item for skipValueForType
+    const SkipWork = struct {
+        type_idx: TypeIndex,
+        count: u16, // Number of values of this type to skip
+    };
+
+    /// Skip SigmaBoolean tree (recursive structure)
+    fn skipSigmaProp(reader: *vlq.Reader) EvalError!void {
+        const opcode = reader.readByte() catch return error.InvalidData;
+
+        switch (opcode) {
+            0x00 => {}, // TrivialFalse - 0 bytes
+            0x01 => {}, // TrivialTrue - 0 bytes
+
+            0xCD => {
+                // ProveDlog - 33 byte public key
                 if (reader.pos + 33 > reader.data.len) return error.InvalidData;
                 reader.pos += 33;
             },
-            TypePool.COLL_BYTE => {
-                const len = reader.readU32() catch return error.InvalidData;
-                if (reader.pos + len > reader.data.len) return error.InvalidData;
-                reader.pos += len;
+
+            0xCE => {
+                // ProveDHTuple - 4x 33 byte public keys = 132 bytes
+                if (reader.pos + 132 > reader.data.len) return error.InvalidData;
+                reader.pos += 132;
             },
-            TypePool.SIGMA_PROP => {
-                // SigmaProp serialization is complex - variable length
-                // For now, this is a limitation
-                return error.UnsupportedExpression;
+
+            0x98 => {
+                // CAND - VLQ count + children
+                const count = reader.readU16() catch return error.InvalidData;
+                for (0..count) |_| {
+                    try skipSigmaProp(reader);
+                }
             },
-            else => {
-                // For complex types, we'd need full type pool traversal
-                return error.UnsupportedExpression;
+
+            0x99 => {
+                // COR - VLQ count + children
+                const count = reader.readU16() catch return error.InvalidData;
+                for (0..count) |_| {
+                    try skipSigmaProp(reader);
+                }
             },
+
+            0x9A => {
+                // CTHRESHOLD - k (2 bytes BE) + count + children
+                reader.pos += 2; // k
+                const count = reader.readByte() catch return error.InvalidData;
+                for (0..count) |_| {
+                    try skipSigmaProp(reader);
+                }
+            },
+
+            else => return error.InvalidData,
         }
     }
 
@@ -6781,6 +6966,43 @@ pub const Evaluator = struct {
             },
             else => return error.UnsupportedExpression,
         }
+
+        return pos;
+    }
+
+    /// Serialize a constant (type + value) to bytes using full type serialization.
+    /// Supports complex types like Coll[T], Option[T], Pair, Tuple.
+    /// Returns number of bytes written.
+    fn serializeConstantFull(
+        self: *const Evaluator,
+        type_idx: TypeIndex,
+        type_pool: *const TypePool,
+        val: Value,
+        output: []u8,
+    ) EvalError!usize {
+        var pos: usize = 0;
+
+        // Serialize type using type_serializer (handles all types)
+        const type_bytes = type_serializer.serialize(type_pool, type_idx, output) catch {
+            return error.OutOfMemory; // Buffer too small
+        };
+        pos += type_bytes;
+
+        // Serialize value using data_serializer with ValuePool access
+        const value_bytes = data.serializeWithPool(
+            type_idx,
+            type_pool,
+            val,
+            &self.pools.values,
+            output[pos..],
+        ) catch |err| {
+            return switch (err) {
+                error.BufferTooSmall => error.OutOfMemory,
+                error.NotSupported => error.UnsupportedExpression,
+                error.InvalidData => error.InvalidData,
+            };
+        };
+        pos += value_bytes;
 
         return pos;
     }

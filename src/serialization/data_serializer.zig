@@ -862,6 +862,7 @@ fn mapVlqError(err: vlq.DecodeError) DeserializeError {
 pub const SerializeError = error{
     BufferTooSmall,
     NotSupported,
+    InvalidData,
 };
 
 /// Serialize a value to bytes based on its type.
@@ -984,6 +985,396 @@ fn serializeAvlTree(value: Value, buf: []u8) SerializeError!usize {
     }
 
     return pos;
+}
+
+// ============================================================================
+// Serialize With ValuePool (for complex types)
+// ============================================================================
+
+/// Maximum serialization depth (bounded per ZIGMA_STYLE)
+const max_serialize_depth: u8 = 16;
+
+/// Serialize a value to bytes, with access to ValuePool for complex types.
+/// This is the full-featured serializer that handles Coll[T], Option[T], Pair, Tuple.
+/// Returns number of bytes written.
+pub fn serializeWithPool(
+    type_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+) SerializeError!usize {
+    return serializeWithPoolDepth(type_idx, pool, value, values, buf, 0);
+}
+
+fn serializeWithPoolDepth(
+    type_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    // PRECONDITION: Bounded recursion
+    if (depth >= max_serialize_depth) return error.NotSupported;
+
+    const t = pool.get(type_idx);
+
+    return switch (t) {
+        .unit => 0,
+        .boolean => serializeBoolean(value, buf),
+        .byte => serializeByte(value, buf),
+        .short => serializeShort(value, buf),
+        .int => serializeInt(value, buf),
+        .long => serializeLong(value, buf),
+        .big_int => serializeBigInt(value, buf),
+        .unsigned_big_int => serializeUnsignedBigInt(value, buf),
+        .group_element => serializeGroupElement(value, buf),
+        .avl_tree => serializeAvlTree(value, buf),
+        .sigma_prop => serializeSigmaProp(value, buf),
+        .coll => |elem_idx| serializeCollWithPool(elem_idx, pool, value, values, buf, depth),
+        .option => |inner_idx| serializeOptionWithPool(inner_idx, pool, value, values, buf, depth),
+        .pair => |p| serializePairWithPool(p.first, p.second, pool, value, values, buf, depth),
+        .triple => |tr| serializeTripleWithPool(tr.a, tr.b, tr.c, pool, value, values, buf, depth),
+        .quadruple => |q| serializeQuadWithPool(q.a, q.b, q.c, q.d, pool, value, values, buf, depth),
+        .tuple => |tuple_n| serializeTupleNWithPool(tuple_n.slice(), pool, value, values, buf, depth),
+        else => error.NotSupported,
+    };
+}
+
+fn serializeSigmaProp(value: Value, buf: []u8) SerializeError!usize {
+    // SigmaProp is stored as raw bytes
+    const data = value.sigma_prop.data;
+    if (buf.len < data.len) return error.BufferTooSmall;
+    @memcpy(buf[0..data.len], data);
+    return data.len;
+}
+
+fn serializeCollWithPool(
+    elem_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    const elem_type = pool.get(elem_idx);
+    var pos: usize = 0;
+
+    // Handle Coll[Byte] specially - it's stored as coll_byte or hash32
+    if (elem_type == .byte) {
+        const data: []const u8 = switch (value) {
+            .coll_byte => |cb| cb,
+            .hash32 => |*h| h,
+            else => return error.NotSupported,
+        };
+
+        // Write length (VLQ)
+        pos += vlq.encodeU64(@intCast(data.len), buf[pos..]);
+        if (buf.len < pos + data.len) return error.BufferTooSmall;
+        @memcpy(buf[pos..][0..data.len], data);
+        pos += data.len;
+        return pos;
+    }
+
+    // Handle Coll[Boolean] - bit-packed
+    if (elem_type == .boolean) {
+        // For Coll[Boolean] stored as coll_byte (1 byte per bool)
+        if (value == .coll_byte) {
+            const bools = value.coll_byte;
+            const byte_len = (bools.len + 7) / 8;
+
+            // Write length (VLQ)
+            pos += vlq.encodeU64(@intCast(bools.len), buf[pos..]);
+            if (buf.len < pos + byte_len) return error.BufferTooSmall;
+
+            // Pack bits
+            for (0..byte_len) |i| {
+                var byte_val: u8 = 0;
+                for (0..8) |bit| {
+                    const idx = i * 8 + bit;
+                    if (idx >= bools.len) break;
+                    if (bools[idx] != 0) {
+                        byte_val |= @as(u8, 1) << @intCast(7 - bit);
+                    }
+                }
+                buf[pos + i] = byte_val;
+            }
+            pos += byte_len;
+            return pos;
+        }
+    }
+
+    // Generic collection - elements stored in ValuePool
+    const coll = switch (value) {
+        .coll => |c| c,
+        else => return error.NotSupported,
+    };
+
+    // Write length (VLQ)
+    pos += vlq.encodeU64(@intCast(coll.len), buf[pos..]);
+
+    // Serialize each element
+    var i: u16 = 0;
+    while (i < coll.len) : (i += 1) {
+        const pooled = values.get(coll.start + i) orelse return error.InvalidData;
+        const elem_value = pooledToValue(pooled, pool) orelse return error.NotSupported;
+        const elem_bytes = try serializeWithPoolDepth(elem_idx, pool, elem_value, values, buf[pos..], depth + 1);
+        pos += elem_bytes;
+    }
+
+    return pos;
+}
+
+fn serializeOptionWithPool(
+    inner_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    if (buf.len < 1) return error.BufferTooSmall;
+
+    const opt = switch (value) {
+        .option => |o| o,
+        else => return error.NotSupported,
+    };
+
+    if (opt.isNone()) {
+        buf[0] = 0x00;
+        return 1;
+    }
+
+    // Some - write flag then inner value
+    buf[0] = 0x01;
+    var pos: usize = 1;
+
+    // Get inner value from ValuePool
+    const pooled = values.get(opt.value_idx) orelse return error.InvalidData;
+    const inner_value = pooledToValue(pooled, pool) orelse return error.NotSupported;
+    pos += try serializeWithPoolDepth(inner_idx, pool, inner_value, values, buf[pos..], depth + 1);
+
+    return pos;
+}
+
+fn serializePairWithPool(
+    first_idx: TypeIndex,
+    second_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    const tuple = switch (value) {
+        .tuple => |t| t,
+        else => return error.NotSupported,
+    };
+
+    // PRECONDITION: Pair has exactly 2 elements
+    assert(tuple.len == 2);
+
+    var pos: usize = 0;
+
+    // Get values - either inline or from ValuePool
+    const first_value = try getTupleElement(tuple, 0, values, pool);
+    const second_value = try getTupleElement(tuple, 1, values, pool);
+
+    pos += try serializeWithPoolDepth(first_idx, pool, first_value, values, buf[pos..], depth + 1);
+    pos += try serializeWithPoolDepth(second_idx, pool, second_value, values, buf[pos..], depth + 1);
+
+    return pos;
+}
+
+fn serializeTripleWithPool(
+    a_idx: TypeIndex,
+    b_idx: TypeIndex,
+    c_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    const tuple = switch (value) {
+        .tuple => |t| t,
+        else => return error.NotSupported,
+    };
+
+    assert(tuple.len == 3);
+
+    var pos: usize = 0;
+    const indices = [_]TypeIndex{ a_idx, b_idx, c_idx };
+
+    for (indices, 0..) |idx, i| {
+        const elem_value = try getTupleElement(tuple, @intCast(i), values, pool);
+        pos += try serializeWithPoolDepth(idx, pool, elem_value, values, buf[pos..], depth + 1);
+    }
+
+    return pos;
+}
+
+fn serializeQuadWithPool(
+    a_idx: TypeIndex,
+    b_idx: TypeIndex,
+    c_idx: TypeIndex,
+    d_idx: TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    const tuple = switch (value) {
+        .tuple => |t| t,
+        else => return error.NotSupported,
+    };
+
+    assert(tuple.len == 4);
+
+    var pos: usize = 0;
+    const indices = [_]TypeIndex{ a_idx, b_idx, c_idx, d_idx };
+
+    for (indices, 0..) |idx, i| {
+        const elem_value = try getTupleElement(tuple, @intCast(i), values, pool);
+        pos += try serializeWithPoolDepth(idx, pool, elem_value, values, buf[pos..], depth + 1);
+    }
+
+    return pos;
+}
+
+fn serializeTupleNWithPool(
+    type_indices: []const TypeIndex,
+    pool: *const TypePool,
+    value: Value,
+    values: *const ValuePool,
+    buf: []u8,
+    depth: u8,
+) SerializeError!usize {
+    const tuple = switch (value) {
+        .tuple => |t| t,
+        else => return error.NotSupported,
+    };
+
+    assert(tuple.len == type_indices.len);
+
+    var pos: usize = 0;
+
+    for (type_indices, 0..) |idx, i| {
+        const elem_value = try getTupleElement(tuple, @intCast(i), values, pool);
+        pos += try serializeWithPoolDepth(idx, pool, elem_value, values, buf[pos..], depth + 1);
+    }
+
+    return pos;
+}
+
+/// Get tuple element value - handles both inline and ValuePool storage
+fn getTupleElement(tuple: Value.TupleRef, idx: u8, values: *const ValuePool, pool: *const TypePool) SerializeError!Value {
+    // Check if inline storage (start=0, types[0]!=0 indicates inline)
+    if (tuple.start == 0 and tuple.types[0] != 0) {
+        // Inline storage - decode from values array
+        const val = tuple.values[idx];
+        const type_idx = tuple.types[idx];
+
+        // Map inline i64 to appropriate Value based on type
+        return inlineToValue(type_idx, val);
+    }
+
+    // External storage - get from ValuePool
+    const pooled = values.get(tuple.start + idx) orelse return error.InvalidData;
+    return pooledToValue(pooled, pool) orelse error.NotSupported;
+}
+
+/// Convert inline tuple value (i64) to Value based on type
+fn inlineToValue(type_idx: TypeIndex, val: i64) Value {
+    return switch (type_idx) {
+        TypePool.BOOLEAN => .{ .boolean = val != 0 },
+        TypePool.BYTE => .{ .byte = @truncate(val) },
+        TypePool.SHORT => .{ .short = @truncate(val) },
+        TypePool.INT => .{ .int = @truncate(val) },
+        TypePool.LONG => .{ .long = val },
+        else => .{ .long = val }, // Default to long for unknown primitive types
+    };
+}
+
+/// Convert PooledValue to Value (subset of types supported)
+/// Uses type_idx to determine the data variant since ValueData is a bare union.
+fn pooledToValue(pooled: *const value_pool.PooledValue, pool: *const TypePool) ?Value {
+    const type_idx = pooled.type_idx;
+
+    // Look up the SType to determine the data variant
+    const stype = pool.get(type_idx);
+
+    return switch (stype) {
+        .boolean => .{ .boolean = pooled.data.primitive != 0 },
+        .byte => .{ .byte = @truncate(pooled.data.primitive) },
+        .short => .{ .short = @truncate(pooled.data.primitive) },
+        .int => .{ .int = @truncate(pooled.data.primitive) },
+        .long => .{ .long = pooled.data.primitive },
+
+        .big_int, .unsigned_big_int => blk: {
+            var result = Value.BigInt{
+                .bytes = undefined,
+                .len = pooled.data.big_int.len,
+            };
+            @memcpy(result.bytes[0..pooled.data.big_int.len], pooled.data.big_int.bytes[0..pooled.data.big_int.len]);
+            break :blk .{ .big_int = result };
+        },
+
+        .group_element => .{ .group_element = pooled.data.group_element },
+
+        .sigma_prop => .{ .sigma_prop = .{ .data = pooled.data.sigma_prop.slice() } },
+
+        .avl_tree => .{ .avl_tree = pooled.data.avl_tree },
+
+        .box => .{
+            .box = .{
+                .source = @enumFromInt(@intFromEnum(pooled.data.box.source)),
+                .index = pooled.data.box.index,
+            },
+        },
+
+        .coll => |_| blk: {
+            // Check for Coll[Byte] stored as byte_slice
+            if (type_idx == TypePool.COLL_BYTE) {
+                break :blk .{ .coll_byte = pooled.data.byte_slice.slice() };
+            }
+            // Generic collection
+            const c = pooled.data.collection;
+            break :blk .{
+                .coll = .{
+                    .elem_type = c.elem_type,
+                    .start = c.start_idx,
+                    .len = c.len,
+                },
+            };
+        },
+
+        .option => |_| blk: {
+            const o = pooled.data.option;
+            break :blk .{
+                .option = .{
+                    .inner_type = o.inner_type,
+                    .value_idx = o.value_idx,
+                },
+            };
+        },
+
+        .pair, .triple, .quadruple, .tuple => blk: {
+            const t = pooled.data.tuple;
+            break :blk .{
+                .tuple = .{
+                    .start = t.start_idx,
+                    .len = t.len,
+                    .types = .{ 0, 0, 0, 0 }, // External storage mode
+                    .values = .{ 0, 0, 0, 0 },
+                },
+            };
+        },
+
+        else => null,
+    };
 }
 
 // ============================================================================
