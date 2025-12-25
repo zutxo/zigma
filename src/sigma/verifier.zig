@@ -797,9 +797,22 @@ fn serializeForFiatShamir(tree: *const UncheckedTree, buffer: []u8) VerifierErro
 }
 
 /// Serialize a Schnorr leaf node for Fiat-Shamir
+/// Format matches Scala's FiatShamirTree.toBytes with constant segregation:
+/// - LEAF_PREFIX (1 byte)
+/// - propLen (2 bytes big-endian) = 39
+/// - propBytes (39 bytes):
+///   - 0x10 = ErgoTree header with constant segregation
+///   - 0x01 = 1 constant
+///   - 0x08 = SSigmaProp type
+///   - 0xcd = GroupElement encoding
+///   - pk (33 bytes)
+///   - 0x73 = ConstantPlaceholder opcode
+///   - 0x00 = placeholder index 0
+/// - commitLen (2 bytes big-endian) = 33
+/// - commitment (33 bytes)
 fn serializeSchnorrLeaf(s: *const UncheckedSchnorr, buffer: []u8, pos: *usize) VerifierError!void {
-    // PRECONDITION: sufficient buffer space (1 + 2 + 35 + 2 + 33 = 73 bytes)
-    if (pos.* + 73 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: sufficient buffer space (1 + 2 + 39 + 2 + 33 = 77 bytes)
+    if (pos.* + 77 > buffer.len) return error.BufferTooSmall;
     // PRECONDITION: commitment computed
     const commitment = s.commitment orelse return error.CommitmentMismatch;
 
@@ -807,16 +820,31 @@ fn serializeSchnorrLeaf(s: *const UncheckedSchnorr, buffer: []u8, pos: *usize) V
     buffer[pos.*] = challenge_mod.LEAF_PREFIX;
     pos.* += 1;
 
-    // Proposition bytes (ErgoTree format: 0x08cd || pk, 35 bytes)
-    const prop_len: i16 = 35;
+    // Proposition bytes (ErgoTree with constant segregation, 39 bytes)
+    const prop_len: i16 = 39;
     buffer[pos.*] = @intCast((prop_len >> 8) & 0xFF);
     buffer[pos.* + 1] = @intCast(prop_len & 0xFF);
     pos.* += 2;
-    buffer[pos.*] = 0x08; // ErgoTree header v0
-    buffer[pos.* + 1] = 0xcd; // SigmaProp constant opcode
+
+    // ErgoTree header with constant segregation (0x10)
+    buffer[pos.*] = 0x10;
+    pos.* += 1;
+
+    // Constant count (1)
+    buffer[pos.*] = 0x01;
+    pos.* += 1;
+
+    // Constant: SSigmaProp type (0x08) + GroupElement (0xcd) + public key
+    buffer[pos.*] = 0x08;
+    buffer[pos.* + 1] = 0xcd;
     pos.* += 2;
     @memcpy(buffer[pos.* .. pos.* + 33], &s.proposition.public_key);
     pos.* += 33;
+
+    // Root expression: ConstantPlaceholder(0)
+    buffer[pos.*] = 0x73; // ConstantPlaceholder opcode
+    buffer[pos.* + 1] = 0x00; // index 0
+    pos.* += 2;
 
     // Commitment bytes (compressed point, 33 bytes)
     const commit_bytes = commitment.encode();
@@ -827,16 +855,26 @@ fn serializeSchnorrLeaf(s: *const UncheckedSchnorr, buffer: []u8, pos: *usize) V
     @memcpy(buffer[pos.* .. pos.* + 33], &commit_bytes);
     pos.* += 33;
 
-    // POSTCONDITION: wrote exactly 73 bytes
+    // POSTCONDITION: wrote exactly 77 bytes
 }
 
 /// Serialize a DH tuple leaf node for Fiat-Shamir
-/// Format: LEAF_PREFIX || propLen || propBytes || commitLen || commitBytes
-/// propBytes = 0x08 || ProveDHTuple opcode || g || h || u || v (134 bytes)
-/// commitBytes = a || b (66 bytes)
+/// Format matches Scala's FiatShamirTree.toBytes with constant segregation:
+/// - LEAF_PREFIX (1 byte)
+/// - propLen (2 bytes big-endian) = 138
+/// - propBytes (138 bytes):
+///   - 0x10 = ErgoTree header with constant segregation
+///   - 0x01 = 1 constant
+///   - 0x08 = SSigmaProp type
+///   - 0xce = ProveDHTuple encoding
+///   - g || h || u || v (132 bytes)
+///   - 0x73 = ConstantPlaceholder opcode
+///   - 0x00 = placeholder index 0
+/// - commitLen (2 bytes big-endian) = 66
+/// - commitment_a || commitment_b (66 bytes)
 fn serializeDHTupleLeaf(d: *const UncheckedDHTuple, buffer: []u8, pos: *usize) VerifierError!void {
-    // PRECONDITION: sufficient buffer space (1 + 2 + 134 + 2 + 66 = 205 bytes)
-    if (pos.* + 205 > buffer.len) return error.BufferTooSmall;
+    // PRECONDITION: sufficient buffer space (1 + 2 + 138 + 2 + 66 = 209 bytes)
+    if (pos.* + 209 > buffer.len) return error.BufferTooSmall;
     // PRECONDITION: commitments computed
     const commitment_a = d.commitment_a orelse return error.CommitmentMismatch;
     const commitment_b = d.commitment_b orelse return error.CommitmentMismatch;
@@ -845,13 +883,23 @@ fn serializeDHTupleLeaf(d: *const UncheckedDHTuple, buffer: []u8, pos: *usize) V
     buffer[pos.*] = challenge_mod.LEAF_PREFIX;
     pos.* += 1;
 
-    // Proposition bytes (0x08 || ProveDHTuple opcode || g || h || u || v = 134 bytes)
-    const prop_len: i16 = 134;
+    // Proposition bytes (ErgoTree with constant segregation, 138 bytes)
+    const prop_len: i16 = 138;
     buffer[pos.*] = @intCast((prop_len >> 8) & 0xFF);
     buffer[pos.* + 1] = @intCast(prop_len & 0xFF);
     pos.* += 2;
-    buffer[pos.*] = 0x08; // ErgoTree header v0
-    buffer[pos.* + 1] = 0xce; // ProveDHTuple opcode
+
+    // ErgoTree header with constant segregation (0x10)
+    buffer[pos.*] = 0x10;
+    pos.* += 1;
+
+    // Constant count (1)
+    buffer[pos.*] = 0x01;
+    pos.* += 1;
+
+    // Constant: SSigmaProp type (0x08) + ProveDHTuple (0xce) + g || h || u || v
+    buffer[pos.*] = 0x08;
+    buffer[pos.* + 1] = 0xce;
     pos.* += 2;
     @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.g);
     pos.* += 33;
@@ -861,6 +909,11 @@ fn serializeDHTupleLeaf(d: *const UncheckedDHTuple, buffer: []u8, pos: *usize) V
     pos.* += 33;
     @memcpy(buffer[pos.* .. pos.* + 33], &d.proposition.v);
     pos.* += 33;
+
+    // Root expression: ConstantPlaceholder(0)
+    buffer[pos.*] = 0x73; // ConstantPlaceholder opcode
+    buffer[pos.* + 1] = 0x00; // index 0
+    pos.* += 2;
 
     // Commitment bytes (a || b = 66 bytes)
     const commit_a_bytes = commitment_a.encode();
@@ -874,7 +927,7 @@ fn serializeDHTupleLeaf(d: *const UncheckedDHTuple, buffer: []u8, pos: *usize) V
     @memcpy(buffer[pos.* .. pos.* + 33], &commit_b_bytes);
     pos.* += 33;
 
-    // POSTCONDITION: wrote exactly 205 bytes
+    // POSTCONDITION: wrote exactly 209 bytes
 }
 
 /// Serialize AND/OR header for Fiat-Shamir

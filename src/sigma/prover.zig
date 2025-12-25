@@ -507,22 +507,32 @@ pub const Prover = struct {
             switch (state.node.*) {
                 .leaf => |leaf| {
                     // Serialize leaf: prefix + proposition + commitment
-                    if (pos + 200 > buffer.len) return error.BufferTooSmall;
+                    // Uses constant segregation format to match Scala's FiatShamirTree.toBytes
+                    if (pos + 220 > buffer.len) return error.BufferTooSmall;
 
                     buffer[pos] = challenge_mod.LEAF_PREFIX;
                     pos += 1;
 
-                    // Serialize proposition
+                    // Serialize proposition with constant segregation
                     switch (leaf) {
                         .schnorr => |s| {
-                            // ProveDlog: 0x08cd || pk
+                            // ProveDlog with constant segregation:
+                            // propLen (2 bytes) = 39
+                            // propBytes: 0x10 || 0x01 || 0x08cd || pk || 0x7300
                             buffer[pos] = 0x00;
-                            buffer[pos + 1] = 35; // length = 35
+                            buffer[pos + 1] = 39; // length = 39
                             pos += 2;
-                            buffer[pos] = 0x08;
-                            buffer[pos + 1] = 0xcd;
+                            buffer[pos] = 0x10; // ErgoTree header with constant segregation
+                            pos += 1;
+                            buffer[pos] = 0x01; // 1 constant
+                            pos += 1;
+                            buffer[pos] = 0x08; // SSigmaProp type
+                            buffer[pos + 1] = 0xcd; // ProveDlog opcode
                             @memcpy(buffer[pos + 2 .. pos + 35], &s.proposition.public_key);
                             pos += 35;
+                            buffer[pos] = 0x73; // ConstantPlaceholder opcode
+                            buffer[pos + 1] = 0x00; // index 0
+                            pos += 2;
 
                             // Commitment (33 bytes)
                             if (s.commitment_opt) |commit| {
@@ -537,17 +547,26 @@ pub const Prover = struct {
                             }
                         },
                         .dh_tuple => |d| {
-                            // ProveDHTuple: header + 4 points
+                            // ProveDHTuple with constant segregation:
+                            // propLen (2 bytes) = 138
+                            // propBytes: 0x10 || 0x01 || 0x08ce || g || h || u || v || 0x7300
                             buffer[pos] = 0x00;
-                            buffer[pos + 1] = 134;
+                            buffer[pos + 1] = 138; // length = 138
                             pos += 2;
-                            buffer[pos] = 0x08;
-                            buffer[pos + 1] = 0xce;
+                            buffer[pos] = 0x10; // ErgoTree header with constant segregation
+                            pos += 1;
+                            buffer[pos] = 0x01; // 1 constant
+                            pos += 1;
+                            buffer[pos] = 0x08; // SSigmaProp type
+                            buffer[pos + 1] = 0xce; // ProveDHTuple opcode
                             @memcpy(buffer[pos + 2 .. pos + 35], &d.proposition.g);
                             @memcpy(buffer[pos + 35 .. pos + 68], &d.proposition.h);
                             @memcpy(buffer[pos + 68 .. pos + 101], &d.proposition.u);
                             @memcpy(buffer[pos + 101 .. pos + 134], &d.proposition.v);
                             pos += 134;
+                            buffer[pos] = 0x73; // ConstantPlaceholder opcode
+                            buffer[pos + 1] = 0x00; // index 0
+                            pos += 2;
 
                             // Commitment (66 bytes)
                             if (d.commitment_opt) |commit| {
