@@ -5,8 +5,8 @@
 
 const std = @import("std");
 
-/// Maximum response size (1MB)
-pub const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
+/// Maximum response size (512KB - sized for large blocks)
+pub const MAX_RESPONSE_SIZE: usize = 512 * 1024;
 
 /// Default timeout in milliseconds
 pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
@@ -136,11 +136,20 @@ pub const ErgoNodeClient = struct {
     // UTXO API
     // ========================================================================
 
-    /// Fetch UTXO by box ID (hex string)
+    /// Fetch UTXO by box ID (only unspent boxes)
     pub fn getUtxoById(self: *ErgoNodeClient, box_id: *const [32]u8) HttpError![]const u8 {
         var path_buf: [128]u8 = undefined;
         const hex = std.fmt.bytesToHex(box_id.*, .lower);
         const path = std.fmt.bufPrint(&path_buf, "/utxo/byId/{s}", .{hex}) catch
+            return HttpError.InvalidUrl;
+        return self.get(path);
+    }
+
+    /// Fetch any box by ID (including spent boxes)
+    pub fn getBoxById(self: *ErgoNodeClient, box_id: *const [32]u8) HttpError![]const u8 {
+        var path_buf: [128]u8 = undefined;
+        const hex = std.fmt.bytesToHex(box_id.*, .lower);
+        const path = std.fmt.bufPrint(&path_buf, "/blockchain/box/byId/{s}", .{hex}) catch
             return HttpError.InvalidUrl;
         return self.get(path);
     }
@@ -199,9 +208,12 @@ pub const ErgoNodeClient = struct {
             return HttpError.InvalidUrl;
         };
 
+        // Buffer for server headers
+        var header_buffer: [8192]u8 = undefined;
+
         // Open connection
         var req = client.open(.GET, uri, .{
-            .server_header_buffer = &[_]u8{},
+            .server_header_buffer = &header_buffer,
         }) catch {
             self.last_error = HttpError.ConnectionFailed;
             return HttpError.ConnectionFailed;
@@ -210,6 +222,12 @@ pub const ErgoNodeClient = struct {
 
         // Send request
         req.send() catch {
+            self.last_error = HttpError.NetworkError;
+            return HttpError.NetworkError;
+        };
+
+        // Finish sending (required before wait)
+        req.finish() catch {
             self.last_error = HttpError.NetworkError;
             return HttpError.NetworkError;
         };

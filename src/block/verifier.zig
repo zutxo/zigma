@@ -70,6 +70,63 @@ pub const VerificationError = error{
 };
 
 // ============================================================================
+// Bug Category
+// ============================================================================
+
+/// Categorization of verification failures for diagnostics
+pub const BugCategory = enum {
+    /// Script deserialization failed (unknown opcode, malformed)
+    ScriptDeserialization,
+    /// Script evaluation failed (runtime error)
+    ScriptEvaluation,
+    /// Proof verification failed (invalid signature)
+    ProofVerification,
+    /// UTXO not found (missing from node)
+    UtxoNotFound,
+    /// Value/token balance mismatch
+    ConsensusViolation,
+    /// Cost limit exceeded
+    CostExceeded,
+    /// Merkle root mismatch
+    MerkleInvalid,
+    /// Soft-fork accepted (may mask issues)
+    SoftForkAccepted,
+    /// Internal/unknown error
+    Internal,
+
+    /// Convert from VerificationError
+    pub fn fromError(err: VerificationError) BugCategory {
+        return switch (err) {
+            VerificationError.ScriptDeserializationFailed => .ScriptDeserialization,
+            VerificationError.ScriptEvaluationFailed => .ScriptEvaluation,
+            VerificationError.ProofVerificationFailed => .ProofVerification,
+            VerificationError.CostLimitExceeded => .CostExceeded,
+            VerificationError.UtxoNotFound => .UtxoNotFound,
+            VerificationError.UtxoLookupFailed => .UtxoNotFound,
+            VerificationError.ValueImbalance => .ConsensusViolation,
+            VerificationError.TokenConservationViolation => .ConsensusViolation,
+            VerificationError.InvalidMerkleRoot => .MerkleInvalid,
+            else => .Internal,
+        };
+    }
+
+    /// Get human-readable description
+    pub fn description(self: BugCategory) []const u8 {
+        return switch (self) {
+            .ScriptDeserialization => "Script deserialization failed",
+            .ScriptEvaluation => "Script evaluation error",
+            .ProofVerification => "Proof verification failed",
+            .UtxoNotFound => "UTXO not found",
+            .ConsensusViolation => "Consensus rule violation",
+            .CostExceeded => "Cost limit exceeded",
+            .MerkleInvalid => "Invalid merkle root",
+            .SoftForkAccepted => "Soft-fork opcode accepted",
+            .Internal => "Internal error",
+        };
+    }
+};
+
+// ============================================================================
 // Result Types
 // ============================================================================
 
@@ -286,28 +343,90 @@ pub const BlockVerifier = struct {
     /// Expression tree buffer for deserialization
     expr_buffer: [64 * 1024]u8,
 
+    /// Pre-allocated type pool (reused across inputs)
+    type_pool: types_mod.TypePool,
+
+    /// Pre-allocated arena (reused across inputs)
+    arena: memory_mod.BumpAllocator(4096),
+
+    /// Pre-allocated context (reused across inputs)
+    context: Context,
+
+    /// Pre-allocated ErgoTree (reused across inputs)
+    ergo_tree: ergotree_serializer.ErgoTree,
+
+    /// Pre-allocated Evaluator (reused across inputs - struct is ~100KB)
+    evaluator: Evaluator,
+
     /// Statistics
     blocks_verified: u64,
     txs_verified: u64,
     inputs_verified: u64,
     total_cost: u64,
 
-    /// Initialize verifier with UTXO source
-    pub fn init(utxo_source: UtxoSource) BlockVerifier {
-        return .{
-            .utxo_source = utxo_source,
-            .tx_cost_limit = DEFAULT_TX_COST_LIMIT,
-            .version = VersionContext.v2(),
-            .resolved_inputs = undefined,
-            .resolved_count = 0,
-            .output_boxes = undefined,
-            .output_count = 0,
-            .expr_buffer = undefined,
-            .blocks_verified = 0,
-            .txs_verified = 0,
-            .inputs_verified = 0,
-            .total_cost = 0,
+    /// Initialize verifier in-place (avoids stack copy of huge struct).
+    /// Use this instead of init() when allocating on heap.
+    pub fn initInPlace(self: *BlockVerifier, utxo_source: UtxoSource) void {
+        self.utxo_source = utxo_source;
+        self.tx_cost_limit = DEFAULT_TX_COST_LIMIT;
+        self.version = VersionContext.v2();
+        // resolved_inputs left undefined (populated per-tx)
+        self.resolved_count = 0;
+        // output_boxes left undefined (populated per-tx)
+        self.output_count = 0;
+        // expr_buffer left undefined (used during deserialization)
+        self.type_pool = types_mod.TypePool.init();
+        self.arena = memory_mod.BumpAllocator(4096).init();
+        // Zero context fields individually to avoid std.mem.zeroes stack temp
+        self.context.inputs = &[_]BoxView{};
+        self.context.outputs = &[_]BoxView{};
+        self.context.data_inputs = &[_]BoxView{};
+        self.context.headers = &[_]HeaderView{};
+        self.context.self_index = 0;
+        self.context.height = 0;
+        self.context.pre_header = .{
+            .version = 0,
+            .parent_id = [_]u8{0} ** 32,
+            .timestamp = 0,
+            .n_bits = 0,
+            .height = 0,
+            .miner_pk = [_]u8{0} ** 33,
+            .votes = [_]u8{0} ** 3,
         };
+        self.context.context_vars = [_]?[]const u8{null} ** 256;
+        self.context.extension_cache = null;
+        // ergo_tree fields (type_pool set in verifyInput, others have defaults)
+        self.ergo_tree.type_pool = undefined;
+        self.ergo_tree.header = .{ .version = .v0, .has_size = false, .constant_segregation = false };
+        self.ergo_tree.size = null;
+        self.ergo_tree.constant_count = 0;
+        self.ergo_tree.expr_tree = .{};
+        // Initialize evaluator fields directly (tree/ctx set in verifyInput)
+        self.evaluator.tree = undefined;
+        self.evaluator.ctx = undefined;
+        self.evaluator.version_ctx = VersionContext.v2();
+        self.evaluator.work_sp = 0;
+        self.evaluator.value_sp = 0;
+        self.evaluator.cost_used = 0;
+        self.evaluator.cost_limit = DEFAULT_TX_COST_LIMIT;
+        self.evaluator.deadline_ns = null;
+        self.evaluator.ops_since_timeout_check = 0;
+        self.evaluator.arena = memory_mod.BumpAllocator(4096).init();
+        self.evaluator.values_sp = 0;
+        self.evaluator.metrics = null;
+        self.evaluator.deserialize_depth = 0;
+        // Statistics
+        self.blocks_verified = 0;
+        self.txs_verified = 0;
+        self.inputs_verified = 0;
+        self.total_cost = 0;
+    }
+
+    /// Initialize verifier with UTXO source (WARNING: may overflow stack for large structs)
+    pub fn init(utxo_source: UtxoSource) BlockVerifier {
+        var v: BlockVerifier = undefined;
+        v.initInPlace(utxo_source);
+        return v;
     }
 
     /// Reset state for new block (O(1))
@@ -481,35 +600,35 @@ pub const BlockVerifier = struct {
         height: u32,
         message: []const u8,
     ) InputVerifyResult {
-        // Build execution context
-        const ctx = Context{
-            .inputs = self.resolved_inputs[0..self.resolved_count],
-            .outputs = self.output_boxes[0..self.output_count],
-            .data_inputs = &[_]BoxView{}, // TODO: resolve data inputs
-            .self_index = input_index,
-            .height = height,
-            .headers = &[_]HeaderView{}, // TODO: populate headers
-            .pre_header = std.mem.zeroes(PreHeaderView),
-            .context_vars = [_]?[]const u8{null} ** 256,
-            .extension_cache = null,
-        };
+        // Build execution context (update pre-allocated, avoid stack temp)
+        self.context.inputs = self.resolved_inputs[0..self.resolved_count];
+        self.context.outputs = self.output_boxes[0..self.output_count];
+        self.context.data_inputs = &[_]BoxView{};
+        self.context.self_index = input_index;
+        self.context.height = height;
+        self.context.headers = &[_]HeaderView{};
+        self.context.pre_header = std.mem.zeroes(PreHeaderView);
+        // context_vars already zeroed from init
+        self.context.extension_cache = null;
 
-        // Deserialize ErgoTree
-        var type_pool = types_mod.TypePool.init();
-        var tree = ergotree_serializer.ErgoTree.init(&type_pool);
-        var arena = memory_mod.BumpAllocator(4096).init();
+        // Deserialize ErgoTree (reuse pre-allocated pools)
+        self.type_pool = types_mod.TypePool.init(); // Reset for this input
+        self.arena = memory_mod.BumpAllocator(4096).init(); // Reset for this input
+        self.ergo_tree = ergotree_serializer.ErgoTree.init(&self.type_pool);
 
-        ergotree_serializer.deserialize(&tree, input_box.proposition_bytes, &arena) catch {
+        ergotree_serializer.deserialize(&self.ergo_tree, input_box.proposition_bytes, &self.arena) catch {
             return InputVerifyResult.failure(input_index, VerificationError.ScriptDeserializationFailed);
         };
 
-        // Create evaluator
-        var eval = Evaluator.init(&tree.expr_tree, &ctx);
-        eval.setCostLimit(self.tx_cost_limit);
+        // Initialize evaluator (update pointers only to avoid stack copy)
+        // Note: evaluate() resets internal state at start, so no explicit reset needed
+        self.evaluator.tree = &self.ergo_tree.expr_tree;
+        self.evaluator.ctx = &self.context;
+        self.evaluator.setCostLimit(self.tx_cost_limit);
 
         // Verify: reduce to SigmaBoolean and verify proof
         const verify_result = pipeline_mod.reduceAndVerify(
-            &eval,
+            &self.evaluator,
             input.spending_proof.slice(),
             message,
             self.tx_cost_limit,

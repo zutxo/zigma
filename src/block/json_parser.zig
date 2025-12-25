@@ -173,9 +173,19 @@ fn parseBlockValue(value: std.json.Value, storage: *BlockStorage) ParseError!Blo
     const header = try parseHeaderValue(header_obj);
 
     // Parse transactions
-    const txs_array = getArray(value, "blockTransactions") orelse
-        getArray(value, "transactions") orelse
+    // API returns "blockTransactions" object with "transactions" array inside
+    // Or direct "transactions" array (test format)
+    const txs_array = blk: {
+        if (getObject(value, "blockTransactions")) |bt_obj| {
+            if (getArray(bt_obj, "transactions")) |txs| {
+                break :blk txs;
+            }
+        }
+        if (getArray(value, "transactions")) |txs| {
+            break :blk txs;
+        }
         return ParseError.MissingField;
+    };
 
     for (txs_array) |tx_val| {
         const tx = try parseTransactionValue(tx_val, &storage.tx_storage);
@@ -426,6 +436,18 @@ fn parseOutputValue(value: std.json.Value, storage: *TransactionStorage) ParseEr
 // Box Parsing (for UTXO lookup)
 // ============================================================================
 
+/// Generic storage interface for box parsing
+fn BoxStorageInterface(comptime T: type) type {
+    return struct {
+        pub fn allocBytes(storage: *T, len: usize) ![]u8 {
+            return storage.allocBytes(len);
+        }
+        pub fn allocTokens(storage: *T, count: usize) ![]context.Token {
+            return storage.allocTokens(count);
+        }
+    };
+}
+
 /// Parse box from JSON into BoxView using pre-allocated storage
 pub fn parseBoxJson(
     json_bytes: []const u8,
@@ -440,11 +462,28 @@ pub fn parseBoxJson(
     ) catch return ParseError.JsonSyntaxError;
     defer parsed.deinit();
 
-    return parseBoxValue(parsed.value, storage);
+    return parseBoxValueGeneric(UtxoStorage, parsed.value, storage);
 }
 
-/// Parse box from JSON value
-fn parseBoxValue(value: std.json.Value, storage: *UtxoStorage) ParseError!BoxView {
+/// Parse box from JSON using lightweight SingleBoxStorage
+pub fn parseBoxJsonSimple(
+    json_bytes: []const u8,
+    storage: anytype,
+    allocator: std.mem.Allocator,
+) ParseError!BoxView {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        json_bytes,
+        .{},
+    ) catch return ParseError.JsonSyntaxError;
+    defer parsed.deinit();
+
+    return parseBoxValueGeneric(@TypeOf(storage.*), parsed.value, storage);
+}
+
+/// Parse box from JSON value (generic over storage type)
+fn parseBoxValueGeneric(comptime Storage: type, value: std.json.Value, storage: *Storage) ParseError!BoxView {
     var box = std.mem.zeroes(BoxView);
 
     // Box ID
@@ -485,8 +524,11 @@ fn parseBoxValue(value: std.json.Value, storage: *UtxoStorage) ParseError!BoxVie
         inline for (4..10) |r| {
             const reg_name = comptime std.fmt.comptimePrint("R{d}", .{r});
             if (getString(regs_obj, reg_name)) |reg_hex| {
-                const reg_bytes = storage.allocBytes(reg_hex.len / 2) catch continue;
-                box.registers[r - 4] = parseHexDynamic(reg_hex, reg_bytes) catch null;
+                if (storage.allocBytes(reg_hex.len / 2)) |reg_bytes| {
+                    box.registers[r - 4] = parseHexDynamic(reg_hex, reg_bytes) catch null;
+                } else |_| {
+                    // Storage full, skip this register
+                }
             }
         }
     }

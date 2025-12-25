@@ -95,6 +95,8 @@ pub fn main() !void {
             return;
         }
         try verifyBlockCommand(args[2], args[3..], allocator);
+    } else if (std.mem.eql(u8, command, "scan-testnet")) {
+        try scanTestnetCommand(args[2..], allocator);
     } else if (std.mem.eql(u8, command, "prove")) {
         if (args.len < 3) {
             std.debug.print("Error: prove requires <public_key_hex> argument\n", .{});
@@ -143,6 +145,12 @@ fn printUsage() void {
         \\    --node=<url>          Node URL (default: http://localhost:9052)
         \\    -v, --verbose         Show per-transaction results
         \\    --cost-limit=<n>      Cost limit per tx (default: 10000000)
+        \\  scan-testnet            Scan testnet blocks to find verification failures
+        \\    --node=<url>          Node URL (default: http://localhost:9052)
+        \\    --count=<n>           Number of blocks to scan (default: 100)
+        \\    --from=<height>       Start from height (default: current tip)
+        \\    --continue            Continue past first failure
+        \\    -v, --verbose         Show per-block details
         \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
         \\  prove <pk_hex>          Generate Schnorr proof for ProveDlog
@@ -1643,4 +1651,252 @@ fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, alloca
     }
 
     try stdout.print("\n}}\n", .{});
+}
+
+// ============================================================================
+// Scan Testnet Command
+// ============================================================================
+
+fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse options
+    var node_url: []const u8 = "http://localhost:9052";
+    var count: u32 = 100;
+    var from_height: ?u32 = null;
+    var continue_on_error = false;
+    var verbose = false;
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--node=")) {
+            node_url = arg["--node=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--count=")) {
+            const count_str = arg["--count=".len..];
+            count = std.fmt.parseInt(u32, count_str, 10) catch {
+                try stdout.print("Error: Invalid count value\n", .{});
+                return;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--from=")) {
+            const from_str = arg["--from=".len..];
+            from_height = std.fmt.parseInt(u32, from_str, 10) catch {
+                try stdout.print("Error: Invalid from height value\n", .{});
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--continue")) {
+            continue_on_error = true;
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        }
+    }
+
+    try stdout.print("Connecting to node: {s}\n", .{node_url});
+
+    // Initialize HTTP client on heap (large buffer would overflow stack)
+    const client = allocator.create(ErgoNodeClient) catch {
+        try stdout.print("Error: Failed to allocate HTTP client\n", .{});
+        return;
+    };
+    defer allocator.destroy(client);
+    client.* = ErgoNodeClient.init(node_url);
+
+    // Get current height from node
+    const current_height = blk: {
+        const info = client.getNodeInfo() catch |err| {
+            try stdout.print("Error: Failed to get node info: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // Parse fullHeight from JSON
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, info, .{}) catch {
+            try stdout.print("Error: Failed to parse node info JSON\n", .{});
+            return;
+        };
+        defer parsed.deinit();
+
+        const height = switch (parsed.value) {
+            .object => |obj| if (obj.get("fullHeight")) |h| switch (h) {
+                .integer => |i| @as(u32, @intCast(i)),
+                else => null,
+            } else null,
+            else => null,
+        };
+
+        if (height) |h| {
+            break :blk h;
+        } else {
+            try stdout.print("Error: Could not get fullHeight from node info\n", .{});
+            return;
+        }
+    };
+
+    const start_height = from_height orelse current_height;
+    try stdout.print("Scanning from height {} (current tip: {})\n", .{ start_height, current_height });
+    try stdout.print("Will scan {} blocks, stopping on first failure: {}\n", .{ count, !continue_on_error });
+    try stdout.print("\n", .{});
+
+    // Initialize HTTP UTXO source on heap (struct is 32KB+)
+    const http_utxo = allocator.create(block_mod.http_utxo.HttpUtxoSource) catch {
+        try stdout.print("Error: Failed to allocate HTTP UTXO source\n", .{});
+        return;
+    };
+    defer allocator.destroy(http_utxo);
+    http_utxo.* = block_mod.http_utxo.HttpUtxoSource.init(client, allocator);
+    const utxo_source = http_utxo.asSource();
+
+    // Initialize verifier on heap (struct is too large for stack)
+    const verifier = allocator.create(BlockVerifier) catch {
+        try stdout.print("Error: Failed to allocate verifier\n", .{});
+        return;
+    };
+    defer allocator.destroy(verifier);
+    verifier.initInPlace(utxo_source);
+
+    // Allocate block storage on heap (struct is too large for stack - 500KB+)
+    const block_storage = allocator.create(block_mod.BlockStorage) catch {
+        try stdout.print("Error: Failed to allocate block storage\n", .{});
+        return;
+    };
+    defer allocator.destroy(block_storage);
+    block_storage.* = block_mod.BlockStorage.init();
+
+    // Scan blocks
+    var verified: u32 = 0;
+    var failed: u32 = 0;
+    var height = start_height;
+
+    while (height > 0 and verified < count) {
+        // Step 1: Get header IDs at this height
+        const header_ids_json = client.getBlockAtHeight(height) catch |err| {
+            try stdout.print("FETCH ERROR at height {}: {s}\n", .{ height, @errorName(err) });
+            if (!continue_on_error) break;
+            height -= 1;
+            continue;
+        };
+
+        // Step 2: Parse the header ID array to get the first ID
+        var header_id: [32]u8 = undefined;
+        const got_header_id = blk: {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, header_ids_json, .{}) catch {
+                break :blk false;
+            };
+            defer parsed.deinit();
+
+            const arr = switch (parsed.value) {
+                .array => |a| a,
+                else => break :blk false,
+            };
+            if (arr.items.len == 0) break :blk false;
+
+            const hex_str = switch (arr.items[0]) {
+                .string => |s| s,
+                else => break :blk false,
+            };
+            if (hex_str.len != 64) break :blk false;
+            _ = std.fmt.hexToBytes(&header_id, hex_str) catch break :blk false;
+            break :blk true;
+        };
+
+        if (!got_header_id) {
+            try stdout.print("ERROR at height {}: Failed to parse header ID\n", .{height});
+            if (!continue_on_error) break;
+            height -= 1;
+            continue;
+        }
+
+        // Step 3: Fetch the full block by header ID
+        const block_json = client.getBlockById(&header_id) catch |err| {
+            try stdout.print("FETCH ERROR at height {} (block fetch): {s}\n", .{ height, @errorName(err) });
+            if (!continue_on_error) break;
+            height -= 1;
+            continue;
+        };
+
+        // Copy json since client reuses buffer
+        const json_copy = allocator.alloc(u8, block_json.len) catch {
+            try stdout.print("Error: Allocation failed\n", .{});
+            return;
+        };
+        @memcpy(json_copy, block_json);
+        defer allocator.free(json_copy);
+
+        // Parse block (reuse heap-allocated storage)
+        block_storage.reset();
+        const blk = json_parser.parseBlockJson(json_copy, block_storage, allocator) catch |err| {
+            try stdout.print("PARSE ERROR at height {}: {s}\n", .{ height, @errorName(err) });
+            failed += 1;
+            if (!continue_on_error) break;
+            height -= 1;
+            continue;
+        };
+
+        // Verify block
+        http_utxo.reset(); // Clear storage for new block
+        const result = verifier.verifyBlock(&blk);
+
+        if (result.valid) {
+            verified += 1;
+            if (verbose) {
+                try stdout.print("Block {}: OK ({} txs, {} cost)\n", .{ height, result.tx_count, result.total_cost });
+            }
+        } else {
+            failed += 1;
+
+            // Output failure details
+            try stdout.print("\n========================================\n", .{});
+            try stdout.print("FAILURE at block {} (id: ", .{height});
+            for (result.block_id) |b| try stdout.print("{x:0>2}", .{b});
+            try stdout.print(")\n", .{});
+
+            if (result.first_error) |err| {
+                const category = block_mod.BugCategory.fromError(err);
+                try stdout.print("\nError: {s}\n", .{@errorName(err)});
+                try stdout.print("Category: {s}\n", .{category.description()});
+            }
+
+            // Find first failed transaction
+            for (result.tx_results[0..result.tx_count], 0..) |tx_result, tx_i| {
+                if (!tx_result.valid) {
+                    try stdout.print("\nTransaction {} failed", .{tx_i});
+                    if (tx_result.first_error) |tx_err| {
+                        try stdout.print(": {s}", .{@errorName(tx_err)});
+                    }
+                    try stdout.print("\n", .{});
+
+                    // Find first failed input
+                    for (tx_result.input_results[0..tx_result.input_count]) |input_result| {
+                        if (!input_result.valid) {
+                            try stdout.print("  Input {} failed", .{input_result.input_index});
+                            if (input_result.err) |in_err| {
+                                try stdout.print(": {s}", .{@errorName(in_err)});
+                            }
+                            try stdout.print("\n", .{});
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            try stdout.print("\nMerkle valid: {}\n", .{result.merkle_valid});
+            try stdout.print("========================================\n\n", .{});
+
+            if (!continue_on_error) {
+                try stdout.print("Stopping scan. Use --continue to continue past failures.\n", .{});
+                break;
+            }
+        }
+
+        height -= 1;
+    }
+
+    // Summary
+    try stdout.print("\n--- Summary ---\n", .{});
+    try stdout.print("Blocks scanned: {}\n", .{verified + failed});
+    try stdout.print("Verified OK: {}\n", .{verified});
+    try stdout.print("Failed: {}\n", .{failed});
+
+    const stats = http_utxo.getStats();
+    try stdout.print("UTXO fetches: {} (errors: {})\n", .{ stats.misses, stats.errors });
+
+    const verifier_stats = verifier.getStats();
+    try stdout.print("Total cost: {}\n", .{verifier_stats.cost});
 }

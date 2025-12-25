@@ -23,6 +23,7 @@ pub const verifier = @import("verifier.zig");
 pub const http = @import("http.zig");
 pub const json_parser = @import("json_parser.zig");
 pub const cost = @import("cost.zig");
+pub const http_utxo = @import("http_utxo.zig");
 
 // Re-export commonly used types
 pub const Transaction = transaction.Transaction;
@@ -39,7 +40,11 @@ pub const computeBoxId = utxo.computeBoxId;
 pub const BlockVerifier = verifier.BlockVerifier;
 pub const BlockVerifyResult = verifier.BlockVerifyResult;
 pub const TxVerifyResult = verifier.TxVerifyResult;
+pub const InputVerifyResult = verifier.InputVerifyResult;
+pub const VerificationError = verifier.VerificationError;
+pub const BugCategory = verifier.BugCategory;
 pub const ErgoNodeClient = http.ErgoNodeClient;
+pub const HttpUtxoSource = http_utxo.HttpUtxoSource;
 
 // Consensus validation exports
 pub const ConsensusError = consensus.ConsensusError;
