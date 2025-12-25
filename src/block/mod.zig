@@ -22,6 +22,7 @@ pub const consensus = @import("consensus.zig");
 pub const verifier = @import("verifier.zig");
 pub const http = @import("http.zig");
 pub const json_parser = @import("json_parser.zig");
+pub const cost = @import("cost.zig");
 
 // Re-export commonly used types
 pub const Transaction = transaction.Transaction;
@@ -63,6 +64,22 @@ pub const computeVersionedMerkleRoot = merkle.computeVersionedMerkleRoot;
 pub const verifyTxMerkleRootVersioned = merkle.verifyTxMerkleRootVersioned;
 pub const INITIAL_VERSION = merkle.INITIAL_VERSION;
 pub const WITNESS_ID_SIZE = merkle.WITNESS_ID_SIZE;
+
+// Cost accounting exports
+pub const JitCost = cost.JitCost;
+pub const CostParameters = cost.CostParameters;
+pub const computeInitialTxCost = cost.computeInitialTxCost;
+pub const computeInitialTxCostDefault = cost.computeInitialTxCostDefault;
+pub const computeTxInitialCost = cost.computeTxInitialCost;
+pub const computeTxInitialCostDefault = cost.computeTxInitialCostDefault;
+pub const estimateTxCost = cost.estimateTxCost;
+pub const wouldExceedCostLimit = cost.wouldExceedCostLimit;
+pub const INTERPRETER_INIT_COST = cost.INTERPRETER_INIT_COST;
+pub const INPUT_COST_DEFAULT = cost.INPUT_COST_DEFAULT;
+pub const DATA_INPUT_COST_DEFAULT = cost.DATA_INPUT_COST_DEFAULT;
+pub const OUTPUT_COST_DEFAULT = cost.OUTPUT_COST_DEFAULT;
+pub const JIT_COST_SCALE = cost.JIT_COST_SCALE;
+pub const MAX_BLOCK_COST_DEFAULT = cost.MAX_BLOCK_COST_DEFAULT;
 
 test {
     @import("std").testing.refAllDecls(@This());
