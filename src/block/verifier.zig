@@ -23,6 +23,7 @@ pub const HeaderView = context_mod.HeaderView;
 pub const PreHeaderView = context_mod.PreHeaderView;
 pub const VersionContext = context_mod.VersionContext;
 pub const Evaluator = evaluator_mod.Evaluator;
+pub const EvalDiagnostics = evaluator_mod.EvalDiagnostics;
 pub const Transaction = transaction.Transaction;
 pub const Input = transaction.Input;
 pub const Output = transaction.Output;
@@ -143,6 +144,8 @@ pub const InputVerifyResult = struct {
     cost: u64,
     /// Deserialization diagnostics (if script deserialization failed)
     deser_diag: ?ergotree_serializer.DeserializeDiagnostics,
+    /// Evaluation diagnostics (if script evaluation failed)
+    eval_diag: ?EvalDiagnostics,
 
     /// Create success result
     pub fn success(input_index: u16, cost: u64) InputVerifyResult {
@@ -152,6 +155,7 @@ pub const InputVerifyResult = struct {
             .err = null,
             .cost = cost,
             .deser_diag = null,
+            .eval_diag = null,
         };
     }
 
@@ -163,11 +167,12 @@ pub const InputVerifyResult = struct {
             .err = err,
             .cost = 0,
             .deser_diag = null,
+            .eval_diag = null,
         };
     }
 
     /// Create failure result with deserialization diagnostics
-    pub fn failureWithDiag(
+    pub fn failureWithDeserDiag(
         input_index: u16,
         err: VerificationError,
         diag: ?ergotree_serializer.DeserializeDiagnostics,
@@ -178,6 +183,23 @@ pub const InputVerifyResult = struct {
             .err = err,
             .cost = 0,
             .deser_diag = diag,
+            .eval_diag = null,
+        };
+    }
+
+    /// Create failure result with evaluation diagnostics
+    pub fn failureWithEvalDiag(
+        input_index: u16,
+        err: VerificationError,
+        diag: ?EvalDiagnostics,
+    ) InputVerifyResult {
+        return .{
+            .input_index = input_index,
+            .valid = false,
+            .err = err,
+            .cost = 0,
+            .deser_diag = null,
+            .eval_diag = diag,
         };
     }
 };
@@ -655,7 +677,7 @@ pub const BlockVerifier = struct {
             &self.evaluator.pools.values,
             &deser_diag,
         ) catch {
-            return InputVerifyResult.failureWithDiag(
+            return InputVerifyResult.failureWithDeserDiag(
                 input_index,
                 VerificationError.ScriptDeserializationFailed,
                 deser_diag,
@@ -675,11 +697,20 @@ pub const BlockVerifier = struct {
             message,
             self.tx_cost_limit,
         ) catch |err| {
-            return InputVerifyResult.failure(input_index, switch (err) {
+            const ver_err: VerificationError = switch (err) {
                 pipeline_mod.PipelineError.CostLimitExceeded => VerificationError.CostLimitExceeded,
                 pipeline_mod.PipelineError.VerificationFailed => VerificationError.ProofVerificationFailed,
                 else => VerificationError.ScriptEvaluationFailed,
-            });
+            };
+            // Capture eval diagnostics for debugging
+            if (ver_err == VerificationError.ScriptEvaluationFailed) {
+                return InputVerifyResult.failureWithEvalDiag(
+                    input_index,
+                    ver_err,
+                    self.evaluator.diag,
+                );
+            }
+            return InputVerifyResult.failure(input_index, ver_err);
         };
 
         if (!verify_result.valid) {

@@ -231,6 +231,128 @@ pub const EvalError = error{
 };
 
 // ============================================================================
+// Evaluation Diagnostics
+// ============================================================================
+
+/// Error codes for diagnostics - maps EvalError variants to stable codes.
+/// Used for display and serialization without carrying full error type.
+pub const EvalErrorCode = enum(u8) {
+    none = 0,
+    cost_limit_exceeded = 1,
+    timeout_exceeded = 2,
+    work_stack_overflow = 3,
+    value_stack_overflow = 4,
+    value_stack_underflow = 5,
+    type_mismatch = 6,
+    division_by_zero = 7,
+    arithmetic_overflow = 8,
+    invalid_shift = 9,
+    invalid_node_index = 10,
+    invalid_constant_index = 11,
+    unsupported_expression = 12,
+    invalid_bin_op = 13,
+    out_of_memory = 14,
+    undefined_variable = 15,
+    option_none = 16,
+    invalid_data = 17,
+    invalid_group_element = 18,
+    invalid_big_int = 19,
+    index_out_of_bounds = 20,
+    invalid_context = 21,
+    invalid_state = 22,
+    collection_too_large = 23,
+    soft_fork_accepted = 24,
+
+    pub fn message(self: EvalErrorCode) []const u8 {
+        return switch (self) {
+            .none => "no error",
+            .cost_limit_exceeded => "cost limit exceeded",
+            .timeout_exceeded => "timeout exceeded",
+            .work_stack_overflow => "work stack overflow",
+            .value_stack_overflow => "value stack overflow",
+            .value_stack_underflow => "value stack underflow",
+            .type_mismatch => "type mismatch",
+            .division_by_zero => "division by zero",
+            .arithmetic_overflow => "arithmetic overflow",
+            .invalid_shift => "invalid shift amount",
+            .invalid_node_index => "invalid node index",
+            .invalid_constant_index => "invalid constant index",
+            .unsupported_expression => "unsupported expression/opcode",
+            .invalid_bin_op => "invalid binary operation",
+            .out_of_memory => "out of memory",
+            .undefined_variable => "undefined variable",
+            .option_none => "None.get() called",
+            .invalid_data => "invalid data format",
+            .invalid_group_element => "invalid group element",
+            .invalid_big_int => "invalid BigInt",
+            .index_out_of_bounds => "index out of bounds",
+            .invalid_context => "invalid context state",
+            .invalid_state => "invalid internal state",
+            .collection_too_large => "collection exceeds size limit",
+            .soft_fork_accepted => "soft fork accepted",
+        };
+    }
+
+    pub fn fromEvalError(err: EvalError) EvalErrorCode {
+        return switch (err) {
+            error.CostLimitExceeded => .cost_limit_exceeded,
+            error.TimeoutExceeded => .timeout_exceeded,
+            error.WorkStackOverflow => .work_stack_overflow,
+            error.ValueStackOverflow => .value_stack_overflow,
+            error.ValueStackUnderflow => .value_stack_underflow,
+            error.TypeMismatch => .type_mismatch,
+            error.DivisionByZero => .division_by_zero,
+            error.ArithmeticOverflow => .arithmetic_overflow,
+            error.InvalidShift => .invalid_shift,
+            error.InvalidNodeIndex => .invalid_node_index,
+            error.InvalidConstantIndex => .invalid_constant_index,
+            error.UnsupportedExpression => .unsupported_expression,
+            error.InvalidBinOp => .invalid_bin_op,
+            error.OutOfMemory => .out_of_memory,
+            error.UndefinedVariable => .undefined_variable,
+            error.OptionNone => .option_none,
+            error.InvalidData => .invalid_data,
+            error.InvalidGroupElement => .invalid_group_element,
+            error.InvalidBigInt => .invalid_big_int,
+            error.IndexOutOfBounds => .index_out_of_bounds,
+            error.InvalidContext => .invalid_context,
+            error.InvalidState => .invalid_state,
+            error.CollectionTooLarge => .collection_too_large,
+            error.SoftForkAccepted => .soft_fork_accepted,
+        };
+    }
+};
+
+/// Diagnostic information captured when evaluation fails.
+/// Follows DeserializeDiagnostics pattern for consistent error reporting.
+pub const EvalDiagnostics = struct {
+    /// The specific error code that occurred
+    error_code: EvalErrorCode = .none,
+
+    /// Opcode tag being evaluated when error occurred (ExprTag as u8)
+    failed_opcode: ?u8 = null,
+
+    /// Node index in expression tree where failure occurred
+    failed_node_idx: ?u16 = null,
+
+    /// Stack depth at time of failure
+    stack_depth: ?u16 = null,
+
+    /// Cost consumed before failure
+    cost_at_failure: ?u64 = null,
+
+    /// Get human-readable error message
+    pub fn message(self: EvalDiagnostics) []const u8 {
+        return self.error_code.message();
+    }
+
+    /// Check if diagnostics contain error info
+    pub fn hasError(self: EvalDiagnostics) bool {
+        return self.error_code != .none;
+    }
+};
+
+// ============================================================================
 // Work Item
 // ============================================================================
 
@@ -618,6 +740,10 @@ pub const Evaluator = struct {
     /// Incremented when evaluating nested deserialized scripts
     deserialize_depth: u8 = 0,
 
+    /// Diagnostics captured on evaluation failure.
+    /// Reset at start of evaluate(), populated on error.
+    diag: EvalDiagnostics = .{},
+
     /// Memory pools container
     pub const MemoryPools = struct {
         values: ValuePool = ValuePool.init(),
@@ -824,6 +950,7 @@ pub const Evaluator = struct {
         self.arena.reset();
         self.var_bindings = [_]?Value{null} ** max_var_bindings;
         self.pools.reset();
+        self.diag = .{};
 
         // INVARIANT: State is clean after reset
         assert(self.work_sp == 0);
@@ -866,6 +993,8 @@ pub const Evaluator = struct {
                         }
                         return .{ .boolean = true };
                     }
+                    // Capture diagnostics for debugging
+                    self.captureEvalDiagnostics(err, work.node_idx);
                     // METRICS: Record error
                     if (self.metrics) |m| m.incErrors();
                     return err;
@@ -880,6 +1009,8 @@ pub const Evaluator = struct {
                         }
                         return .{ .boolean = true };
                     }
+                    // Capture diagnostics for debugging
+                    self.captureEvalDiagnostics(err, work.node_idx);
                     // METRICS: Record error
                     if (self.metrics) |m| m.incErrors();
                     return err;
@@ -8897,6 +9028,32 @@ pub const Evaluator = struct {
     }
 
     // ========================================================================
+    // ========================================================================
+    // Diagnostics
+    // ========================================================================
+
+    /// Capture diagnostic state when an error occurs.
+    /// Called before returning an error to preserve debugging info.
+    fn captureEvalDiagnostics(self: *Evaluator, err: EvalError, node_idx: ?u16) void {
+        self.diag = .{
+            .error_code = EvalErrorCode.fromEvalError(err),
+            .failed_opcode = if (node_idx) |idx|
+                if (idx < self.tree.node_count) @intFromEnum(self.tree.nodes[idx].tag) else null
+            else
+                null,
+            .failed_node_idx = node_idx,
+            .stack_depth = self.value_sp,
+            .cost_at_failure = self.cost_used,
+        };
+    }
+
+    /// Return an error after capturing diagnostics.
+    /// Use this instead of plain `return error.X` to preserve context.
+    fn returnWithDiag(self: *Evaluator, err: EvalError, node_idx: ?u16) EvalError {
+        self.captureEvalDiagnostics(err, node_idx);
+        return err;
+    }
+
     // Stack operations
     // ========================================================================
 

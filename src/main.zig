@@ -1899,6 +1899,25 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
                                     try stdout.print("  Constant type: {s}\n", .{diag.typeName()});
                                 }
                             }
+
+                            // Print evaluation diagnostics if available
+                            if (input_result.eval_diag) |diag| {
+                                if (diag.hasError()) {
+                                    try stdout.print("  Eval error: {s}\n", .{diag.message()});
+                                    if (diag.failed_opcode) |op| {
+                                        try stdout.print("  Failed opcode: 0x{X:0>2}\n", .{op});
+                                    }
+                                    if (diag.failed_node_idx) |idx| {
+                                        try stdout.print("  Node index: {}\n", .{idx});
+                                    }
+                                    if (diag.stack_depth) |depth| {
+                                        try stdout.print("  Stack depth: {}\n", .{depth});
+                                    }
+                                    if (diag.cost_at_failure) |cost| {
+                                        try stdout.print("  Cost consumed: {}\n", .{cost});
+                                    }
+                                }
+                            }
                             break;
                         }
                     }

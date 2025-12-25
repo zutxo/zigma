@@ -17,6 +17,7 @@ const evaluator_mod = @import("evaluator.zig");
 const SigmaBoolean = sigma_tree.SigmaBoolean;
 const Evaluator = evaluator_mod.Evaluator;
 const EvalError = evaluator_mod.EvalError;
+pub const EvalDiagnostics = evaluator_mod.EvalDiagnostics;
 const Value = @import("../serialization/data_serializer.zig").Value;
 
 // ============================================================================
@@ -142,6 +143,12 @@ pub fn reduceToCrypto(eval: *Evaluator, cost_limit: u64) ReductionError!Reductio
         .sigma_boolean = &result_ptr[0],
         .cost = eval.cost_used,
     };
+}
+
+/// Get evaluation diagnostics from evaluator after reduction fails.
+/// Call this after reduceToCrypto returns an error to get detailed error info.
+pub fn getEvalDiagnostics(eval: *const Evaluator) EvalDiagnostics {
+    return eval.diag;
 }
 
 /// Convert evaluated Value to SigmaBoolean.

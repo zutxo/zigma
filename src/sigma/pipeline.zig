@@ -28,6 +28,7 @@ const Proof = prover_mod.Proof;
 const SigmaBoolean = sigma_tree.SigmaBoolean;
 const PrivateInput = private_input.PrivateInput;
 const ReductionResult = reducer.ReductionResult;
+pub const EvalDiagnostics = reducer.EvalDiagnostics;
 
 // ============================================================================
 // Configuration
@@ -89,6 +90,8 @@ pub const VerifyResult = struct {
     valid: bool,
     /// Total cost consumed (reduction + verification)
     cost: u64,
+    /// Evaluation diagnostics (populated on failure)
+    eval_diag: ?EvalDiagnostics = null,
 };
 
 // ============================================================================
