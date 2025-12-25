@@ -55,6 +55,15 @@ pub const MAX_BOX_SIZE = consensus.MAX_BOX_SIZE;
 pub const MAX_PROPOSITION_SIZE = consensus.MAX_PROPOSITION_SIZE;
 pub const MIN_VALUE_PER_BYTE = consensus.MIN_VALUE_PER_BYTE;
 
+// Merkle v2+ exports
+pub const computeWitnessId = merkle.computeWitnessId;
+pub const computeWitnessIds = merkle.computeWitnessIds;
+pub const computeTxMerkleRootV2 = merkle.computeTxMerkleRootV2;
+pub const computeVersionedMerkleRoot = merkle.computeVersionedMerkleRoot;
+pub const verifyTxMerkleRootVersioned = merkle.verifyTxMerkleRootVersioned;
+pub const INITIAL_VERSION = merkle.INITIAL_VERSION;
+pub const WITNESS_ID_SIZE = merkle.WITNESS_ID_SIZE;
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
