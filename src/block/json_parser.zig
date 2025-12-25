@@ -383,10 +383,10 @@ fn parseInputValue(value: std.json.Value, storage: *TransactionStorage) ParseErr
                     // Parse key as variable ID
                     const var_id = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
 
-                    // Parse value as hex bytes
+                    // Parse value as hex bytes (up to 8KB for large scripts)
                     if (entry.value_ptr.* == .string) {
                         const hex_str = entry.value_ptr.string;
-                        if (hex_str.len >= 2 and hex_str.len <= 1024) {
+                        if (hex_str.len >= 2 and hex_str.len <= 16384) {
                             const bytes = storage.allocBytes(hex_str.len / 2) catch continue;
                             if (parseHexDynamic(hex_str, bytes)) |data| {
                                 // First byte is type code, rest is value

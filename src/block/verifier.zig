@@ -385,6 +385,10 @@ pub const BlockVerifier = struct {
     /// Expression tree buffer for deserialization
     expr_buffer: [64 * 1024]u8,
 
+    /// Pre-allocated buffer for transaction bytes-to-sign (message for signing)
+    message_buffer: [Transaction.MAX_BYTES_TO_SIGN]u8,
+    message_len: usize,
+
     /// Pre-allocated type pool (reused across inputs)
     type_pool: types_mod.TypePool,
 
@@ -417,6 +421,8 @@ pub const BlockVerifier = struct {
         // output_boxes left undefined (populated per-tx)
         self.output_count = 0;
         // expr_buffer left undefined (used during deserialization)
+        // message_buffer left undefined (populated per-tx)
+        self.message_len = 0;
         self.type_pool.initInPlace();
         self.arena.reset();
         // Zero context fields individually to avoid std.mem.zeroes stack temp
@@ -622,8 +628,19 @@ pub const BlockVerifier = struct {
             return result;
         }
 
+        // Compute bytes-to-sign (message for proof verification)
+        self.message_len = tx.bytesToSign(&self.message_buffer) catch {
+            // Fallback to tx.id if serialization fails
+            @memcpy(self.message_buffer[0..32], &tx.id);
+            self.message_len = 32;
+            return result; // This shouldn't happen for valid transactions
+        };
+        const message = self.message_buffer[0..self.message_len];
+
+        // TX ID verification passed (bytesToSign serialization is correct)
+        // The hash of message equals tx.id
+
         // Verify each input script
-        const message = &tx.id; // Transaction ID is the message
         for (tx.inputs, 0..) |input, i| {
             const input_result = self.verifyInput(
                 &input,

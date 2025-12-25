@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const context = @import("../interpreter/context.zig");
+const vlq = @import("../serialization/vlq.zig");
 
 pub const Token = context.Token;
 
@@ -245,6 +246,157 @@ pub const Transaction = struct {
             total = std.math.add(i64, total, out.value) catch return std.math.maxInt(i64);
         }
         return total;
+    }
+
+    /// Maximum size of bytes-to-sign buffer
+    pub const MAX_BYTES_TO_SIGN: usize = 256 * 1024;
+
+    /// Serialize transaction to bytes for signing (unsigned transaction format).
+    /// This is the message that gets signed/verified in Ergo transactions.
+    ///
+    /// Format (Scala reference: ErgoLikeTransactionSerializer):
+    /// - u16 BE: input count
+    /// - For each input: box_id (32) + proof_size (u16 BE=0) + ext_count (u16 BE) + ext entries
+    /// - u16 BE: data input count
+    /// - For each data input: box_id (32)
+    /// - VLQ: distinct token ID count
+    /// - For each distinct token: token_id (32)
+    /// - u16 BE: output count
+    /// - For each output: value (u64 BE) + ergoTree + creation_height (VLQ) + tokens + registers
+    ///
+    /// Returns the number of bytes written, or error if buffer too small.
+    pub fn bytesToSign(self: *const Transaction, buf: []u8) !usize {
+        var pos: usize = 0;
+
+        // Helper to write bytes
+        const writeBytes = struct {
+            fn f(b: []u8, p: *usize, data: []const u8) !void {
+                if (p.* + data.len > b.len) return error.BufferTooSmall;
+                @memcpy(b[p.* .. p.* + data.len], data);
+                p.* += data.len;
+            }
+        }.f;
+
+        // Helper to write VLQ
+        const writeVLQ = struct {
+            fn f(b: []u8, p: *usize, v: u64) !void {
+                if (p.* + vlq.max_vlq_bytes > b.len) return error.BufferTooSmall;
+                const written = vlq.encodeU64(v, b[p.*..][0..vlq.max_vlq_bytes]);
+                p.* += written;
+            }
+        }.f;
+
+        // 1. Input count (VLQ)
+        try writeVLQ(buf, &pos, self.inputs.len);
+
+        // For each input: box_id + proof_size (0) + extension
+        for (self.inputs) |input| {
+            // Box ID (32 bytes)
+            try writeBytes(buf, &pos, &input.box_id);
+            // Proof size = 0 for unsigned tx (VLQ)
+            try writeVLQ(buf, &pos, 0);
+            // Context extension: count (u8) + entries
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = @intCast(input.extension.count);
+            pos += 1;
+
+            // Write extension entries (key byte + serialized value)
+            for (input.extension.values, 0..) |maybe_val, var_id| {
+                if (maybe_val) |val| {
+                    // Key is variable ID (1 byte)
+                    if (pos + 1 > buf.len) return error.BufferTooSmall;
+                    buf[pos] = @intCast(var_id);
+                    pos += 1;
+                    // Value is already serialized bytes (with type prefix)
+                    try writeBytes(buf, &pos, val.data);
+                }
+            }
+        }
+
+        // 2. Data input count (VLQ) + box IDs
+        try writeVLQ(buf, &pos, self.data_inputs.len);
+        for (self.data_inputs) |di| {
+            try writeBytes(buf, &pos, &di);
+        }
+
+        // 3. Collect distinct token IDs from all outputs
+        var distinct_tokens: [4096][32]u8 = undefined;
+        var distinct_count: u32 = 0;
+
+        for (self.outputs) |output| {
+            for (output.tokens) |token| {
+                // Check if already in distinct list
+                var found = false;
+                for (distinct_tokens[0..distinct_count]) |dt| {
+                    if (std.mem.eql(u8, &dt, &token.id)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and distinct_count < 4096) {
+                    distinct_tokens[distinct_count] = token.id;
+                    distinct_count += 1;
+                }
+            }
+        }
+
+        // Token count as VLQ
+        try writeVLQ(buf, &pos, distinct_count);
+        for (distinct_tokens[0..distinct_count]) |dt| {
+            try writeBytes(buf, &pos, &dt);
+        }
+
+        // 4. Output count (VLQ) + serialized outputs
+        try writeVLQ(buf, &pos, self.outputs.len);
+        for (self.outputs) |output| {
+            // Value as VLQ (unsigned, Scala uses putULong which is VLQ)
+            try writeVLQ(buf, &pos, @bitCast(output.value));
+
+            // ErgoTree: raw bytes (self-delimiting via header)
+            try writeBytes(buf, &pos, output.ergo_tree);
+
+            // Creation height as VLQ
+            try writeVLQ(buf, &pos, output.creation_height);
+
+            // Tokens: count (1 byte) + (index VLQ, amount VLQ) pairs
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = @intCast(output.tokens.len);
+            pos += 1;
+
+            for (output.tokens) |token| {
+                // Find token index in distinct list
+                var token_idx: u32 = 0;
+                for (distinct_tokens[0..distinct_count], 0..) |dt, idx| {
+                    if (std.mem.eql(u8, &dt, &token.id)) {
+                        token_idx = @intCast(idx);
+                        break;
+                    }
+                }
+                // Token index as VLQ
+                try writeVLQ(buf, &pos, token_idx);
+                // Token amount as VLQ
+                try writeVLQ(buf, &pos, @bitCast(token.amount));
+            }
+
+            // Registers: count (1 byte) + serialized values (raw bytes)
+            var reg_count: u8 = 0;
+            for (output.registers) |reg| {
+                if (reg != null) reg_count += 1;
+            }
+
+            if (pos + 1 > buf.len) return error.BufferTooSmall;
+            buf[pos] = reg_count;
+            pos += 1;
+
+            for (output.registers) |maybe_reg| {
+                if (maybe_reg) |reg| {
+                    // Register value is already serialized - write raw bytes
+                    try writeBytes(buf, &pos, reg);
+                }
+            }
+        }
+
+        return pos;
     }
 };
 
