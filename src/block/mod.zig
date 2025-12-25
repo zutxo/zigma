@@ -34,6 +34,7 @@ pub const Extension = block.Extension;
 pub const UtxoSource = utxo.UtxoSource;
 pub const MemoryUtxoSet = utxo.MemoryUtxoSet;
 pub const UtxoStorage = utxo.UtxoStorage;
+pub const computeBoxId = utxo.computeBoxId;
 pub const BlockVerifier = verifier.BlockVerifier;
 pub const BlockVerifyResult = verifier.BlockVerifyResult;
 pub const TxVerifyResult = verifier.TxVerifyResult;

@@ -1,8 +1,8 @@
 //! Consensus Rule Verification
 //!
 //! Validates transaction consensus rules:
-//! - Value conservation: sum(inputs) >= sum(outputs)
-//! - Token conservation: per-token balance >= 0
+//! - Value conservation: sum(inputs) == sum(outputs) (ERG exactly preserved)
+//! - Token conservation: per-token balance >= 0 (output <= input)
 //! - Token minting: only from first input's box ID
 
 const std = @import("std");
@@ -83,7 +83,7 @@ pub const ConsensusResult = struct {
 
 /// Consensus rule violation types
 pub const ConsensusError = error{
-    /// Output sum exceeds input sum
+    /// Inputs and outputs don't balance (ERG not preserved)
     ValueImbalance,
     /// Token destroyed without authorization
     TokenDestroyed,
@@ -95,15 +95,14 @@ pub const ConsensusError = error{
     ValueOverflow,
     /// Too many distinct tokens
     TooManyTokens,
-    /// Negative fee
-    NegativeFee,
 };
 
 // ============================================================================
 // Value Conservation
 // ============================================================================
 
-/// Verify value conservation: sum(inputs) >= sum(outputs).
+/// Verify ERG preservation: sum(inputs) == sum(outputs).
+/// In Ergo, ERG must be exactly preserved (txErgPreservation rule).
 /// Returns (ok, input_sum, output_sum).
 pub fn verifyValueBalance(
     input_boxes: []const BoxView,
@@ -136,8 +135,8 @@ pub fn verifyValueBalance(
         output_sum = overflow[0];
     }
 
-    // Check balance
-    const ok = input_sum >= output_sum;
+    // Check ERG preservation (must be exactly equal)
+    const ok = input_sum == output_sum;
     const err: ?ConsensusError = if (ok) null else ConsensusError.ValueImbalance;
 
     return .{ .ok = ok, .input_sum = input_sum, .output_sum = output_sum, .err = err };
@@ -267,19 +266,13 @@ pub fn verifyConsensus(
     input_boxes: []const BoxView,
     tx: *const Transaction,
 ) ConsensusResult {
-    // Verify value balance
+    // Verify ERG preservation (inputs == outputs)
     const value_result = verifyValueBalance(input_boxes, tx.outputs);
     if (!value_result.ok) {
         var result = ConsensusResult.failure(value_result.err.?);
         result.input_sum = value_result.input_sum;
         result.output_sum = value_result.output_sum;
         return result;
-    }
-
-    // Check fee is positive
-    const fee = value_result.input_sum - value_result.output_sum;
-    if (fee < 0) {
-        return ConsensusResult.failure(ConsensusError.NegativeFee);
     }
 
     // Get first input box ID for token minting rule
@@ -303,7 +296,7 @@ pub fn verifyConsensus(
 // Tests
 // ============================================================================
 
-test "consensus: value balance success" {
+test "consensus: ERG preservation success (exact balance)" {
     var inputs = [_]BoxView{
         std.mem.zeroes(BoxView),
         std.mem.zeroes(BoxView),
@@ -313,22 +306,40 @@ test "consensus: value balance success" {
 
     const ergo_tree = [_]u8{0x00};
     const outputs = [_]Output{
-        Output.init(2500, &ergo_tree, 100),
+        Output.init(3000, &ergo_tree, 100), // Exact match: 1000 + 2000 = 3000
     };
 
     const result = verifyValueBalance(&inputs, &outputs);
     try std.testing.expect(result.ok);
     try std.testing.expectEqual(@as(i64, 3000), result.input_sum);
-    try std.testing.expectEqual(@as(i64, 2500), result.output_sum);
+    try std.testing.expectEqual(@as(i64, 3000), result.output_sum);
 }
 
-test "consensus: value balance failure" {
+test "consensus: ERG preservation failure (inputs > outputs)" {
+    var inputs = [_]BoxView{
+        std.mem.zeroes(BoxView),
+        std.mem.zeroes(BoxView),
+    };
+    inputs[0].value = 1000;
+    inputs[1].value = 2000;
+
+    const ergo_tree = [_]u8{0x00};
+    const outputs = [_]Output{
+        Output.init(2500, &ergo_tree, 100), // Not equal: 3000 != 2500
+    };
+
+    const result = verifyValueBalance(&inputs, &outputs);
+    try std.testing.expect(!result.ok);
+    try std.testing.expectEqual(ConsensusError.ValueImbalance, result.err.?);
+}
+
+test "consensus: ERG preservation failure (outputs > inputs)" {
     var inputs = [_]BoxView{std.mem.zeroes(BoxView)};
     inputs[0].value = 1000;
 
     const ergo_tree = [_]u8{0x00};
     const outputs = [_]Output{
-        Output.init(1500, &ergo_tree, 100),
+        Output.init(1500, &ergo_tree, 100), // outputs > inputs
     };
 
     const result = verifyValueBalance(&inputs, &outputs);
@@ -414,7 +425,7 @@ test "consensus: full verification success" {
     @memset(&box_id, 0xAA);
 
     const ergo_tree = [_]u8{0x00};
-    const outputs = [_]Output{Output.init(900, &ergo_tree, 100)};
+    const outputs = [_]Output{Output.init(1000, &ergo_tree, 100)}; // ERG preserved: 1000 = 1000
 
     const tx_input = transaction.Input.fromBoxId(box_id);
     const tx = Transaction.init([_]u8{0} ** 32, &[_]transaction.Input{tx_input}, &outputs);
@@ -423,5 +434,5 @@ test "consensus: full verification success" {
     try std.testing.expect(result.valid);
     try std.testing.expect(result.value_balance_ok);
     try std.testing.expect(result.token_conservation_ok);
-    try std.testing.expectEqual(@as(i64, 100), result.fee);
+    try std.testing.expectEqual(@as(i64, 0), result.fee); // Fee is always 0 with ERG preservation
 }

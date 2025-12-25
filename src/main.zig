@@ -1597,13 +1597,9 @@ fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, alloca
             box_view.proposition_bytes = output.ergo_tree;
             box_view.index = @intCast(i);
 
-            // Compute box ID (Blake2b256 of tx.id || output_index)
-            var hasher = hash.Blake2b256Hasher.init();
-            hasher.update(&tx.id);
-            var idx_bytes: [2]u8 = undefined;
-            std.mem.writeInt(u16, &idx_bytes, @intCast(i), .big);
-            hasher.update(&idx_bytes);
-            const box_id = hasher.finalize();
+            // Compute box ID per Ergo protocol:
+            // Blake2b256(serialize(value, ergoTree, creationHeight, tokens, registers, txId, index))
+            const box_id = block_mod.computeBoxId(&output, &tx.id, @intCast(i));
 
             utxo_storage.addBox(box_id, box_view) catch break;
         }

@@ -5,9 +5,13 @@
 
 const std = @import("std");
 const context = @import("../interpreter/context.zig");
+const vlq = @import("../serialization/vlq.zig");
+const hash = @import("../crypto/hash.zig");
+const transaction = @import("transaction.zig");
 
 pub const BoxView = context.BoxView;
 pub const Token = context.Token;
+pub const Output = transaction.Output;
 
 /// Maximum boxes in memory UTXO set
 pub const MAX_BOXES: u16 = 4096;
@@ -237,8 +241,169 @@ pub const UtxoStorage = struct {
 };
 
 // ============================================================================
+// Box ID Computation
+// ============================================================================
+
+/// Maximum size for box serialization buffer
+pub const MAX_BOX_BYTES: usize = 8192;
+
+/// Compute box ID from output data according to Ergo protocol.
+/// Box ID = Blake2b256(serialize(value, ergoTree, creationHeight, tokens, registers, txId, index))
+///
+/// Reference: ErgoBox.scala:72-73 - `lazy val id: BoxId = ADKey @@@ Blake2b256.hash(bytes)`
+pub fn computeBoxId(output: *const Output, tx_id: *const [32]u8, output_index: u16) [32]u8 {
+    var buf: [MAX_BOX_BYTES]u8 = undefined;
+    var pos: usize = 0;
+
+    // 1. Value as unsigned VLQ
+    var vlq_buf: [vlq.max_vlq_bytes]u8 = undefined;
+    const value_len = vlq.encodeU64(@bitCast(output.value), &vlq_buf);
+    @memcpy(buf[pos .. pos + value_len], vlq_buf[0..value_len]);
+    pos += value_len;
+
+    // 2. ErgoTree with VLQ length prefix
+    const tree_len = vlq.encodeU64(output.ergo_tree.len, &vlq_buf);
+    @memcpy(buf[pos .. pos + tree_len], vlq_buf[0..tree_len]);
+    pos += tree_len;
+    @memcpy(buf[pos .. pos + output.ergo_tree.len], output.ergo_tree);
+    pos += output.ergo_tree.len;
+
+    // 3. CreationHeight as unsigned VLQ
+    const height_len = vlq.encodeU64(output.creation_height, &vlq_buf);
+    @memcpy(buf[pos .. pos + height_len], vlq_buf[0..height_len]);
+    pos += height_len;
+
+    // 4. Token count (1 byte)
+    buf[pos] = @intCast(output.tokens.len);
+    pos += 1;
+
+    // 5. Tokens: each is (tokenId[32] + VLQ amount)
+    for (output.tokens) |token| {
+        @memcpy(buf[pos .. pos + 32], &token.id);
+        pos += 32;
+        const amount_len = vlq.encodeU64(@bitCast(token.amount), &vlq_buf);
+        @memcpy(buf[pos .. pos + amount_len], vlq_buf[0..amount_len]);
+        pos += amount_len;
+    }
+
+    // 6. Register count (non-null registers from R4-R9)
+    var reg_count: u8 = 0;
+    for (output.registers) |reg| {
+        if (reg != null) reg_count += 1;
+    }
+    buf[pos] = reg_count;
+    pos += 1;
+
+    // 7. Registers: serialized bytes for each non-null register
+    for (output.registers) |reg| {
+        if (reg) |reg_bytes| {
+            @memcpy(buf[pos .. pos + reg_bytes.len], reg_bytes);
+            pos += reg_bytes.len;
+        }
+    }
+
+    // 8. Transaction ID (32 bytes)
+    @memcpy(buf[pos .. pos + 32], tx_id);
+    pos += 32;
+
+    // 9. Box index as 2-byte big-endian (UShort)
+    std.mem.writeInt(u16, buf[pos..][0..2], output_index, .big);
+    pos += 2;
+
+    // Hash the serialized bytes
+    var hasher = hash.Blake2b256Hasher.init();
+    hasher.update(buf[0..pos]);
+    return hasher.finalize();
+}
+
+/// Compute box ID from BoxView and transaction reference.
+/// Used for existing boxes that have all fields populated.
+pub fn computeBoxIdFromView(
+    box: *const BoxView,
+    tx_id: *const [32]u8,
+    box_index: u16,
+) [32]u8 {
+    var buf: [MAX_BOX_BYTES]u8 = undefined;
+    var pos: usize = 0;
+
+    // 1. Value as unsigned VLQ
+    var vlq_buf: [vlq.max_vlq_bytes]u8 = undefined;
+    const value_len = vlq.encodeU64(@bitCast(box.value), &vlq_buf);
+    @memcpy(buf[pos .. pos + value_len], vlq_buf[0..value_len]);
+    pos += value_len;
+
+    // 2. Proposition bytes with VLQ length prefix
+    const prop_len = vlq.encodeU64(box.proposition_bytes.len, &vlq_buf);
+    @memcpy(buf[pos .. pos + prop_len], vlq_buf[0..prop_len]);
+    pos += prop_len;
+    @memcpy(buf[pos .. pos + box.proposition_bytes.len], box.proposition_bytes);
+    pos += box.proposition_bytes.len;
+
+    // 3. CreationHeight as unsigned VLQ
+    const height_len = vlq.encodeU64(box.creation_height, &vlq_buf);
+    @memcpy(buf[pos .. pos + height_len], vlq_buf[0..height_len]);
+    pos += height_len;
+
+    // 4. Token count
+    buf[pos] = @intCast(box.tokens.len);
+    pos += 1;
+
+    // 5. Tokens
+    for (box.tokens) |token| {
+        @memcpy(buf[pos .. pos + 32], &token.id);
+        pos += 32;
+        const amount_len = vlq.encodeU64(@bitCast(token.amount), &vlq_buf);
+        @memcpy(buf[pos .. pos + amount_len], vlq_buf[0..amount_len]);
+        pos += amount_len;
+    }
+
+    // 6. Register count
+    var reg_count: u8 = 0;
+    for (box.registers) |reg| {
+        if (reg != null) reg_count += 1;
+    }
+    buf[pos] = reg_count;
+    pos += 1;
+
+    // 7. Registers
+    for (box.registers) |reg| {
+        if (reg) |reg_bytes| {
+            @memcpy(buf[pos .. pos + reg_bytes.len], reg_bytes);
+            pos += reg_bytes.len;
+        }
+    }
+
+    // 8. Transaction ID
+    @memcpy(buf[pos .. pos + 32], tx_id);
+    pos += 32;
+
+    // 9. Box index
+    std.mem.writeInt(u16, buf[pos..][0..2], box_index, .big);
+    pos += 2;
+
+    var hasher = hash.Blake2b256Hasher.init();
+    hasher.update(buf[0..pos]);
+    return hasher.finalize();
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
+
+test "utxo: computeBoxId produces deterministic output" {
+    const ergo_tree = [_]u8{ 0x00, 0x08, 0xcd }; // Example minimal ErgoTree
+    const output = Output.init(1000000, &ergo_tree, 100);
+    const tx_id = [_]u8{0xAB} ** 32;
+
+    const id1 = computeBoxId(&output, &tx_id, 0);
+    const id2 = computeBoxId(&output, &tx_id, 0);
+
+    try std.testing.expectEqualSlices(u8, &id1, &id2);
+
+    // Different index should produce different ID
+    const id3 = computeBoxId(&output, &tx_id, 1);
+    try std.testing.expect(!std.mem.eql(u8, &id1, &id3));
+}
 
 test "utxo: MemoryUtxoSet lookup found" {
     var box_ids = [_][32]u8{
