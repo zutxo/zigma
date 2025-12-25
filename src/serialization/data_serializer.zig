@@ -18,7 +18,7 @@ const TypePool = types.TypePool;
 const TypeIndex = types.TypeIndex;
 const SType = types.SType;
 const BumpAllocator = memory.BumpAllocator;
-const ValuePool = value_pool.ValuePool;
+pub const ValuePool = value_pool.ValuePool;
 const null_value_idx = value_pool.null_value_idx;
 
 // ============================================================================

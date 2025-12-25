@@ -1895,6 +1895,9 @@ fn scanTestnetCommand(extra_args: []const []const u8, allocator: std.mem.Allocat
                                 if (diag.constant_index) |ci| {
                                     try stdout.print("  Constant index: {}\n", .{ci});
                                 }
+                                if (diag.type_idx != null) {
+                                    try stdout.print("  Constant type: {s}\n", .{diag.typeName()});
+                                }
                             }
                             break;
                         }

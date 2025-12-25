@@ -204,6 +204,10 @@ pub const DeserializeDiagnostics = struct {
     phase: DeserializePhase,
     /// Index of the constant being parsed (if in constants phase)
     constant_index: ?u16,
+    /// Type index of the constant (if in constant_value phase)
+    type_idx: ?types.TypeIndex,
+    /// Pointer to type pool for type name lookup
+    type_pool: ?*const types.TypePool,
 
     /// Format diagnostics as a human-readable string
     pub fn format(self: DeserializeDiagnostics, buf: []u8) []const u8 {
@@ -230,6 +234,73 @@ pub const DeserializeDiagnostics = struct {
                 self.byte_offset,
                 phase_str,
             }) catch "format error";
+    }
+
+    /// Get type name string for debugging
+    pub fn typeName(self: DeserializeDiagnostics) []const u8 {
+        if (self.type_idx == null or self.type_pool == null) return "unknown";
+        const pool = self.type_pool.?;
+        const t = pool.get(self.type_idx.?);
+        return typeNameInner(pool, t);
+    }
+
+    fn typeNameInner(pool: *const types.TypePool, t: types.SType) []const u8 {
+        return switch (t) {
+            .boolean => "Boolean",
+            .byte => "Byte",
+            .short => "Short",
+            .int => "Int",
+            .long => "Long",
+            .big_int => "BigInt",
+            .group_element => "GroupElement",
+            .sigma_prop => "SigmaProp",
+            .unsigned_big_int => "UnsignedBigInt",
+            .coll => |elem_idx| blk: {
+                const elem = pool.get(elem_idx);
+                break :blk switch (elem) {
+                    .byte => "Coll[Byte]",
+                    .boolean => "Coll[Boolean]",
+                    .short => "Coll[Short]",
+                    .int => "Coll[Int]",
+                    .long => "Coll[Long]",
+                    .big_int => "Coll[BigInt]",
+                    .group_element => "Coll[GroupElement]",
+                    .sigma_prop => "Coll[SigmaProp]",
+                    .box => "Coll[Box]",
+                    .header => "Coll[Header]",
+                    .avl_tree => "Coll[AvlTree]",
+                    .coll => "Coll[Coll[...]]",
+                    .option => "Coll[Option[...]]",
+                    .pair => "Coll[(T,T)]",
+                    else => "Coll[?]",
+                };
+            },
+            .option => |inner_idx| blk: {
+                const inner = pool.get(inner_idx);
+                break :blk switch (inner) {
+                    .byte => "Option[Byte]",
+                    .int => "Option[Int]",
+                    .long => "Option[Long]",
+                    .box => "Option[Box]",
+                    .coll => "Option[Coll[...]]",
+                    else => "Option[?]",
+                };
+            },
+            .pair => "(T,T)",
+            .triple => "(T,T,T)",
+            .quadruple => "(T,T,T,T)",
+            .tuple => "Tuple",
+            .avl_tree => "AvlTree",
+            .func => "Func",
+            .any => "Any",
+            .unit => "Unit",
+            .box => "Box",
+            .context => "Context",
+            .header => "Header",
+            .pre_header => "PreHeader",
+            .global => "Global",
+            .type_var => "TypeVar",
+        };
     }
 };
 
@@ -294,10 +365,12 @@ pub fn deserialize(
 /// Deserialize an ErgoTree with detailed diagnostics on failure.
 /// Use this for debugging deserialization errors - provides byte offset,
 /// failed byte value, and phase information.
+/// The `values` parameter is required for Coll[Int]/Coll[Long]/etc. constants.
 pub fn deserializeWithDiagnostics(
     tree: *ErgoTree,
     data: []const u8,
     arena: anytype,
+    values: ?*data_serializer.ValuePool,
     diag: *?DeserializeDiagnostics,
 ) DeserializeError!void {
     diag.* = null;
@@ -310,6 +383,8 @@ pub fn deserializeWithDiagnostics(
             .failed_byte = if (data.len > 0) data[0] else null,
             .phase = .header,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return error.TreeTooBig;
     }
@@ -324,6 +399,8 @@ pub fn deserializeWithDiagnostics(
             .failed_byte = null,
             .phase = .header,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return error.UnexpectedEndOfInput;
     };
@@ -336,6 +413,8 @@ pub fn deserializeWithDiagnostics(
             .failed_byte = header_byte,
             .phase = .header,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return error.InvalidHeader;
     }
@@ -347,6 +426,8 @@ pub fn deserializeWithDiagnostics(
             .failed_byte = header_byte,
             .phase = .header,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return error.InvalidHeader;
     };
@@ -361,6 +442,8 @@ pub fn deserializeWithDiagnostics(
                 .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
                 .phase = .header,
                 .constant_index = null,
+                .type_idx = null,
+                .type_pool = null,
             };
             return err;
         };
@@ -368,7 +451,7 @@ pub fn deserializeWithDiagnostics(
 
     // Parse constants if segregation enabled
     if (tree.header.constant_segregation) {
-        parseConstantsWithDiagnostics(tree, &reader, arena, data, diag) catch |e| {
+        parseConstantsWithDiagnostics(tree, &reader, arena, values, data, diag) catch |e| {
             return e;
         };
     }
@@ -402,6 +485,8 @@ pub fn deserializeWithDiagnostics(
             .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
             .phase = .expression,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         _ = expr_start;
         return err;
@@ -412,6 +497,7 @@ fn parseConstantsWithDiagnostics(
     tree: *ErgoTree,
     reader: *vlq.Reader,
     arena: anytype,
+    values: ?*data_serializer.ValuePool,
     data: []const u8,
     diag: *?DeserializeDiagnostics,
 ) DeserializeError!void {
@@ -424,6 +510,8 @@ fn parseConstantsWithDiagnostics(
             .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
             .phase = .constants,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return err;
     };
@@ -435,6 +523,8 @@ fn parseConstantsWithDiagnostics(
             .failed_byte = if (reader.pos < data.len) data[reader.pos] else null,
             .phase = .constants,
             .constant_index = null,
+            .type_idx = null,
+            .type_pool = null,
         };
         return error.TooManyConstants;
     }
@@ -459,14 +549,16 @@ fn parseConstantsWithDiagnostics(
                 .failed_byte = if (type_start < data.len) data[type_start] else null,
                 .phase = .constant_type,
                 .constant_index = i,
+                .type_idx = null,
+                .type_pool = null,
             };
             return err;
         };
 
         const value_start = reader.pos;
 
-        // Parse value
-        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, null) catch |e| {
+        // Parse value (pass values for Coll[Int] etc.)
+        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, values) catch |e| {
             const err: DeserializeError = switch (e) {
                 error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
                 error.Overflow => error.Overflow,
@@ -481,6 +573,8 @@ fn parseConstantsWithDiagnostics(
                 .failed_byte = if (value_start < data.len) data[value_start] else null,
                 .phase = .constant_value,
                 .constant_index = i,
+                .type_idx = type_idx,
+                .type_pool = tree.type_pool,
             };
             return err;
         };

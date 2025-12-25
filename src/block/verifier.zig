@@ -651,6 +651,7 @@ pub const BlockVerifier = struct {
             &self.ergo_tree,
             input_box.proposition_bytes,
             &self.arena,
+            &self.evaluator.pools.values,
             &deser_diag,
         ) catch {
             return InputVerifyResult.failureWithDiag(
