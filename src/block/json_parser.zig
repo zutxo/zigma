@@ -387,7 +387,7 @@ fn parseOutputValue(value: std.json.Value, storage: *TransactionStorage) ParseEr
     if (getArray(value, "assets")) |assets| {
         const token_start = storage.token_count;
         for (assets) |asset| {
-            if (storage.token_count >= transaction.MAX_OUTPUTS * transaction.MAX_TOKENS) break;
+            if (storage.token_count >= 4096) break; // TransactionStorage.tokens limit
             if (getString(asset, "tokenId")) |token_id_hex| {
                 const token_id = parseHex(32, token_id_hex) catch continue;
                 const amount = getInt(i64, asset, "amount") orelse continue;
@@ -404,8 +404,11 @@ fn parseOutputValue(value: std.json.Value, storage: *TransactionStorage) ParseEr
         inline for (4..10) |r| {
             const reg_name = comptime std.fmt.comptimePrint("R{d}", .{r});
             if (getString(regs_obj, reg_name)) |reg_hex| {
-                const reg_bytes = storage.allocBytes(reg_hex.len / 2) catch continue;
-                registers[r - 4] = parseHexDynamic(reg_hex, reg_bytes) catch null;
+                if (storage.allocBytes(reg_hex.len / 2)) |reg_bytes| {
+                    registers[r - 4] = parseHexDynamic(reg_hex, reg_bytes) catch null;
+                } else |_| {
+                    // Storage full, skip this register
+                }
             }
         }
     }

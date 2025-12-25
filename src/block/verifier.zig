@@ -7,7 +7,9 @@ const std = @import("std");
 const context_mod = @import("../interpreter/context.zig");
 const evaluator_mod = @import("../interpreter/evaluator.zig");
 const pipeline_mod = @import("../sigma/pipeline.zig");
-const expr_serializer = @import("../serialization/expr_serializer.zig");
+const ergotree_serializer = @import("../serialization/ergotree_serializer.zig");
+const types_mod = @import("../core/types.zig");
+const memory_mod = @import("../interpreter/memory.zig");
 const transaction = @import("transaction.zig");
 const block_mod = @import("block.zig");
 const utxo_mod = @import("utxo.zig");
@@ -493,21 +495,16 @@ pub const BlockVerifier = struct {
         };
 
         // Deserialize ErgoTree
-        var tree: expr_serializer.ExprTree = undefined;
-        const deser_result = expr_serializer.deserializeExpr(
-            input_box.proposition_bytes,
-            &tree,
-            &self.expr_buffer,
-        );
+        var type_pool = types_mod.TypePool.init();
+        var tree = ergotree_serializer.ErgoTree.init(&type_pool);
+        var arena = memory_mod.BumpAllocator(4096).init();
 
-        if (deser_result) |_| {
-            // Deserialization succeeded - continue to evaluation
-        } else |_| {
+        ergotree_serializer.deserialize(&tree, input_box.proposition_bytes, &arena) catch {
             return InputVerifyResult.failure(input_index, VerificationError.ScriptDeserializationFailed);
-        }
+        };
 
         // Create evaluator
-        var eval = Evaluator.init(&tree, &ctx, self.version);
+        var eval = Evaluator.init(&tree.expr_tree, &ctx);
         eval.setCostLimit(self.tx_cost_limit);
 
         // Verify: reduce to SigmaBoolean and verify proof

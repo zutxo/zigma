@@ -221,17 +221,18 @@ pub const ErgoNodeClient = struct {
         };
 
         // Check status code
-        if (req.status == .not_found) {
+        const status = req.response.status;
+        if (status == .not_found) {
             self.last_error = HttpError.NotFound;
             return HttpError.NotFound;
         }
 
-        if (@intFromEnum(req.status) >= 500) {
+        if (@intFromEnum(status) >= 500) {
             self.last_error = HttpError.ServerError;
             return HttpError.ServerError;
         }
 
-        if (@intFromEnum(req.status) >= 400) {
+        if (@intFromEnum(status) >= 400) {
             self.last_error = HttpError.InvalidResponse;
             return HttpError.InvalidResponse;
         }

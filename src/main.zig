@@ -22,6 +22,13 @@ const PrivateInput = private_input.PrivateInput;
 const DlogProverInput = private_input.DlogProverInput;
 const Prover = prover_mod.Prover;
 
+// Block verification imports
+const block_mod = zigma.block;
+const BlockVerifier = block_mod.BlockVerifier;
+const Block = block_mod.Block;
+const ErgoNodeClient = block_mod.ErgoNodeClient;
+const json_parser = block_mod.json_parser;
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -81,6 +88,13 @@ pub fn main() !void {
             return;
         }
         try verifyTxCommand(args[2], args[3..], allocator);
+    } else if (std.mem.eql(u8, command, "verify-block")) {
+        if (args.len < 3) {
+            std.debug.print("Error: verify-block requires <source> argument\n", .{});
+            printUsage();
+            return;
+        }
+        try verifyBlockCommand(args[2], args[3..], allocator);
     } else if (std.mem.eql(u8, command, "prove")) {
         if (args.len < 3) {
             std.debug.print("Error: prove requires <public_key_hex> argument\n", .{});
@@ -124,6 +138,11 @@ fn printUsage() void {
         \\    --message=<hex>       Transaction bytes to sign (hex)
         \\  verify-tx <file>        Verify transaction proofs from JSON file
         \\    --message=<hex>       Transaction bytes that were signed (hex)
+        \\  verify-block <source>   Verify all transactions in a block
+        \\    <source>              JSON file path, --height=N, or --id=<hex>
+        \\    --node=<url>          Node URL (default: http://localhost:9052)
+        \\    -v, --verbose         Show per-transaction results
+        \\    --cost-limit=<n>      Cost limit per tx (default: 10000000)
         \\  deserialize <hex>       Deserialize and display ErgoTree
         \\  hash <algorithm> <hex>  Compute hash (blake2b256, sha256)
         \\  prove <pk_hex>          Generate Schnorr proof for ProveDlog
@@ -140,6 +159,8 @@ fn printUsage() void {
         \\  zigma eval-scenario scenario.json
         \\  zigma sign-tx tx.json --secrets=abc...,def... --message=deadbeef
         \\  zigma verify-tx tx.json --message=deadbeef
+        \\  zigma verify-block block.json
+        \\  zigma verify-block --height=500000 --node=http://localhost:9052
         \\  zigma deserialize 00d191a37300
         \\  zigma hash blake2b256 616263
         \\  zigma prove 03... --secret=abc123... --message=deadbeef
@@ -1438,4 +1459,192 @@ fn verifyTxCommand(path: []const u8, extra_args: []const []const u8, allocator: 
     }
 
     try stdout.print("], \"all_valid\": {}, \"total_cost\": {}}}\n", .{ all_valid, total_cost });
+}
+
+/// Verify block command: Verify all transactions in a block
+/// Usage: zigma verify-block <source> [options]
+///
+/// Source can be:
+/// - JSON file path (e.g., "block.json")
+/// - --height=N with --node=URL to fetch from node
+/// - --id=<hex> with --node=URL to fetch by header ID
+fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, allocator: std.mem.Allocator) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    // Parse options
+    var node_url: []const u8 = "http://localhost:9052";
+    var height: ?u32 = null;
+    var header_id: ?[]const u8 = null;
+    var verbose = false;
+    var cost_limit: u64 = 10_000_000;
+
+    // Check if source is an option
+    if (std.mem.startsWith(u8, source, "--height=")) {
+        const height_str = source["--height=".len..];
+        height = std.fmt.parseInt(u32, height_str, 10) catch {
+            try stdout.print("{{\"success\": false, \"error\": \"invalid_height\"}}\n", .{});
+            return;
+        };
+    } else if (std.mem.startsWith(u8, source, "--id=")) {
+        header_id = source["--id=".len..];
+    }
+
+    for (extra_args) |arg| {
+        if (std.mem.startsWith(u8, arg, "--node=")) {
+            node_url = arg["--node=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--height=")) {
+            const height_str = arg["--height=".len..];
+            height = std.fmt.parseInt(u32, height_str, 10) catch {
+                try stdout.print("{{\"success\": false, \"error\": \"invalid_height\"}}\n", .{});
+                return;
+            };
+        } else if (std.mem.startsWith(u8, arg, "--id=")) {
+            header_id = arg["--id=".len..];
+        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+        } else if (std.mem.startsWith(u8, arg, "--cost-limit=")) {
+            const limit_str = arg["--cost-limit=".len..];
+            cost_limit = std.fmt.parseInt(u64, limit_str, 10) catch {
+                try stdout.print("{{\"success\": false, \"error\": \"invalid_cost_limit\"}}\n", .{});
+                return;
+            };
+        }
+    }
+
+    // Determine data source
+    var json_content: []u8 = undefined;
+    var should_free = false;
+
+    if (height != null or header_id != null) {
+        // Fetch from node
+        var client = ErgoNodeClient.init(node_url);
+
+        if (height) |h| {
+            const result = client.getBlockAtHeight(h);
+            if (result) |data| {
+                // Copy to allocated buffer since client reuses internal buffer
+                json_content = allocator.alloc(u8, data.len) catch {
+                    try stdout.print("{{\"success\": false, \"error\": \"allocation_failed\"}}\n", .{});
+                    return;
+                };
+                @memcpy(json_content, data);
+                should_free = true;
+            } else |err| {
+                try stdout.print("{{\"success\": false, \"error\": \"fetch_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+                return;
+            }
+        } else if (header_id) |id_hex| {
+            var id_bytes: [32]u8 = undefined;
+            if (std.fmt.hexToBytes(&id_bytes, id_hex)) |decoded| {
+                if (decoded.len != 32) {
+                    try stdout.print("{{\"success\": false, \"error\": \"invalid_header_id\", \"message\": \"must be 32 bytes\"}}\n", .{});
+                    return;
+                }
+            } else |_| {
+                try stdout.print("{{\"success\": false, \"error\": \"invalid_header_id_hex\"}}\n", .{});
+                return;
+            }
+
+            const result = client.getBlockById(&id_bytes);
+            if (result) |data| {
+                json_content = allocator.alloc(u8, data.len) catch {
+                    try stdout.print("{{\"success\": false, \"error\": \"allocation_failed\"}}\n", .{});
+                    return;
+                };
+                @memcpy(json_content, data);
+                should_free = true;
+            } else |err| {
+                try stdout.print("{{\"success\": false, \"error\": \"fetch_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+                return;
+            }
+        }
+    } else {
+        // Read from file
+        const file = std.fs.cwd().openFile(source, .{}) catch |err| {
+            try stdout.print("{{\"success\": false, \"error\": \"file_open_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+            return;
+        };
+        defer file.close();
+
+        json_content = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch |err| {
+            try stdout.print("{{\"success\": false, \"error\": \"file_read_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+            return;
+        };
+        should_free = true;
+    }
+
+    defer if (should_free) allocator.free(json_content);
+
+    // Parse block JSON
+    var block_storage = block_mod.BlockStorage.init();
+    const blk = json_parser.parseBlockJson(json_content, &block_storage, allocator) catch |err| {
+        try stdout.print("{{\"success\": false, \"error\": \"parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
+        return;
+    };
+
+    // Create verifier with empty UTXO source (will need to fetch from node)
+    // For now, use a memory UTXO set from the block's transactions (outputs as UTXOs)
+    var utxo_storage = block_mod.UtxoStorage.init();
+
+    // Build UTXO set from transaction outputs (for testing with pre-mined blocks)
+    // In production, this would come from the node's UTXO set
+    for (blk.transactions) |tx| {
+        for (tx.outputs, 0..) |output, i| {
+            // Create BoxView from Output
+            var box_view: zigma.context.BoxView = std.mem.zeroes(zigma.context.BoxView);
+            box_view.value = output.value;
+            box_view.creation_height = output.creation_height;
+            box_view.proposition_bytes = output.ergo_tree;
+            box_view.index = @intCast(i);
+
+            // Compute box ID (Blake2b256 of tx.id || output_index)
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&tx.id);
+            var idx_bytes: [2]u8 = undefined;
+            std.mem.writeInt(u16, &idx_bytes, @intCast(i), .big);
+            hasher.update(&idx_bytes);
+            const box_id = hasher.finalize();
+
+            utxo_storage.addBox(box_id, box_view) catch break;
+        }
+    }
+
+    var utxo_set = utxo_storage.toUtxoSet();
+    const utxo_source = utxo_set.asSource();
+
+    // Initialize verifier
+    var verifier = BlockVerifier.init(utxo_source);
+    verifier.setCostLimit(cost_limit);
+
+    // Verify block
+    const result = verifier.verifyBlock(&blk);
+
+    // Output results
+    try stdout.print("{{\n  \"success\": {},\n", .{result.valid});
+    try stdout.print("  \"block_height\": {},\n", .{result.height});
+    try stdout.print("  \"transaction_count\": {},\n", .{result.tx_count});
+    try stdout.print("  \"total_cost\": {},\n", .{result.total_cost});
+    try stdout.print("  \"merkle_valid\": {},\n", .{result.merkle_valid});
+
+    if (result.first_error) |err| {
+        try stdout.print("  \"error\": \"{s}\",\n", .{@errorName(err)});
+    }
+
+    try stdout.print("  \"tx_results_count\": {}", .{result.tx_count});
+
+    if (verbose and result.tx_count > 0) {
+        try stdout.print(",\n  \"tx_results\": [\n", .{});
+        for (result.tx_results[0..result.tx_count], 0..) |tx_result, i| {
+            try stdout.print("    {{\"index\": {}, \"valid\": {}, \"cost\": {}", .{ i, tx_result.valid, tx_result.total_cost });
+            if (tx_result.first_error) |err| {
+                try stdout.print(", \"error\": \"{s}\"", .{@errorName(err)});
+            }
+            try stdout.print("}}", .{});
+            if (i < result.tx_count - 1) try stdout.print(",", .{});
+            try stdout.print("\n", .{});
+        }
+        try stdout.print("  ]", .{});
+    }
+
+    try stdout.print("\n}}\n", .{});
 }
