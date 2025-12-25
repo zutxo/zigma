@@ -644,6 +644,7 @@ pub const BlockVerifier = struct {
         // Deserialize ErgoTree (reuse pre-allocated pools)
         self.type_pool = types_mod.TypePool.init(); // Reset for this input
         self.arena = memory_mod.BumpAllocator(4096).init(); // Reset for this input
+        self.evaluator.pools.values.reset(); // Reset ValuePool for Coll[Int] etc.
         self.ergo_tree = ergotree_serializer.ErgoTree.init(&self.type_pool);
 
         var deser_diag: ?ergotree_serializer.DeserializeDiagnostics = null;
