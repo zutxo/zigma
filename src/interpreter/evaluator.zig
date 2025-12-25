@@ -137,6 +137,9 @@ fn pooledValueToValue(pooled: *const PooledValue, type_pool: *const TypePool) Ev
             .value_idx = pooled.data.option.value_idx,
         } },
 
+        // AVL tree type
+        TypePool.AVL_TREE => .{ .avl_tree = pooled.data.avl_tree },
+
         else => blk: {
             // Dynamic types - check actual type in pool
             if (type_idx < type_pool.count) {
@@ -151,8 +154,17 @@ fn pooledValueToValue(pooled: *const PooledValue, type_pool: *const TypePool) Ev
                         .inner_type = pooled.data.option.inner_type,
                         .value_idx = pooled.data.option.value_idx,
                     } },
-                    // Pairs need special handling - stored differently than Value.TupleRef
-                    .pair => break :blk error.UnsupportedExpression,
+                    // Pairs/tuples - convert to TupleRef using external storage mode
+                    .pair => break :blk .{
+                        .tuple = .{
+                            .start = pooled.data.tuple.start_idx,
+                            .len = pooled.data.tuple.len,
+                            .types = .{ 0, 0, 0, 0 }, // External storage
+                            .values = .{ 0, 0, 0, 0 }, // External storage
+                        },
+                    },
+                    // AVL tree (dynamically allocated type index)
+                    .avl_tree => break :blk .{ .avl_tree = pooled.data.avl_tree },
                     else => break :blk error.UnsupportedExpression,
                 }
             }
@@ -1922,6 +1934,7 @@ pub const Evaluator = struct {
     }
 
     /// Compute DecodePoint - decode Coll[Byte] to GroupElement
+    /// If input is already a GroupElement, passes it through unchanged.
     fn computeDecodePoint(self: *Evaluator) EvalError!void {
         // PRECONDITION: Value stack has at least one value
         assert(self.value_sp > 0);
@@ -1929,9 +1942,17 @@ pub const Evaluator = struct {
         try self.addCost(FixedCost.decode_point);
 
         const input = try self.popValue();
-        if (input != .coll_byte) return error.TypeMismatch;
 
-        const bytes = input.coll_byte;
+        // If already a GroupElement, pass through unchanged
+        if (input == .group_element) {
+            try self.pushValue(input);
+            return;
+        }
+
+        // Extract bytes from either .coll_byte or .coll (byte collection from pool)
+        var buf: [33]u8 = undefined;
+        const bytes = self.extractBytesFromColl(input, &buf) orelse return error.TypeMismatch;
+
         if (bytes.len != 33) return error.InvalidData;
 
         // INVARIANT: Input is exactly 33 bytes
@@ -4499,7 +4520,6 @@ pub const Evaluator = struct {
 
         // Currently only support coll_byte
         if (coll != .coll_byte) {
-            std.debug.print("DEBUG: flatMap on non-byte coll type\n", .{});
             return error.UnsupportedExpression;
         }
 
@@ -8564,6 +8584,32 @@ pub const Evaluator = struct {
             .coll => |c| self.getCollectionElementFromRef(c, @intCast(idx)),
             else => error.TypeMismatch,
         };
+    }
+
+    /// Helper: extract bytes from a collection that holds bytes.
+    /// Handles both .coll_byte (direct) and .coll with elem_type=BYTE (from pool).
+    /// Returns null if not a byte collection or extraction fails.
+    fn extractBytesFromColl(self: *Evaluator, coll: Value, buf: []u8) ?[]const u8 {
+        switch (coll) {
+            .coll_byte => |bytes| {
+                if (bytes.len > buf.len) return null;
+                return bytes;
+            },
+            .coll => |c| {
+                // Check if this is a byte collection
+                if (c.elem_type != TypePool.BYTE) return null;
+                if (c.len > buf.len) return null;
+
+                // Extract bytes from ValuePool
+                for (0..c.len) |i| {
+                    const pooled = self.pools.values.get(c.start + @as(u16, @intCast(i))) orelse return null;
+                    if (pooled.type_idx != TypePool.BYTE) return null;
+                    buf[i] = @intCast(@as(u64, @bitCast(pooled.data.primitive)) & 0xFF);
+                }
+                return buf[0..c.len];
+            },
+            else => return null,
+        }
     }
 
     /// Helper: find lambda argument var_id by scanning body for val_use
