@@ -1525,7 +1525,13 @@ fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, alloca
 
     if (height != null or header_id != null) {
         // Fetch from node
-        var client = ErgoNodeClient.init(node_url);
+        // ErgoNodeClient has 512KB buffer, must be heap-allocated
+        const client = allocator.create(ErgoNodeClient) catch {
+            try stdout.print("Error: Failed to allocate HTTP client\n", .{});
+            return;
+        };
+        defer allocator.destroy(client);
+        client.* = ErgoNodeClient.init(node_url);
 
         if (height) |h| {
             const result = client.getBlockAtHeight(h);
@@ -1584,15 +1590,27 @@ fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, alloca
     defer if (should_free) allocator.free(json_content);
 
     // Parse block JSON
-    var block_storage = block_mod.BlockStorage.init();
-    const blk = json_parser.parseBlockJson(json_content, &block_storage, allocator) catch |err| {
+    // BlockStorage is huge (256KB+ for ad_proofs alone), must be heap-allocated
+    const block_storage = allocator.create(block_mod.BlockStorage) catch {
+        try stdout.print("Error: Failed to allocate block storage\n", .{});
+        return;
+    };
+    defer allocator.destroy(block_storage);
+    block_storage.initInPlace();
+    const blk = json_parser.parseBlockJson(json_content, block_storage, allocator) catch |err| {
         try stdout.print("{{\"success\": false, \"error\": \"parse_error\", \"message\": \"{s}\"}}\n", .{@errorName(err)});
         return;
     };
 
     // Create verifier with empty UTXO source (will need to fetch from node)
     // For now, use a memory UTXO set from the block's transactions (outputs as UTXOs)
-    var utxo_storage = block_mod.UtxoStorage.init();
+    // UtxoStorage is ~1.5MB, must be heap-allocated
+    const utxo_storage = allocator.create(block_mod.UtxoStorage) catch {
+        try stdout.print("Error: Failed to allocate UTXO storage\n", .{});
+        return;
+    };
+    defer allocator.destroy(utxo_storage);
+    utxo_storage.* = block_mod.UtxoStorage.init();
 
     // Build UTXO set from transaction outputs (for testing with pre-mined blocks)
     // In production, this would come from the node's UTXO set
@@ -1616,12 +1634,24 @@ fn verifyBlockCommand(source: []const u8, extra_args: []const []const u8, alloca
     var utxo_set = utxo_storage.toUtxoSet();
     const utxo_source = utxo_set.asSource();
 
-    // Initialize verifier
-    var verifier = BlockVerifier.init(utxo_source);
+    // Initialize verifier on heap (struct is too large for stack)
+    const verifier = allocator.create(BlockVerifier) catch {
+        try stdout.print("Error: Failed to allocate verifier\n", .{});
+        return;
+    };
+    defer allocator.destroy(verifier);
+    verifier.initInPlace(utxo_source);
     verifier.setCostLimit(cost_limit);
 
-    // Verify block
-    const result = verifier.verifyBlock(&blk);
+    // Allocate result on heap (struct is 5MB+ due to tx_results array)
+    const result = allocator.create(block_mod.BlockVerifyResult) catch {
+        try stdout.print("Error: Failed to allocate block verify result\n", .{});
+        return;
+    };
+    defer allocator.destroy(result);
+
+    // Verify block (use in-place to avoid stack overflow)
+    verifier.verifyBlockInPlace(&blk, result);
 
     // Output results
     try stdout.print("{{\n  \"success\": {},\n", .{result.valid});
