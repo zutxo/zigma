@@ -2814,8 +2814,19 @@ pub const Evaluator = struct {
                 return self.deserializeAndCacheRegister(source, box_idx, reg, expected_type);
             },
             .loaded => |value_idx| {
-                // Cache hit - value already in pool, reuse index directly
-                return .{ .option = .{ .inner_type = expected_type, .value_idx = value_idx } };
+                // Cache hit - value already in pool
+                // Check if the cached value's type matches the expected type
+                if (self.pools.values.get(value_idx)) |pooled| {
+                    if (!typesCompatible(expected_type, pooled.type_idx, &self.pools.type_pool)) {
+                        // Type mismatch - return None
+                        return .{ .option = .{ .inner_type = expected_type, .value_idx = null_value_idx } };
+                    }
+                    // Types match - return Some(value)
+                    return .{ .option = .{ .inner_type = expected_type, .value_idx = value_idx } };
+                } else {
+                    // Value not found in pool (shouldn't happen) - return None
+                    return .{ .option = .{ .inner_type = expected_type, .value_idx = null_value_idx } };
+                }
             },
             .absent => {
                 // Register not present - return Option.None
@@ -2864,6 +2875,35 @@ pub const Evaluator = struct {
             self.pools.register_cache.markInvalid(source, box_idx, reg, .invalid_data);
             return error.InvalidData;
         };
+
+        // Type check: if actual type doesn't match expected type, return Option.None
+        // This matches ErgoScript semantics where box.R4[GroupElement] returns None
+        // if R4 contains a different type (e.g., SigmaProp)
+        // Note: We still deserialize and cache the value so later requests with the
+        // correct type will work. We just return None for this specific request.
+        if (!typesCompatible(expected_type, actual_type, &self.pools.type_pool)) {
+            // Deserialize and cache the actual value so correct-type requests work
+            const value = data.deserialize(
+                actual_type,
+                &self.pools.type_pool,
+                &reader,
+                &self.arena,
+                &self.pools.values,
+            ) catch {
+                self.pools.register_cache.markInvalid(source, box_idx, reg, .invalid_data);
+                return error.InvalidData;
+            };
+
+            const value_idx = self.storeValueInPool(value, actual_type) catch {
+                self.pools.register_cache.markInvalid(source, box_idx, reg, .pool_exhausted);
+                return error.OutOfMemory;
+            };
+
+            self.pools.register_cache.markLoaded(source, box_idx, reg, value_idx);
+
+            // Return None for this type mismatch request
+            return .{ .option = .{ .inner_type = expected_type, .value_idx = null_value_idx } };
+        }
 
         // Deserialize the value
         const value = data.deserialize(
@@ -4400,16 +4440,12 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Find the lambda (func_value node after collection subtree)
+        // Find the lambda - can be inline func_value or val_use
         const coll_idx = node_idx + 1;
         const lambda_idx = self.findSubtreeEnd(coll_idx);
-        const lambda_node = self.tree.nodes[lambda_idx];
-
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-
-        // Get lambda argument var_id by scanning for val_use in body
-        const body_idx = lambda_idx + 1;
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1; // Default to 1
+        const lambda_info = try self.resolveLambda(lambda_idx);
+        const body_idx = lambda_info.body_idx;
+        const arg_var_id = lambda_info.arg_var_id;
 
         // Evaluate predicate for each element
         for (0..len) |i| {
@@ -4480,16 +4516,12 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Find the lambda (func_value node after collection subtree)
+        // Find the lambda - can be inline func_value or val_use
         const coll_idx = node_idx + 1;
         const lambda_idx = self.findSubtreeEnd(coll_idx);
-        const lambda_node = self.tree.nodes[lambda_idx];
-
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-
-        // Get lambda argument var_id by scanning for val_use in body
-        const body_idx = lambda_idx + 1;
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+        const lambda_info = try self.resolveLambda(lambda_idx);
+        const body_idx = lambda_info.body_idx;
+        const arg_var_id = lambda_info.arg_var_id;
 
         // Evaluate predicate for each element
         for (0..len) |i| {
@@ -4566,15 +4598,13 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Find the lambda
+        // Find the lambda - can be inline func_value or val_use referencing a function
         const coll_idx = node_idx + 1;
         const lambda_idx = self.findSubtreeEnd(coll_idx);
-        const lambda_node = self.tree.nodes[lambda_idx];
 
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-
-        const body_idx = lambda_idx + 1;
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+        const lambda_info = try self.resolveLambda(lambda_idx);
+        const body_idx = lambda_info.body_idx;
+        const arg_var_id = lambda_info.arg_var_id;
 
         // Handle byte collections specially (more efficient)
         if (coll == .coll_byte) {
@@ -4657,15 +4687,12 @@ pub const Evaluator = struct {
         // Chunk-based cost for filter: PerItemCost(20, 1, 10)
         try self.addCost(CollectionCost.filter.cost(@truncate(len)));
 
-        // Find the lambda
+        // Find the lambda - can be inline func_value or val_use
         const coll_idx = node_idx + 1;
         const lambda_idx = self.findSubtreeEnd(coll_idx);
-        const lambda_node = self.tree.nodes[lambda_idx];
-
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-
-        const body_idx = lambda_idx + 1;
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+        const lambda_info = try self.resolveLambda(lambda_idx);
+        const body_idx = lambda_info.body_idx;
+        const arg_var_id = lambda_info.arg_var_id;
 
         // Handle byte collections specially (more efficient)
         if (coll == .coll_byte) {
@@ -4823,12 +4850,22 @@ pub const Evaluator = struct {
         const lambda_idx = self.findSubtreeEnd(zero_idx);
         const lambda_node = self.tree.nodes[lambda_idx];
 
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-        if (lambda_node.data != 2) return error.InvalidData; // Fold lambda takes 2 args
+        // Fold lambda takes 2 args; resolve inline or via val_use
+        var body_idx: u16 = undefined;
+        if (lambda_node.tag == .func_value) {
+            if (lambda_node.data != 2) return error.InvalidData;
+            body_idx = lambda_idx + 1;
+        } else if (lambda_node.tag == .val_use) {
+            const var_id: u8 = @truncate(lambda_node.data);
+            const func_val = self.var_bindings[var_id] orelse return error.UndefinedVariable;
+            if (func_val != .func_ref) return error.TypeMismatch;
+            body_idx = func_val.func_ref.body_idx;
+        } else {
+            return error.InvalidData;
+        }
 
         // For fold, we need two var_ids: accumulator and element
         // Convention: acc_id = 1, elem_id = 2 (or scan body to find them)
-        const body_idx = lambda_idx + 1;
         const acc_var_id: u16 = 1;
         const elem_var_id: u16 = 2;
 
@@ -4876,16 +4913,13 @@ pub const Evaluator = struct {
         const MAX_COLLECTION_SIZE = 4096;
         if (input.len > MAX_COLLECTION_SIZE) return error.CollectionTooLarge;
 
-        // Find the lambda
+        // Find the lambda - can be inline func_value or val_use
         const coll_idx = node_idx + 1;
         const lambda_idx = self.findSubtreeEnd(coll_idx);
         assert(lambda_idx < self.tree.node_count); // Lambda must be in bounds
-        const lambda_node = self.tree.nodes[lambda_idx];
-
-        if (lambda_node.tag != .func_value) return error.InvalidData;
-
-        const body_idx = lambda_idx + 1;
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1;
+        const lambda_info = try self.resolveLambda(lambda_idx);
+        const body_idx = lambda_info.body_idx;
+        const arg_var_id = lambda_info.arg_var_id;
 
         // Collect results - use temporary buffer then copy
         var result_len: usize = 0;
@@ -9417,6 +9451,29 @@ pub const Evaluator = struct {
         return null;
     }
 
+    /// Resolve a lambda expression to its body index and argument var_id.
+    /// Handles both inline func_value and val_use referencing a stored function.
+    fn resolveLambda(self: *const Evaluator, lambda_idx: u16) EvalError!struct { body_idx: u16, arg_var_id: u8 } {
+        const lambda_node = self.tree.nodes[lambda_idx];
+
+        if (lambda_node.tag == .func_value) {
+            // Inline lambda: body follows func_value node
+            const body_idx = lambda_idx + 1;
+            const arg_var_id: u8 = @truncate(self.findLambdaArgId(body_idx) orelse 1);
+            return .{ .body_idx = body_idx, .arg_var_id = arg_var_id };
+        } else if (lambda_node.tag == .val_use) {
+            // Lambda from variable reference
+            const var_id: u8 = @truncate(lambda_node.data);
+            const func_val = self.var_bindings[var_id] orelse return error.UndefinedVariable;
+            if (func_val != .func_ref) return error.TypeMismatch;
+            const body_idx = func_val.func_ref.body_idx;
+            const arg_var_id: u8 = @truncate(self.findLambdaArgId(body_idx) orelse 1);
+            return .{ .body_idx = body_idx, .arg_var_id = arg_var_id };
+        } else {
+            return error.InvalidData;
+        }
+    }
+
     /// Helper: evaluate a subtree and return result
     fn evaluateSubtree(self: *Evaluator, root_idx: u16) EvalError!Value {
         // PRECONDITION: Valid node index
@@ -9686,6 +9743,17 @@ pub const Evaluator = struct {
                         CollMethodId.get => 2, // obj + 1 arg (idx)
                         CollMethodId.flatmap => 2, // obj + 1 arg (lambda)
                         else => 1, // indices, reverse have no args
+                    };
+                }
+                // AvlTree methods with args:
+                if (type_code == AvlTreeTypeCode) {
+                    break :blk switch (method_id) {
+                        // 2-arg methods: contains, get, getMany, insert, update, remove, insertOrUpdate
+                        AvlTreeMethodId.contains, AvlTreeMethodId.get, AvlTreeMethodId.get_many, AvlTreeMethodId.insert, AvlTreeMethodId.update, AvlTreeMethodId.remove, AvlTreeMethodId.insert_or_update => 3, // obj + 2 args
+                        // 1-arg methods: updateOperations, updateDigest
+                        AvlTreeMethodId.update_operations, AvlTreeMethodId.update_digest => 2, // obj + 1 arg
+                        // 0-arg methods (properties): digest, enabledOperations, keyLength, etc.
+                        else => 1, // obj only
                     };
                 }
                 break :blk 1; // Default: obj only
