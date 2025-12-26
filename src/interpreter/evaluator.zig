@@ -9618,6 +9618,25 @@ fn valuesEqual(a: Value, b: Value) bool {
             if (b != .group_element) break :blk false;
             break :blk std.mem.eql(u8, &av, &b.group_element);
         },
+        .avl_tree => |av| blk: {
+            if (b != .avl_tree) break :blk false;
+            const bv = b.avl_tree;
+            // Compare digest, flags, and key/value lengths
+            if (!std.mem.eql(u8, &av.digest, &bv.digest)) break :blk false;
+            if (av.tree_flags.insert_allowed != bv.tree_flags.insert_allowed) break :blk false;
+            if (av.tree_flags.update_allowed != bv.tree_flags.update_allowed) break :blk false;
+            if (av.tree_flags.remove_allowed != bv.tree_flags.remove_allowed) break :blk false;
+            if (av.key_length != bv.key_length) break :blk false;
+            // Compare optional value length
+            if (av.value_length_opt) |avl| {
+                if (bv.value_length_opt) |bvl| {
+                    if (avl != bvl) break :blk false;
+                } else break :blk false;
+            } else {
+                if (bv.value_length_opt != null) break :blk false;
+            }
+            break :blk true;
+        },
         else => false, // Complex types (tuples, collections) need deeper comparison
     };
 }

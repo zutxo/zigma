@@ -255,16 +255,29 @@ pub const SigmaBoolean = union(enum) {
                 // AND reduction:
                 // - If ANY child is false → whole thing is false
                 // - If ALL children are true → whole thing is true
-                // - Otherwise, keep non-trivial children
-                var all_true = true;
+                // - If exactly one non-trivial child → return that child
+                // - Otherwise, keep the CAND
+                var non_trivial_count: usize = 0;
+                var last_non_trivial: ?*const SigmaBoolean = null;
 
                 for (and_node.children) |child| {
                     const reduced = child.reduceWithDepth(depth + 1);
                     if (reduced.isFalse()) return .trivial_false;
-                    if (!reduced.isTrue()) all_true = false;
+                    if (!reduced.isTrue()) {
+                        non_trivial_count += 1;
+                        last_non_trivial = child;
+                    }
                 }
 
-                if (all_true) return .trivial_true;
+                // All children are trivially true
+                if (non_trivial_count == 0) return .trivial_true;
+
+                // Exactly one non-trivial child: AND(true, pk) = pk
+                if (non_trivial_count == 1) {
+                    return last_non_trivial.?.*;
+                }
+
+                // Multiple non-trivial children: keep the CAND
                 return self.*;
             },
 
@@ -272,16 +285,29 @@ pub const SigmaBoolean = union(enum) {
                 // OR reduction:
                 // - If ANY child is true → whole thing is true
                 // - If ALL children are false → whole thing is false
+                // - If exactly one non-trivial child → return that child
                 // - Otherwise, keep non-trivial children
-                var all_false = true;
+                var non_trivial_count: usize = 0;
+                var last_non_trivial: ?*const SigmaBoolean = null;
 
                 for (or_node.children) |child| {
                     const reduced = child.reduceWithDepth(depth + 1);
                     if (reduced.isTrue()) return .trivial_true;
-                    if (!reduced.isFalse()) all_false = false;
+                    if (!reduced.isFalse()) {
+                        non_trivial_count += 1;
+                        last_non_trivial = child;
+                    }
                 }
 
-                if (all_false) return .trivial_false;
+                // All children are trivially false
+                if (non_trivial_count == 0) return .trivial_false;
+
+                // Exactly one non-trivial child: OR(false, pk) = pk
+                if (non_trivial_count == 1) {
+                    return last_non_trivial.?.*;
+                }
+
+                // Multiple non-trivial children: keep the COR
                 return self.*;
             },
 
