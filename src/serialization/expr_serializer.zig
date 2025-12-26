@@ -1766,9 +1766,12 @@ fn deserializeFuncValue(
     if (num_args > 32) return error.InvalidData; // Reasonable limit
 
     // Read argument definitions and register types
+    // For single-arg functions (most common), store arg var_id for binding
+    var first_arg_var_id: u32 = 0;
     var i: u32 = 0;
     while (i < num_args) : (i += 1) {
         const var_id = reader.readU32() catch |e| return mapVlqError(e);
+        if (i == 0) first_arg_var_id = var_id;
         const arg_type = type_serializer.deserialize(&tree.type_pool, reader) catch |e| {
             return switch (e) {
                 error.InvalidTypeCode => error.InvalidTypeCode,
@@ -1782,10 +1785,12 @@ fn deserializeFuncValue(
         tree.setValDefType(@truncate(var_id), arg_type);
     }
 
-    // Add the func_value node (stores num_args in data)
+    // Add the func_value node
+    // Data format: low 8 bits = num_args, high 8 bits = first arg var_id
+    const packed_data: u16 = @as(u16, @truncate(num_args)) | (@as(u16, @truncate(first_arg_var_id)) << 8);
     _ = try tree.addNode(.{
         .tag = .func_value,
-        .data = @truncate(num_args),
+        .data = packed_data,
         .result_type = TypePool.ANY, // Function type determined by body
     });
 

@@ -1357,7 +1357,9 @@ pub const Evaluator = struct {
             .func_value => {
                 // FuncValue can be stored as a first-class value (e.g., in a variable)
                 // When encountered standalone, create a function reference
+                // data layout: num_args (bits 0-7), arg_var_id (bits 8-15)
                 const num_args: u8 = @truncate(node.data);
+                const arg_var_id: u8 = @truncate(node.data >> 8);
                 const body_idx: u16 = node_idx + 1;
 
                 // Validate body index
@@ -1366,6 +1368,7 @@ pub const Evaluator = struct {
                 try self.pushValue(.{ .func_ref = .{
                     .body_idx = body_idx,
                     .num_args = num_args,
+                    .arg_var_id = arg_var_id,
                 } });
             },
 
@@ -2955,8 +2958,8 @@ pub const Evaluator = struct {
             .tuple => |t| .{ .type_idx = type_idx, .data = .{ .tuple = .{ .start_idx = t.start, .len = t.len, .types_start = 0 } } },
             // Types that shouldn't be stored in pool (use stack Value directly)
             .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
-            // Function references store body_idx and num_args
-            .func_ref => |f| .{ .type_idx = type_idx, .data = .{ .primitive = (@as(i64, f.body_idx) << 8) | @as(i64, f.num_args) } },
+            // Function references store body_idx, num_args, and arg_var_id
+            .func_ref => |f| .{ .type_idx = type_idx, .data = .{ .primitive = (@as(i64, f.body_idx) << 16) | (@as(i64, f.arg_var_id) << 8) | @as(i64, f.num_args) } },
         };
 
         self.pools.values.set(idx, pooled);
@@ -5188,15 +5191,18 @@ pub const Evaluator = struct {
         assert(func_idx < self.tree.node_count); // func must be in bounds
         const func_node = self.tree.nodes[func_idx];
 
-        // Determine function body and num_args based on whether inline or from variable
+        // Determine function body, num_args, and arg_var_id based on whether inline or from variable
         var body_idx: u16 = undefined;
         var num_args: u8 = undefined;
+        var arg_var_id: u16 = undefined;
         var arg_value: Value = undefined;
 
         if (func_node.tag == .func_value) {
             // Inline function: stack has [arg]
             arg_value = try self.popValue();
-            num_args = @truncate(func_node.data);
+            // Data format: low 8 bits = num_args, high 8 bits = first arg var_id
+            num_args = @truncate(func_node.data & 0xFF);
+            arg_var_id = (func_node.data >> 8) & 0xFF;
             body_idx = func_idx + 1;
         } else {
             // Function from variable: stack has [func_ref, arg]
@@ -5207,6 +5213,7 @@ pub const Evaluator = struct {
             if (func_ref_value != .func_ref) return error.TypeMismatch;
             const func_ref = func_ref_value.func_ref;
             num_args = func_ref.num_args;
+            arg_var_id = func_ref.arg_var_id;
             body_idx = func_ref.body_idx;
         }
 
@@ -5217,9 +5224,6 @@ pub const Evaluator = struct {
         if (num_args != 1) return error.TypeMismatch;
 
         assert(body_idx < self.tree.node_count); // body must be in bounds
-
-        // Find argument var_id by scanning body for val_use
-        const arg_var_id = self.findLambdaArgId(body_idx) orelse 1; // Default to 1 if not found
 
         // INVARIANT: var_id must be in bounds of pre-allocated binding array
         assert(arg_var_id < self.var_bindings.len);
@@ -11647,7 +11651,7 @@ test "evaluator: apply identity function" {
     // Tree: [apply] [func_value(1)] [val_use(1)] [constant(42)]
     var tree = ExprTree.init();
     tree.nodes[0] = .{ .tag = .apply };
-    tree.nodes[1] = .{ .tag = .func_value, .data = 1 }; // 1 argument
+    tree.nodes[1] = .{ .tag = .func_value, .data = 1 | (1 << 8) }; // 1 arg, arg_var_id=1
     tree.nodes[2] = .{ .tag = .val_use, .data = 1 }; // Return x (var_id = 1)
     tree.nodes[3] = .{ .tag = .constant, .data = 0 }; // Argument = 42
     tree.node_count = 4;

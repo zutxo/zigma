@@ -306,6 +306,8 @@ pub const Value = union(enum) {
         body_idx: u16,
         /// Number of arguments the function takes
         num_args: u8,
+        /// Variable ID for the first argument (for binding during apply)
+        arg_var_id: u8,
 
         // Compile-time assertions
         comptime {
