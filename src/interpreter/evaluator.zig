@@ -3034,25 +3034,19 @@ pub const Evaluator = struct {
             const start = self.values_sp;
             if (start + elem_count > self.values.len) return error.OutOfMemory;
 
-            // Debug: show expected element type
-            const expected_stype = self.pools.type_pool.get(elem_type);
-            std.debug.print("DEBUG concreteCollection: elem_count={d}, expected elem_type={s}\n", .{ elem_count, @tagName(expected_stype) });
-
             // Pop elements in reverse order (last on stack = first in collection)
             var i: u16 = elem_count;
             while (i > 0) {
                 i -= 1;
                 const val = try self.popValue();
-                // Debug: show actual element type
-                std.debug.print("DEBUG concreteCollection: elem[{d}] actual type={s}\n", .{ i, @tagName(val) });
                 self.values[start + i] = val;
             }
             self.values_sp = start + elem_count;
 
-            // Create collection reference
+            // Create collection reference with runtime flag set
             try self.pushValue(.{ .coll = .{
                 .elem_type = elem_type,
-                .start = @truncate(start),
+                .start = @as(u16, @truncate(start)) | RUNTIME_COLL_FLAG,
                 .len = elem_count,
             } });
         }
@@ -5042,21 +5036,19 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Determine element type from collection's declared type
-        // For Coll[Boolean]: iterate elements and AND them as booleans
-        // For Coll[SigmaProp]: create SigmaAnd of all elements
-        const declared_elem_type: TypeIndex = switch (coll_val) {
-            .coll_byte => TypePool.BYTE,
-            .coll => |c| c.elem_type,
-            else => return error.TypeMismatch, // Shouldn't reach here
-        };
+        // Determine element type from first actual element (not declared type)
+        // This handles the common ErgoScript pattern where allOf/anyOf is used with SigmaProps
+        // but the collection may be declared as Coll[Boolean]
+        const first_elem = try self.getCollectionElement(coll_val, 0);
 
-        const elem_stype = self.pools.type_pool.get(declared_elem_type);
-
-        switch (elem_stype) {
+        switch (first_elem) {
             .boolean => {
-                // Coll[Boolean] → Boolean
-                for (0..len) |i| {
+                // Coll[Boolean] → Boolean: AND all elements
+                if (!first_elem.boolean) {
+                    try self.pushValue(.{ .boolean = false });
+                    return;
+                }
+                for (1..len) |i| {
                     const elem = try self.getCollectionElement(coll_val, i);
                     switch (elem) {
                         .boolean => |b| {
@@ -5122,19 +5114,19 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Determine element type from collection's declared type
-        const declared_elem_type: TypeIndex = switch (coll_val) {
-            .coll_byte => TypePool.BYTE,
-            .coll => |c| c.elem_type,
-            else => return error.TypeMismatch, // Shouldn't reach here
-        };
+        // Determine element type from first actual element (not declared type)
+        // This handles the common ErgoScript pattern where allOf/anyOf is used with SigmaProps
+        // but the collection may be declared as Coll[Boolean]
+        const first_elem = try self.getCollectionElement(coll_val, 0);
 
-        const elem_stype = self.pools.type_pool.get(declared_elem_type);
-
-        switch (elem_stype) {
+        switch (first_elem) {
             .boolean => {
-                // Coll[Boolean] → Boolean
-                for (0..len) |i| {
+                // Coll[Boolean] → Boolean: OR all elements
+                if (first_elem.boolean) {
+                    try self.pushValue(.{ .boolean = true });
+                    return;
+                }
+                for (1..len) |i| {
                     const elem = try self.getCollectionElement(coll_val, i);
                     switch (elem) {
                         .boolean => |b| {
@@ -6568,7 +6560,7 @@ pub const Evaluator = struct {
         // Extract SigmaBoolean from each collection element
         var children: [256]*const sigma_tree.SigmaBoolean = undefined;
         for (0..coll_len) |i| {
-            const elem = self.values[coll_ref.start + i];
+            const elem = try self.getCollectionElementFromRef(coll_ref, @intCast(i));
             children[i] = try self.extractSigmaBoolean(elem);
         }
 
@@ -7332,8 +7324,21 @@ pub const Evaluator = struct {
     }
 
     /// Get element from a CollRef at given index
+    /// Flag bit to indicate runtime collections (elements in self.values, not pools.values)
+    const RUNTIME_COLL_FLAG: u16 = 0x8000;
+
     fn getCollectionElementFromRef(self: *Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
         if (idx >= coll.len) return error.IndexOutOfBounds;
+
+        // Check if this is a runtime-built collection (high bit set)
+        if (coll.start & RUNTIME_COLL_FLAG != 0) {
+            const actual_start = coll.start & ~RUNTIME_COLL_FLAG;
+            const val_idx = actual_start + idx;
+            if (val_idx < self.values.len) {
+                return self.values[val_idx];
+            }
+            return error.IndexOutOfBounds;
+        }
 
         const val_idx = coll.start + idx;
 
