@@ -90,7 +90,7 @@ pub fn computeWitnessIds(
 /// 3. Otherwise, build tree bottom-up:
 ///    - Each leaf: hash(LeafPrefix || data)
 ///    - Internal nodes: hash(InternalNodePrefix || left || right)
-///    - Odd node paired with empty node (all zeros)
+///    - Odd node paired with EmptyNode (hash = EmptyByteArray = 0 bytes)
 ///    - Repeat until single root
 ///
 /// Reference: scrypto MerkleTree.scala, Node.scala
@@ -118,7 +118,8 @@ pub fn computeTxMerkleRoot(leaf_data: []const [32]u8) [32]u8 {
     var level_size: usize = initial_count;
 
     // Build tree bottom-up
-    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+    // Note: scrypto uses EmptyNode with hash = EmptyByteArray (0 bytes)
+    // So we don't append anything when pairing with empty node
 
     while (level_size > 1) {
         const pairs = level_size / 2;
@@ -133,12 +134,12 @@ pub fn computeTxMerkleRoot(leaf_data: []const [32]u8) [32]u8 {
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node - pair with empty node
+        // Handle odd node - pair with EmptyNode (EmptyByteArray = 0 bytes)
         if (has_odd) {
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[level_size - 1]);
-            hasher.update(&empty_node_hash);
+            // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
             next[pairs] = hasher.finalize();
             level_size = pairs + 1;
         } else {
@@ -206,7 +207,7 @@ pub fn computeTxMerkleRootV2(
     var level_size: usize = total_leaves;
 
     // Build tree bottom-up
-    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+    // Note: scrypto uses EmptyNode with hash = EmptyByteArray (0 bytes)
 
     while (level_size > 1) {
         const pairs = level_size / 2;
@@ -221,12 +222,12 @@ pub fn computeTxMerkleRootV2(
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node - pair with empty node
+        // Handle odd node - pair with EmptyNode (EmptyByteArray = 0 bytes)
         if (has_odd) {
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[level_size - 1]);
-            hasher.update(&empty_node_hash);
+            // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
             next[pairs] = hasher.finalize();
             level_size = pairs + 1;
         } else {
@@ -347,7 +348,7 @@ fn computeTxMerkleRootWithBuffers(
     }
 
     // Build tree bottom-up
-    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+    // Note: scrypto uses EmptyNode with hash = EmptyByteArray (0 bytes)
 
     while (count > 1) {
         const pairs = count / 2;
@@ -362,12 +363,12 @@ fn computeTxMerkleRootWithBuffers(
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node - pair with empty node
+        // Handle odd node - pair with EmptyNode (EmptyByteArray = 0 bytes)
         if (has_odd) {
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[count - 1]);
-            hasher.update(&empty_node_hash);
+            // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
             next[pairs] = hasher.finalize();
             count = pairs + 1;
         } else {
@@ -417,7 +418,7 @@ fn computeTxMerkleRootV2WithBuffers(
     }
 
     // Build tree bottom-up
-    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+    // Note: scrypto uses EmptyNode with hash = EmptyByteArray (0 bytes)
 
     while (count > 1) {
         const pairs = count / 2;
@@ -431,12 +432,12 @@ fn computeTxMerkleRootV2WithBuffers(
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node - pair with empty node
+        // Handle odd node - pair with EmptyNode (EmptyByteArray = 0 bytes)
         if (has_odd) {
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[count - 1]);
-            hasher.update(&empty_node_hash);
+            // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
             next[pairs] = hasher.finalize();
             count = pairs + 1;
         } else {
@@ -466,6 +467,9 @@ pub const MerkleProof = struct {
 
     /// Verify that tx_id is included with this proof producing expected root
     pub fn verify(self: *const MerkleProof, tx_id: [32]u8, expected_root: [32]u8) bool {
+        // Empty sibling marker (scrypto uses EmptyByteArray = 0 bytes)
+        const empty_sibling_marker: [32]u8 = [_]u8{0} ** 32;
+
         // First hash the leaf with LEAF_PREFIX
         var leaf_hasher = hash.Blake2b256Hasher.init();
         leaf_hasher.update(&[_]u8{LEAF_PREFIX});
@@ -477,14 +481,22 @@ pub const MerkleProof = struct {
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
 
+            const is_empty_sibling = std.mem.eql(u8, &self.siblings[i], &empty_sibling_marker);
+
             // Order depends on position: left child (even index) or right child (odd index)
             if (index % 2 == 0) {
                 // Current is left child
                 hasher.update(&current);
-                hasher.update(&self.siblings[i]);
+                // EmptyNode.hash = EmptyByteArray (0 bytes), so skip if empty
+                if (!is_empty_sibling) {
+                    hasher.update(&self.siblings[i]);
+                }
             } else {
                 // Current is right child
-                hasher.update(&self.siblings[i]);
+                // EmptyNode.hash = EmptyByteArray (0 bytes), so skip if empty
+                if (!is_empty_sibling) {
+                    hasher.update(&self.siblings[i]);
+                }
                 hasher.update(&current);
             }
 
@@ -522,7 +534,10 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
     var current: *[MAX_LEVEL_NODES][32]u8 = &level_a;
     var next: *[MAX_LEVEL_NODES][32]u8 = &level_b;
 
-    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+    // Note: scrypto uses EmptyNode with hash = EmptyByteArray (0 bytes)
+    // For proof siblings, we use all zeros as a marker for "empty sibling"
+    // The verify function needs to handle this specially
+    const empty_sibling_marker: [32]u8 = [_]u8{0} ** 32;
 
     // Hash leaves with LEAF_PREFIX
     const initial_count = @min(tx_ids.len, MAX_LEVEL_NODES);
@@ -547,7 +562,7 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
                 proof.siblings[proof.depth] = current[target_index + 1];
             } else {
                 // No sibling (we're the odd one), sibling is empty node
-                proof.siblings[proof.depth] = empty_node_hash;
+                proof.siblings[proof.depth] = empty_sibling_marker;
             }
         } else {
             // We're right child, sibling is left
@@ -565,11 +580,11 @@ pub fn buildMerkleProof(tx_ids: []const [32]u8, tx_index: usize) ?MerkleProof {
         }
 
         if (has_odd) {
-            // Hash odd node with empty sibling
+            // Hash odd node with EmptyNode (EmptyByteArray = 0 bytes)
             var hasher = hash.Blake2b256Hasher.init();
             hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
             hasher.update(&current[level_size - 1]);
-            hasher.update(&empty_node_hash);
+            // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
             next[pairs] = hasher.finalize();
             level_size = pairs + 1;
         } else {
@@ -641,7 +656,6 @@ test "merkle: three txs handles odd node" {
     const tx1 = [_]u8{0x11} ** 32;
     const tx2 = [_]u8{0x22} ** 32;
     const tx3 = [_]u8{0x33} ** 32;
-    const empty_hash = [_]u8{0} ** 32;
 
     // Hash leaves with prefix
     var hl1 = hash.Blake2b256Hasher.init();
@@ -659,7 +673,8 @@ test "merkle: three txs handles odd node" {
     hl3.update(&tx3);
     const leaf3 = hl3.finalize();
 
-    // Level 1: hash(1 || leaf1 || leaf2), hash(1 || leaf3 || empty)
+    // Level 1: hash(1 || leaf1 || leaf2), hash(1 || leaf3)
+    // Note: EmptyNode.hash = EmptyByteArray (0 bytes), so odd node is hash(1 || leaf3) only
     var h12 = hash.Blake2b256Hasher.init();
     h12.update(&[_]u8{INTERNAL_NODE_PREFIX});
     h12.update(&leaf1);
@@ -669,7 +684,7 @@ test "merkle: three txs handles odd node" {
     var h3e = hash.Blake2b256Hasher.init();
     h3e.update(&[_]u8{INTERNAL_NODE_PREFIX});
     h3e.update(&leaf3);
-    h3e.update(&empty_hash);
+    // EmptyNode.hash = EmptyByteArray (0 bytes), so no update
     const node3e = h3e.finalize();
 
     // Level 2 (root): hash(1 || node12 || node3e)
