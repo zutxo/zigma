@@ -88,6 +88,69 @@ fn hexToFixedBytes(comptime N: usize, hex: []const u8) ![N]u8 {
     return result;
 }
 
+/// Encode a Coll[Byte] value as a serialized register (type_byte + VLQ length + bytes)
+fn encodeCollByteRegister(allocator: std.mem.Allocator, value_bytes: []const u8) ![]u8 {
+    // Format: type_byte (0x0E) + VLQ length (u16) + raw bytes
+    var vlq_buf: [4]u8 = undefined; // VLQ for u16 needs at most 3 bytes, plus type byte
+    vlq_buf[0] = 0x0E; // COLL_BYTE type code
+
+    // VLQ encode the length
+    var len_val: u32 = @intCast(value_bytes.len);
+    var vlq_len: usize = 1;
+    while (true) {
+        const byte: u8 = @truncate(len_val & 0x7F);
+        len_val >>= 7;
+        if (len_val == 0) {
+            vlq_buf[vlq_len] = byte;
+            vlq_len += 1;
+            break;
+        } else {
+            vlq_buf[vlq_len] = byte | 0x80; // Set continuation bit
+            vlq_len += 1;
+        }
+    }
+
+    // Allocate and copy: type_byte + vlq_length + bytes
+    const result = try allocator.alloc(u8, vlq_len + value_bytes.len);
+    @memcpy(result[0..vlq_len], vlq_buf[0..vlq_len]);
+    @memcpy(result[vlq_len..], value_bytes);
+    return result;
+}
+
+/// Encode an integer value as a serialized register (type_byte + VLQ ZigZag encoded value)
+fn encodeIntegerRegister(allocator: std.mem.Allocator, type_byte: u8, value: i64) ![]u8 {
+    // ZigZag encode the signed value
+    const zigzag: u64 = blk: {
+        const shifted: u64 = @bitCast(value << 1);
+        const sign_mask: u64 = @bitCast(value >> 63);
+        break :blk shifted ^ sign_mask;
+    };
+
+    // VLQ encode - need at most 10 bytes for u64, plus 1 for type byte
+    var vlq_buf: [11]u8 = undefined;
+    vlq_buf[0] = type_byte;
+
+    var v = zigzag;
+    var len: usize = 1;
+    while (true) {
+        const byte: u8 = @truncate(v & 0x7F);
+        v >>= 7;
+        if (v == 0) {
+            vlq_buf[len] = byte;
+            len += 1;
+            break;
+        } else {
+            vlq_buf[len] = byte | 0x80; // Set continuation bit
+            len += 1;
+        }
+    }
+
+    // Allocate and copy
+    const result = try allocator.alloc(u8, len);
+    @memcpy(result, vlq_buf[0..len]);
+    return result;
+}
+
 /// Storage for parsed box data (static allocation)
 const ParsedBox = struct {
     box: BoxView,
@@ -182,6 +245,11 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
 
                         // Prepend type byte based on type_name
                         if (type_name) |tn| {
+                            const is_coll_byte = std.mem.eql(u8, tn, "Coll[Byte]") or
+                                std.mem.eql(u8, tn, "SByteArray") or
+                                std.mem.eql(u8, tn, "SColl[SByte]") or
+                                std.mem.eql(u8, tn, "Coll[SByte]");
+
                             const type_byte: u8 = if (std.mem.eql(u8, tn, "SGroupElement"))
                                 0x07 // GROUP_ELEMENT type code
                             else if (std.mem.eql(u8, tn, "SInt"))
@@ -190,19 +258,40 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
                                 0x05 // LONG type code
                             else if (std.mem.eql(u8, tn, "SBoolean"))
                                 0x01 // BOOLEAN type code
-                            else if (std.mem.eql(u8, tn, "Coll[Byte]") or std.mem.eql(u8, tn, "SByteArray"))
+                            else if (is_coll_byte)
                                 0x0E // COLL_BYTE type code
                             else
                                 continue; // Unknown type, skip
 
-                            // Allocate type_byte + value_bytes
-                            const full_bytes = allocator.alloc(u8, 1 + value_bytes.len) catch continue;
-                            full_bytes[0] = type_byte;
-                            @memcpy(full_bytes[1..], value_bytes);
-                            result.registers[i] = full_bytes;
+                            if (is_coll_byte) {
+                                // For Coll[Byte], format is: type_byte + VLQ_length + bytes
+                                const encoded = encodeCollByteRegister(allocator, value_bytes) catch continue;
+                                result.registers[i] = encoded;
+                            } else {
+                                // For primitives, format is: type_byte + value
+                                const full_bytes = allocator.alloc(u8, 1 + value_bytes.len) catch continue;
+                                full_bytes[0] = type_byte;
+                                @memcpy(full_bytes[1..], value_bytes);
+                                result.registers[i] = full_bytes;
+                            }
                         } else {
                             // No type specified - use raw bytes
                             result.registers[i] = value_bytes;
+                        }
+                    },
+                    .integer => |int_val| {
+                        // Handle integer values for SInt/SLong types
+                        if (type_name) |tn| {
+                            if (std.mem.eql(u8, tn, "SLong")) {
+                                // Encode as type_byte (0x05) + ZigZag VLQ encoded value
+                                const encoded = encodeIntegerRegister(allocator, 0x05, int_val) catch continue;
+                                result.registers[i] = encoded;
+                            } else if (std.mem.eql(u8, tn, "SInt")) {
+                                // Encode as type_byte (0x04) + ZigZag VLQ encoded value
+                                const encoded = encodeIntegerRegister(allocator, 0x04, int_val) catch continue;
+                                result.registers[i] = encoded;
+                            }
+                            // Other types with integer values are skipped
                         }
                     },
                     else => {},
