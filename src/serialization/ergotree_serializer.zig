@@ -338,8 +338,10 @@ pub fn deserialize(
     }
 
     // Parse constants if segregation enabled
+    // ValuePool required for Coll[Int]/Coll[Long]/etc. constants
+    var value_pool = data_serializer.ValuePool.init();
     if (tree.header.constant_segregation) {
-        try parseConstants(tree, &reader, arena);
+        try parseConstants(tree, &reader, arena, &value_pool);
     }
 
     // Copy constants to expression tree for ConstantPlaceholder resolution
@@ -590,6 +592,7 @@ fn parseConstants(
     tree: *ErgoTree,
     reader: *vlq.Reader,
     arena: anytype,
+    values: ?*data_serializer.ValuePool,
 ) DeserializeError!void {
     // Read constant count (VLQ u32)
     const count = reader.readU32() catch |e| return mapVlqError(e);
@@ -612,8 +615,8 @@ fn parseConstants(
             };
         };
 
-        // Parse value (pass null for value_pool - not needed during deserialization)
-        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, null) catch |e| {
+        // Parse value (pass ValuePool for Coll[Int]/Coll[Long]/etc. constants)
+        const value = data_serializer.deserialize(type_idx, tree.type_pool, reader, arena, values) catch |e| {
             return switch (e) {
                 error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
                 error.Overflow => error.Overflow,
