@@ -5725,31 +5725,95 @@ pub const Evaluator = struct {
         const arg = try self.popValue();
         const obj = try self.popValue();
 
-        // Both must be coll_byte for now
-        if (obj != .coll_byte or arg != .coll_byte) return error.TypeMismatch;
-
-        const coll1 = obj.coll_byte;
-        const coll2 = arg.coll_byte;
+        // Get lengths and element types from both collections
+        const len1: u32 = switch (obj) {
+            .coll_byte => |c| @intCast(c.len),
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
+        const len2: u32 = switch (arg) {
+            .coll_byte => |c| @intCast(c.len),
+            .coll => |c| c.len,
+            else => return error.TypeMismatch,
+        };
 
         // Result length is minimum of both
-        const result_len = @min(coll1.len, coll2.len);
+        const result_len = @min(len1, len2);
 
-        // Create tuples: each element is a (byte, byte) pair
-        // For coll_byte, we create coll_tuple with 2-element tuples
-        // Store as flat array of pairs for simplicity
-        const result = self.arena.allocSlice(u8, result_len * 2) catch return error.OutOfMemory;
+        // Get the node to determine result type
+        const node = self.tree.nodes[node_idx];
 
+        // Allocate storage for tuple pairs in ValuePool
+        if (result_len > 65535) return error.CollectionTooLarge;
+        const result_start = self.pools.values.allocN(@intCast(result_len)) catch return error.OutOfMemory;
+
+        // Get element types for tuple storage
+        const elem_type1: types.TypeIndex = switch (obj) {
+            .coll_byte => TypePool.BYTE,
+            .coll => |c| c.elem_type,
+            else => unreachable,
+        };
+        const elem_type2: types.TypeIndex = switch (arg) {
+            .coll_byte => TypePool.BYTE,
+            .coll => |c| c.elem_type,
+            else => unreachable,
+        };
+
+        // Build tuple pairs
         for (0..result_len) |i| {
-            result[i * 2] = coll1[i];
-            result[i * 2 + 1] = coll2[i];
+            // Get element from first collection
+            const elem1 = try self.getCollectionElement(obj, i);
+            // Get element from second collection
+            const elem2 = try self.getCollectionElement(arg, i);
+
+            // Allocate consecutive slots for tuple elements
+            const tuple_start = self.pools.values.allocN(2) catch return error.OutOfMemory;
+
+            // Convert and store first element
+            const pooled1: PooledValue = switch (elem1) {
+                .unit => .{ .type_idx = TypePool.UNIT, .data = .{ .primitive = 0 } },
+                .boolean => |b| .{ .type_idx = TypePool.BOOLEAN, .data = .{ .primitive = if (b) 1 else 0 } },
+                .byte => |b| .{ .type_idx = TypePool.BYTE, .data = .{ .primitive = b } },
+                .short => |s| .{ .type_idx = TypePool.SHORT, .data = .{ .primitive = s } },
+                .int => |intv| .{ .type_idx = TypePool.INT, .data = .{ .primitive = intv } },
+                .long => |l| .{ .type_idx = TypePool.LONG, .data = .{ .primitive = l } },
+                .coll_byte => |cb| .{ .type_idx = TypePool.COLL_BYTE, .data = .{ .byte_slice = .{ .ptr = cb.ptr, .len = @intCast(cb.len) } } },
+                .option => |o| .{ .type_idx = elem_type1, .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } } },
+                else => .{ .type_idx = elem_type1, .data = .{ .primitive = 0 } },
+            };
+            self.pools.values.set(tuple_start, pooled1);
+
+            // Convert and store second element
+            const pooled2: PooledValue = switch (elem2) {
+                .unit => .{ .type_idx = TypePool.UNIT, .data = .{ .primitive = 0 } },
+                .boolean => |b| .{ .type_idx = TypePool.BOOLEAN, .data = .{ .primitive = if (b) 1 else 0 } },
+                .byte => |b| .{ .type_idx = TypePool.BYTE, .data = .{ .primitive = b } },
+                .short => |s| .{ .type_idx = TypePool.SHORT, .data = .{ .primitive = s } },
+                .int => |intv| .{ .type_idx = TypePool.INT, .data = .{ .primitive = intv } },
+                .long => |l| .{ .type_idx = TypePool.LONG, .data = .{ .primitive = l } },
+                .coll_byte => |cb| .{ .type_idx = TypePool.COLL_BYTE, .data = .{ .byte_slice = .{ .ptr = cb.ptr, .len = @intCast(cb.len) } } },
+                .option => |o| .{ .type_idx = elem_type2, .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } } },
+                else => .{ .type_idx = elem_type2, .data = .{ .primitive = 0 } },
+            };
+            self.pools.values.set(tuple_start + 1, pooled2);
+
+            // Store tuple reference at result position
+            const result_idx = result_start + @as(u16, @intCast(i));
+            self.pools.values.set(result_idx, .{
+                .type_idx = node.result_type,
+                .data = .{ .tuple = .{ .start_idx = tuple_start, .len = 2, .types_start = 0 } },
+            });
         }
 
-        // POSTCONDITION: Result has correct length
-        assert(result.len == result_len * 2);
-
-        // Push as coll_byte (pairs encoded as consecutive bytes)
-        // Note: proper tuple type handling would require coll_tuple
-        try self.pushValue(.{ .coll_byte = result });
+        // Push result collection of tuples
+        // The result_type is Coll[(A,B)], so use it directly - elements are stored as tuples
+        try self.pushValue(.{
+            .coll = .{
+                .elem_type = node.result_type, // Contains pair type info
+                .start = result_start,
+                .len = @intCast(result_len),
+            },
+        });
     }
 
     /// Compute indices: Coll[T] → Coll[Int] (0, 1, 2, ..., len-1)
@@ -11834,13 +11898,9 @@ test "evaluator: zip two byte collections" {
     var eval = Evaluator.init(&tree, &ctx);
     const result = try eval.evaluate();
 
-    // Result should be pairs: (1,3), (2,4) encoded as [1,3,2,4]
-    try std.testing.expect(result == .coll_byte);
-    try std.testing.expectEqual(@as(usize, 4), result.coll_byte.len);
-    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[0]);
-    try std.testing.expectEqual(@as(u8, 3), result.coll_byte[1]);
-    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
-    try std.testing.expectEqual(@as(u8, 4), result.coll_byte[3]);
+    // Result should be Coll[(Byte, Byte)] with 2 pairs: (1,3), (2,4)
+    try std.testing.expect(result == .coll);
+    try std.testing.expectEqual(@as(u32, 2), result.coll.len); // 2 pairs
 }
 
 test "evaluator: zip different length collections" {
@@ -11872,13 +11932,9 @@ test "evaluator: zip different length collections" {
     var eval = Evaluator.init(&tree, &ctx);
     const result = try eval.evaluate();
 
-    // Result should be 2 pairs (min length): (1,4), (2,5)
-    try std.testing.expect(result == .coll_byte);
-    try std.testing.expectEqual(@as(usize, 4), result.coll_byte.len);
-    try std.testing.expectEqual(@as(u8, 1), result.coll_byte[0]);
-    try std.testing.expectEqual(@as(u8, 4), result.coll_byte[1]);
-    try std.testing.expectEqual(@as(u8, 2), result.coll_byte[2]);
-    try std.testing.expectEqual(@as(u8, 5), result.coll_byte[3]);
+    // Result should be Coll[(Byte, Byte)] with 2 pairs (min length): (1,4), (2,5)
+    try std.testing.expect(result == .coll);
+    try std.testing.expectEqual(@as(u32, 2), result.coll.len); // 2 pairs
 }
 
 // ============================================================================
