@@ -54,7 +54,10 @@ const ScenarioResult = union(enum) {
     },
     parse_error: []const u8,
     deser_error: []const u8,
-    eval_error: []const u8,
+    eval_error: struct {
+        name: []const u8,
+        opcode: ?u8 = null,
+    },
     unsupported: []const u8,
 };
 
@@ -401,7 +404,7 @@ fn runScenario(
             error.OptionNone => "OptionNone",
             else => "EvalError",
         };
-        return .{ .eval_error = err_name };
+        return .{ .eval_error = .{ .name = err_name, .opcode = eval.diag.failed_opcode } };
     };
 
     // Compare result - determine actual boolean value from result
@@ -476,7 +479,7 @@ test "testbench: height-gt-100-true" {
             try testing.expect(false);
         },
         .eval_error => |e| {
-            std.debug.print("Eval error: {s}\n", .{e});
+            std.debug.print("Eval error: {s} (opcode: {?})\n", .{ e.name, e.opcode });
             try testing.expect(false);
         },
         .unsupported => |e| {
@@ -580,7 +583,7 @@ test "testbench: pin-lock-valid" {
             // Pin-lock may still have issues - don't fail test
         },
         .eval_error => |e| {
-            std.debug.print("pin-lock eval error: {s}\n", .{e});
+            std.debug.print("pin-lock eval error: {s} (opcode: {?})\n", .{ e.name, e.opcode });
             // May have unsupported features
         },
         .parse_error => |e| {
@@ -621,7 +624,7 @@ test "testbench: pattern-multisig-2of3" {
             // Not all deserializations work yet
         },
         .eval_error => |e| {
-            std.debug.print("multisig eval error: {s}\n", .{e});
+            std.debug.print("multisig eval error: {s} (opcode: {?})\n", .{ e.name, e.opcode });
             // Not all evaluations work yet - skip for now
         },
         .parse_error => |e| {
@@ -714,10 +717,14 @@ test "testbench: scenario stats" {
             },
             .eval_error => |e| {
                 stats.eval_error += 1;
-                std.debug.print("EVAL: {s} -> {s}\n", .{ entry.name, e });
-                if (std.mem.eql(u8, e, "UnsupportedExpression")) {
+                if (e.opcode) |op| {
+                    std.debug.print("EVAL: {s} -> {s} (op:0x{x:0>2})\n", .{ entry.name, e.name, op });
+                } else {
+                    std.debug.print("EVAL: {s} -> {s}\n", .{ entry.name, e.name });
+                }
+                if (std.mem.eql(u8, e.name, "UnsupportedExpression")) {
                     stats.unsupported_expr += 1;
-                } else if (std.mem.eql(u8, e, "TypeMismatch")) {
+                } else if (std.mem.eql(u8, e.name, "TypeMismatch")) {
                     stats.type_mismatch += 1;
                 } else {
                     stats.other_eval += 1;

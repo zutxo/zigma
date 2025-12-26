@@ -342,6 +342,26 @@ pub const EvalDiagnostics = struct {
     /// Cost consumed before failure
     cost_at_failure: ?u64 = null,
 
+    /// For IndexOutOfBounds: the index that was out of bounds
+    failed_index: ?i32 = null,
+
+    /// For IndexOutOfBounds: the collection length
+    collection_len: ?usize = null,
+
+    /// For IndexOutOfBounds: collection type description
+    coll_type: CollType = .unknown,
+
+    pub const CollType = enum(u8) {
+        unknown,
+        coll_byte,
+        coll_generic,
+        box_inputs,
+        box_outputs,
+        box_data_inputs,
+        token_coll,
+        tuple,
+    };
+
     /// Get human-readable error message
     pub fn message(self: EvalDiagnostics) []const u8 {
         return self.error_code.message();
@@ -2383,7 +2403,11 @@ pub const Evaluator = struct {
                     .outputs => self.ctx.outputs,
                     .data_inputs => self.ctx.data_inputs,
                 };
-                if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
+                if (tc.box_index >= boxes.len) {
+                    self.diag.failed_index = @intCast(tc.box_index);
+                    self.diag.collection_len = boxes.len;
+                    return error.IndexOutOfBounds;
+                }
                 break :blk @intCast(boxes[tc.box_index].tokens.len);
             },
             else => return error.TypeMismatch,
@@ -2639,7 +2663,11 @@ pub const Evaluator = struct {
         assert(tuple_val == .tuple);
 
         const tuple = tuple_val.tuple;
-        if (field_idx >= tuple.len) return error.IndexOutOfBounds;
+        if (field_idx >= tuple.len) {
+            self.diag.failed_index = @intCast(field_idx);
+            self.diag.collection_len = tuple.len;
+            return error.IndexOutOfBounds;
+        }
 
         // INVARIANT: Index is within bounds
         assert(field_idx < tuple.len);
@@ -3199,15 +3227,30 @@ pub const Evaluator = struct {
 
     /// Index into collection (handles coll_byte, box_coll, token_coll)
     fn binOpByIndex(self: *Evaluator, left: Value, idx: i32) EvalError!void {
-        if (idx < 0) return error.IndexOutOfBounds;
+        if (idx < 0) {
+            self.diag.failed_index = idx;
+            self.diag.collection_len = 0;
+            return error.IndexOutOfBounds;
+        }
 
         switch (left) {
             .coll_byte => |arr| {
-                if (idx >= arr.len) return error.IndexOutOfBounds;
+                if (idx >= arr.len) {
+                    self.diag.failed_index = idx;
+                    self.diag.collection_len = arr.len;
+                    self.diag.coll_type = .coll_byte;
+                    return error.IndexOutOfBounds;
+                }
                 try self.pushValue(.{ .byte = @intCast(arr[@intCast(idx)]) });
             },
             .coll => |c| {
                 // Generic collection indexing from ValuePool
+                if (@as(usize, @intCast(idx)) >= c.len) {
+                    self.diag.failed_index = idx;
+                    self.diag.collection_len = c.len;
+                    self.diag.coll_type = .coll_generic;
+                    return error.IndexOutOfBounds;
+                }
                 const elem = try self.getCollectionElementFromRef(c, @intCast(idx));
                 try self.pushValue(elem);
             },
@@ -3217,7 +3260,16 @@ pub const Evaluator = struct {
                     .outputs => self.ctx.outputs,
                     .data_inputs => self.ctx.data_inputs,
                 };
-                if (idx >= boxes.len) return error.IndexOutOfBounds;
+                if (idx >= boxes.len) {
+                    self.diag.failed_index = idx;
+                    self.diag.collection_len = boxes.len;
+                    self.diag.coll_type = switch (bc.source) {
+                        .inputs => .box_inputs,
+                        .outputs => .box_outputs,
+                        .data_inputs => .box_data_inputs,
+                    };
+                    return error.IndexOutOfBounds;
+                }
                 try self.pushValue(.{ .box = .{
                     .source = bc.source,
                     .index = @intCast(idx),
@@ -3229,9 +3281,19 @@ pub const Evaluator = struct {
                     .outputs => self.ctx.outputs,
                     .data_inputs => self.ctx.data_inputs,
                 };
-                if (tc.box_index >= boxes.len) return error.IndexOutOfBounds;
+                if (tc.box_index >= boxes.len) {
+                    self.diag.failed_index = @intCast(tc.box_index);
+                    self.diag.collection_len = boxes.len;
+                    self.diag.coll_type = .token_coll;
+                    return error.IndexOutOfBounds;
+                }
                 const box = boxes[tc.box_index];
-                if (idx >= box.tokens.len) return error.IndexOutOfBounds;
+                if (idx >= box.tokens.len) {
+                    self.diag.failed_index = idx;
+                    self.diag.collection_len = box.tokens.len;
+                    self.diag.coll_type = .token_coll;
+                    return error.IndexOutOfBounds;
+                }
                 const token = box.tokens[@intCast(idx)];
 
                 // Copy token id to arena
@@ -5821,6 +5883,8 @@ pub const Evaluator = struct {
             .coll_byte => |coll| {
                 // Bounds check
                 if (idx < 0 or idx >= @as(i64, @intCast(coll.len))) {
+                    self.diag.failed_index = @intCast(idx);
+                    self.diag.collection_len = coll.len;
                     return error.IndexOutOfBounds;
                 }
 
@@ -5894,6 +5958,8 @@ pub const Evaluator = struct {
                 for (indexes, values) |idx_byte, value| {
                     const idx: usize = idx_byte;
                     if (idx >= result.len) {
+                        self.diag.failed_index = @intCast(idx);
+                        self.diag.collection_len = result.len;
                         return error.IndexOutOfBounds;
                     }
                     result[idx] = value;
@@ -6552,6 +6618,8 @@ pub const Evaluator = struct {
             const pos_val = self.getIntCollectionElement(positions_coll, pos_idx) catch return error.InvalidData;
 
             if (pos_val < 0 or pos_val >= @as(i32, @intCast(num_constants))) {
+                self.diag.failed_index = pos_val;
+                self.diag.collection_len = num_constants;
                 return error.IndexOutOfBounds;
             }
 
@@ -8930,8 +8998,16 @@ pub const Evaluator = struct {
     /// Helper: get element from collection at index
     fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
         return switch (coll) {
-            .coll_byte => |c| if (idx < c.len) .{ .byte = @bitCast(c[idx]) } else error.IndexOutOfBounds,
-            .coll => |c| self.getCollectionElementFromRef(c, @intCast(idx)),
+            .coll_byte => |c| if (idx < c.len) .{ .byte = @bitCast(c[idx]) } else blk: {
+                self.diag.failed_index = @intCast(idx);
+                self.diag.collection_len = c.len;
+                break :blk error.IndexOutOfBounds;
+            },
+            .coll => |c| if (@as(usize, @intCast(idx)) >= c.len) blk: {
+                self.diag.failed_index = @intCast(idx);
+                self.diag.collection_len = c.len;
+                break :blk error.IndexOutOfBounds;
+            } else self.getCollectionElementFromRef(c, @intCast(idx)),
             else => error.TypeMismatch,
         };
     }
@@ -9037,12 +9113,20 @@ pub const Evaluator = struct {
         else
             null;
 
+        // Preserve failed_index, collection_len, and coll_type if already set (from IndexOutOfBounds)
+        const saved_idx = self.diag.failed_index;
+        const saved_len = self.diag.collection_len;
+        const saved_type = self.diag.coll_type;
+
         self.diag = .{
             .error_code = EvalErrorCode.fromEvalError(err),
             .failed_opcode = opcode,
             .failed_node_idx = node_idx,
             .stack_depth = self.value_sp,
             .cost_at_failure = self.cost_used,
+            .failed_index = saved_idx,
+            .collection_len = saved_len,
+            .coll_type = saved_type,
         };
     }
 
