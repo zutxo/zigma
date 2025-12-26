@@ -902,11 +902,36 @@ pub const Evaluator = struct {
         ctx: *const Context,
         version_ctx: VersionContext,
     ) Evaluator {
-        return .{
+        var eval = Evaluator{
             .tree = tree,
             .ctx = ctx,
             .version_ctx = version_ctx,
         };
+
+        // Copy deserialization-time pools from tree to runtime pools.
+        // This ensures Option inner values (and other complex types) are accessible
+        // at runtime when we look them up by value_idx.
+
+        // Copy value pool
+        const val_count = tree.value_pool.count;
+        if (val_count > 0) {
+            @memcpy(eval.pools.values.values[0..val_count], tree.value_pool.values[0..val_count]);
+            eval.pools.values.count = val_count;
+        }
+
+        // Copy type pool (values reference types by index)
+        // Static types (0-23) are pre-populated, copy dynamic types (24+)
+        const type_count = tree.type_pool.count;
+        const first_dynamic: types.TypeIndex = 24;
+        if (type_count > first_dynamic) {
+            @memcpy(
+                eval.pools.type_pool.types[first_dynamic..type_count],
+                tree.type_pool.types[first_dynamic..type_count],
+            );
+            eval.pools.type_pool.count = type_count;
+        }
+
+        return eval;
     }
 
     /// Set cost limit for this evaluation
@@ -1565,6 +1590,13 @@ pub const Evaluator = struct {
                     CollMethodId.patch => 3,
                     CollMethodId.zip, CollMethodId.starts_with, CollMethodId.ends_with, CollMethodId.get, CollMethodId.flatmap => 1,
                     else => 0,
+                } else if (type_code == AvlTreeTypeCode) switch (method_id) {
+                    // 2-arg methods: contains, get, getMany, insert, update, remove, insertOrUpdate
+                    AvlTreeMethodId.contains, AvlTreeMethodId.get, AvlTreeMethodId.get_many, AvlTreeMethodId.insert, AvlTreeMethodId.update, AvlTreeMethodId.remove, AvlTreeMethodId.insert_or_update => 2,
+                    // 1-arg methods: updateOperations, updateDigest
+                    AvlTreeMethodId.update_operations, AvlTreeMethodId.update_digest => 1,
+                    // 0-arg methods (properties): digest, enabledOperations, keyLength, etc.
+                    else => 0,
                 } else if (arg1_start < self.tree.node_count and self.tree.nodes[arg1_start].tag != .unsupported)
                     1
                 else
@@ -1997,7 +2029,10 @@ pub const Evaluator = struct {
         try self.addCost(15); // OptionIsDefined cost from opcodes
 
         const opt_val = try self.popValue();
-        if (opt_val != .option) return error.TypeMismatch;
+        if (opt_val != .option) {
+            std.debug.print("DEBUG optionIsDefined: expected option, got {s}\n", .{@tagName(opt_val)});
+            return error.TypeMismatch;
+        }
 
         // INVARIANT: Option type is well-formed
         assert(opt_val.option.inner_type != 0);
@@ -2208,7 +2243,10 @@ pub const Evaluator = struct {
         try self.addCost(20); // ProveDlog construction cost
 
         const input = try self.popValue();
-        if (input != .group_element) return error.TypeMismatch;
+        if (input != .group_element) {
+            std.debug.print("DEBUG proveDlog: expected group_element, got {s}\n", .{@tagName(input)});
+            return error.TypeMismatch;
+        }
 
         // INVARIANT: GroupElement is 33-byte compressed public key
         assert(input.group_element.len == 33);
@@ -2264,7 +2302,10 @@ pub const Evaluator = struct {
         try self.addCost(15); // SigmaPropBytes cost
 
         const input = try self.popValue();
-        if (input != .sigma_prop) return error.TypeMismatch;
+        if (input != .sigma_prop) {
+            std.debug.print("DEBUG sigmaPropBytes: expected sigma_prop, got {s}\n", .{@tagName(input)});
+            return error.TypeMismatch;
+        }
 
         // Return the raw sigma bytes as Coll[Byte]
         const sigma_data = input.sigma_prop.data;
@@ -2657,7 +2698,10 @@ pub const Evaluator = struct {
         try self.addCost(FixedCost.select_field);
 
         const tuple_val = try self.popValue();
-        if (tuple_val != .tuple) return error.TypeMismatch;
+        if (tuple_val != .tuple) {
+            std.debug.print("DEBUG selectField: expected tuple, got {s}\n", .{@tagName(tuple_val)});
+            return error.TypeMismatch;
+        }
 
         // INVARIANT: Value is a tuple
         assert(tuple_val == .tuple);
@@ -4070,7 +4114,10 @@ pub const Evaluator = struct {
         try self.addCost(10); // FixedCost for box property access
 
         const box_val = try self.popValue();
-        if (box_val != .box) return error.TypeMismatch;
+        if (box_val != .box) {
+            std.debug.print("DEBUG computeBoxId: expected box, got {s}\n", .{@tagName(box_val)});
+            return error.TypeMismatch;
+        }
 
         const source = convertBoxSource(box_val.box.source);
         const box = self.getBoxFromSource(source, box_val.box.index) orelse {
@@ -4416,7 +4463,10 @@ pub const Evaluator = struct {
                 if (tc.box_index >= boxes.len) break :blk 0;
                 break :blk boxes[tc.box_index].tokens.len;
             },
-            else => return error.TypeMismatch,
+            else => {
+                std.debug.print("DEBUG forAll: unexpected coll type: {s}\n", .{@tagName(coll)});
+                return error.TypeMismatch;
+            },
         };
 
         // Chunk-based cost for forall: PerItemCost(3, 1, 10)
@@ -4449,7 +4499,10 @@ pub const Evaluator = struct {
 
             // Evaluate lambda body
             const body_result = try self.evaluateSubtree(body_idx);
-            if (body_result != .boolean) return error.TypeMismatch;
+            if (body_result != .boolean) {
+                std.debug.print("DEBUG forAll body: expected boolean, got {s}\n", .{@tagName(body_result)});
+                return error.TypeMismatch;
+            }
 
             if (!body_result.boolean) {
                 // Found false: forall fails
@@ -4955,7 +5008,10 @@ pub const Evaluator = struct {
         const len: usize = switch (coll_val) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
-            else => return error.TypeMismatch,
+            else => {
+                std.debug.print("DEBUG logicalAnd: expected coll, got {s}\n", .{@tagName(coll_val)});
+                return error.TypeMismatch;
+            },
         };
 
         // Cost: base 10 + per-element
@@ -4970,7 +5026,10 @@ pub const Evaluator = struct {
         // Check all elements
         for (0..len) |i| {
             const elem = try self.getCollectionElement(coll_val, i);
-            if (elem != .boolean) return error.TypeMismatch;
+            if (elem != .boolean) {
+                std.debug.print("DEBUG logicalAnd elem: expected boolean, got {s} at index {d}\n", .{ @tagName(elem), i });
+                return error.TypeMismatch;
+            }
             if (!elem.boolean) {
                 // Found false: entire AND is false
                 try self.pushValue(.{ .boolean = false });
@@ -5058,7 +5117,10 @@ pub const Evaluator = struct {
             // Pop in reverse: arg first, then func_ref
             arg_value = try self.popValue();
             const func_ref_value = try self.popValue();
-            if (func_ref_value != .func_ref) return error.TypeMismatch;
+            if (func_ref_value != .func_ref) {
+                std.debug.print("DEBUG apply: expected func_ref, got {s}\n", .{@tagName(func_ref_value)});
+                return error.TypeMismatch;
+            }
             const func_ref = func_ref_value.func_ref;
             num_args = func_ref.num_args;
             body_idx = func_ref.body_idx;
@@ -5069,6 +5131,7 @@ pub const Evaluator = struct {
 
         // For v5.x, only single-arg functions are supported
         if (num_args != 1) {
+            std.debug.print("DEBUG apply: unsupported num_args={d}\n", .{num_args});
             return error.TypeMismatch;
         }
 
@@ -7180,15 +7243,22 @@ pub const Evaluator = struct {
     }
 
     /// Get element from a CollRef at given index
-    fn getCollectionElementFromRef(self: *const Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
+    fn getCollectionElementFromRef(self: *Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
         if (idx >= coll.len) return error.IndexOutOfBounds;
 
-        // Get from values array (where computeConcreteCollection stores elements)
-        const start_idx = coll.start;
-        const val_idx = start_idx + idx;
+        const val_idx = coll.start + idx;
 
-        if (val_idx >= max_value_stack) return error.IndexOutOfBounds;
-        return self.values[val_idx];
+        // Try ValuePool first (for deserialized constants)
+        if (self.pools.values.get(val_idx)) |pooled| {
+            return pooledValueToValue(pooled, &self.pools.type_pool);
+        }
+
+        // Fall back to evaluator's values array (for runtime-built collections)
+        if (val_idx < self.values_sp) {
+            return self.values[val_idx];
+        }
+
+        return error.IndexOutOfBounds;
     }
 
     /// Serialize a constant (type + value) to bytes
@@ -8278,13 +8348,161 @@ pub const Evaluator = struct {
     }
 
     /// Compute tree.getMany(keys, proof) → Coll[Option[Coll[Byte]]]
-    /// TODO: Full implementation requires Coll[Coll[Byte]] support
+    /// Batch lookup of multiple keys in AVL tree
     fn computeAvlTreeGetMany(self: *Evaluator) EvalError!void {
-        // getMany requires iterating through a collection of keys
-        // and building a collection of Option[Coll[Byte]] results.
-        // This needs full nested collection support which is complex.
-        // Use soft-fork handling for now.
-        return self.handleUnsupported();
+        // PRECONDITIONS: 3 values on stack (tree, keys, proof)
+        assert(self.value_sp >= 3);
+        assert(self.value_sp <= max_value_stack);
+
+        const initial_sp = self.value_sp;
+
+        // Pop in reverse order (proof, keys, tree)
+        const proof_val = try self.popValue();
+
+        // Proof can be coll_byte (direct byte slice) or coll (generic Coll[Byte])
+        const proof: []const u8 = switch (proof_val) {
+            .coll_byte => |cb| cb,
+            .coll => |c| blk: {
+                // Extract bytes from Coll[Byte] stored in values array
+                if (c.elem_type != TypePool.BYTE) return error.TypeMismatch;
+                // Build byte array from collection elements
+                const bytes = self.arena.allocSlice(u8, c.len) catch return error.OutOfMemory;
+                for (0..c.len) |i| {
+                    const elem = try self.getCollectionElementFromRef(c, @intCast(i));
+                    if (elem != .byte) return error.TypeMismatch;
+                    bytes[i] = @bitCast(elem.byte);
+                }
+                break :blk bytes;
+            },
+            else => return error.TypeMismatch,
+        };
+
+        // INVARIANT: proof size within protocol limits
+        assert(proof.len <= avl_tree.max_proof_size);
+
+        const keys_val = try self.popValue();
+        // keys is Coll[Coll[Byte]] - a collection of byte arrays
+        if (keys_val != .coll) return error.TypeMismatch;
+        const keys = keys_val.coll;
+
+        const tree_val = try self.popValue();
+        if (tree_val != .avl_tree) return error.TypeMismatch;
+        const tree_data = tree_val.avl_tree;
+
+        // INVARIANT: tree has valid key_length
+        assert(tree_data.key_length > 0);
+        assert(tree_data.key_length <= avl_tree.max_key_length);
+
+        // Cost: per-key cost based on proof size
+        const proof_elements: u32 = @intCast(proof.len);
+        const num_keys: u32 = keys.len;
+        try self.addCost(AvlTreeCost.lookup.cost(proof_elements) * num_keys);
+
+        // Pre-allocate contiguous slots for result Options
+        const result_start = self.pools.values.allocN(keys.len) catch return error.OutOfMemory;
+
+        // Initialize batch verifier
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        var verifier = avl_tree.BatchAVLVerifier.init(
+            tree_data.digest,
+            proof,
+            tree_data.key_length,
+            if (tree_data.value_length_opt) |vl| @as(?usize, vl) else null,
+            &arena,
+        ) catch {
+            // Verification failed - return collection of Nones
+            for (0..keys.len) |i| {
+                self.pools.values.set(result_start + @as(u16, @intCast(i)), .{
+                    .type_idx = TypePool.OPTION_COLL_BYTE,
+                    .data = .{ .option = .{ .inner_type = TypePool.COLL_BYTE, .value_idx = null_value_idx } },
+                });
+            }
+            try self.pushValue(.{ .coll = .{
+                .elem_type = TypePool.OPTION_COLL_BYTE,
+                .start = result_start,
+                .len = keys.len,
+            } });
+            assert(self.value_sp == initial_sp - 2);
+            return;
+        };
+
+        // Lookup each key
+        for (0..keys.len) |i| {
+            // Get key from keys collection
+            const key_elem = try self.getCollectionElement(keys_val, i);
+
+            // Key can be coll_byte or coll (Coll[Byte])
+            const key: []const u8 = switch (key_elem) {
+                .coll_byte => |cb| cb,
+                .coll => |c| blk: {
+                    if (c.elem_type != TypePool.BYTE) return error.TypeMismatch;
+                    const bytes = self.arena.allocSlice(u8, c.len) catch return error.OutOfMemory;
+                    for (0..c.len) |j| {
+                        const elem = try self.getCollectionElementFromRef(c, @intCast(j));
+                        if (elem != .byte) return error.TypeMismatch;
+                        bytes[j] = @bitCast(elem.byte);
+                    }
+                    break :blk bytes;
+                },
+                else => return error.TypeMismatch,
+            };
+
+            // Validate key length
+            if (key.len != tree_data.key_length) {
+                return error.InvalidData;
+            }
+
+            const result_idx = result_start + @as(u16, @intCast(i));
+
+            const result = verifier.lookup(key) catch {
+                // Lookup failed - store None at result position
+                self.pools.values.set(result_idx, .{
+                    .type_idx = TypePool.OPTION_COLL_BYTE,
+                    .data = .{ .option = .{ .inner_type = TypePool.COLL_BYTE, .value_idx = null_value_idx } },
+                });
+                continue;
+            };
+
+            switch (result) {
+                .found => |value| {
+                    // Copy value to our arena
+                    const value_copy = self.arena.allocSlice(u8, value.len) catch return error.OutOfMemory;
+                    @memcpy(value_copy, value);
+
+                    // Store the value in ValuePool (separate allocation for the inner value)
+                    const val_idx = self.pools.values.alloc() catch return error.OutOfMemory;
+                    self.pools.values.set(val_idx, .{
+                        .type_idx = TypePool.COLL_BYTE,
+                        .data = .{ .byte_slice = .{ .ptr = value_copy.ptr, .len = @intCast(value_copy.len) } },
+                    });
+
+                    // Store Some(value) at result position
+                    self.pools.values.set(result_idx, .{
+                        .type_idx = TypePool.OPTION_COLL_BYTE,
+                        .data = .{ .option = .{ .inner_type = TypePool.COLL_BYTE, .value_idx = val_idx } },
+                    });
+                },
+                .not_found, .verification_failed => {
+                    // Store None at result position
+                    self.pools.values.set(result_idx, .{
+                        .type_idx = TypePool.OPTION_COLL_BYTE,
+                        .data = .{ .option = .{ .inner_type = TypePool.COLL_BYTE, .value_idx = null_value_idx } },
+                    });
+                },
+            }
+        }
+
+        // Push result collection
+        try self.pushValue(.{ .coll = .{
+            .elem_type = TypePool.OPTION_COLL_BYTE,
+            .start = result_start,
+            .len = keys.len,
+        } });
+
+        // POSTCONDITION: consumed 3 values, pushed 1
+        assert(self.value_sp == initial_sp - 2);
     }
 
     /// Compute tree.updateDigest(newDigest) → AvlTree

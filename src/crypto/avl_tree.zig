@@ -656,8 +656,11 @@ pub const BatchAVLVerifier = struct {
                     pos += vl; // fixed-length value
                 } else {
                     if (pos + 2 > self.proof.len) return error.ProofExhausted;
-                    const vlen = std.mem.readInt(u16, self.proof[pos..][0..2], .big);
-                    pos += 2 + vlen;
+                    const vlen: usize = std.mem.readInt(u16, self.proof[pos..][0..2], .big);
+                    // Check bounds before advancing position
+                    const total_advance = 2 +| vlen; // saturating add
+                    if (pos +| total_advance > self.proof.len) return error.ProofExhausted;
+                    pos += total_advance;
                 }
                 pos += self.key_length; // next_leaf_key
             } else {
