@@ -372,6 +372,9 @@ pub const BlockVerifier = struct {
     /// Protocol version context
     version: VersionContext,
 
+    /// Current block header (set during block verification)
+    current_header: ?*const HeaderView,
+
     /// Pre-allocated storage for resolved input boxes
     resolved_inputs: [MAX_INPUTS]BoxView,
     resolved_count: u16,
@@ -420,6 +423,7 @@ pub const BlockVerifier = struct {
         self.utxo_source = utxo_source;
         self.tx_cost_limit = DEFAULT_TX_COST_LIMIT;
         self.version = VersionContext.v2();
+        self.current_header = null;
         // resolved_inputs left undefined (populated per-tx)
         self.resolved_count = 0;
         // output_boxes left undefined (populated per-tx)
@@ -567,6 +571,9 @@ pub const BlockVerifier = struct {
         );
         result.setMerkleResult(merkle_valid);
 
+        // Store header for pre_header access during input verification
+        self.current_header = &blk.header;
+
         // Verify each transaction
         for (blk.transactions, 0..) |tx, i| {
             self.reset(); // Reset per-transaction state
@@ -688,7 +695,29 @@ pub const BlockVerifier = struct {
         self.context.self_index = input_index;
         self.context.height = height;
         self.context.headers = &[_]HeaderView{};
-        self.context.pre_header = std.mem.zeroes(PreHeaderView);
+        // Populate pre_header from current block header (required for MinerPubkey access)
+        if (self.current_header) |hdr| {
+            self.context.pre_header = .{
+                .version = hdr.version,
+                .parent_id = hdr.parent_id,
+                .timestamp = hdr.timestamp,
+                .n_bits = hdr.n_bits,
+                .height = hdr.height,
+                .miner_pk = hdr.miner_pk,
+                .votes = hdr.votes,
+            };
+        } else {
+            // Fallback for standalone tx verification (no block context)
+            self.context.pre_header = .{
+                .version = 0,
+                .parent_id = [_]u8{0} ** 32,
+                .timestamp = 0,
+                .n_bits = 0,
+                .height = height,
+                .miner_pk = [_]u8{0} ** 33,
+                .votes = [_]u8{0} ** 3,
+            };
+        }
         self.context.extension_cache = null;
 
         // Populate context_vars from input's context extension

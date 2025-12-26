@@ -9601,7 +9601,24 @@ fn valuesEqual(a: Value, b: Value) bool {
             if (av.len != bv.len) break :blk false;
             break :blk std.mem.eql(u8, av.bytes[0..av.len], bv.bytes[0..bv.len]);
         },
-        else => false, // Complex types need deeper comparison
+        .coll_byte => |av| blk: {
+            if (b != .coll_byte) break :blk false;
+            const bv = b.coll_byte;
+            break :blk std.mem.eql(u8, av, bv);
+        },
+        .hash32 => |av| blk: {
+            if (b == .hash32) break :blk std.mem.eql(u8, &av, &b.hash32);
+            // Also compare hash32 with coll_byte of length 32
+            if (b == .coll_byte and b.coll_byte.len == 32) {
+                break :blk std.mem.eql(u8, &av, b.coll_byte);
+            }
+            break :blk false;
+        },
+        .group_element => |av| blk: {
+            if (b != .group_element) break :blk false;
+            break :blk std.mem.eql(u8, &av, &b.group_element);
+        },
+        else => false, // Complex types (tuples, collections) need deeper comparison
     };
 }
 

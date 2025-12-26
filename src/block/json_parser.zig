@@ -263,19 +263,16 @@ fn parseHeaderValue(value: std.json.Value) ParseError!HeaderView {
         header.extension_root = try parseHex(32, root_hex);
     }
 
-    // Mining fields
-    if (getString(value, "powSolutions")) |_| {
-        // Parse from nested object if present
-        if (getObject(value, "powSolutions")) |pow| {
-            if (getString(pow, "pk")) |pk_hex| {
-                if (pk_hex.len == 66) {
-                    header.miner_pk = try parseHex(33, pk_hex);
-                }
+    // Mining fields (powSolutions is an object with pk, w, n, d fields)
+    if (getObject(value, "powSolutions")) |pow| {
+        if (getString(pow, "pk")) |pk_hex| {
+            if (pk_hex.len == 66) {
+                header.miner_pk = try parseHex(33, pk_hex);
             }
-            if (getString(pow, "n")) |n_hex| {
-                if (n_hex.len == 16) {
-                    header.pow_nonce = try parseHex(8, n_hex);
-                }
+        }
+        if (getString(pow, "n")) |n_hex| {
+            if (n_hex.len == 16) {
+                header.pow_nonce = try parseHex(8, n_hex);
             }
         }
     }
