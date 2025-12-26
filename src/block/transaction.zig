@@ -320,7 +320,9 @@ pub const Transaction = struct {
         }
 
         // 3. Collect distinct token IDs from all outputs
-        var distinct_tokens: [4096][32]u8 = undefined;
+        // Max 256 unique tokens per transaction (8KB on stack vs 128KB before)
+        const max_distinct_tokens = 256;
+        var distinct_tokens: [max_distinct_tokens][32]u8 = undefined;
         var distinct_count: u32 = 0;
 
         for (self.outputs) |output| {
@@ -333,7 +335,7 @@ pub const Transaction = struct {
                         break;
                     }
                 }
-                if (!found and distinct_count < 4096) {
+                if (!found and distinct_count < max_distinct_tokens) {
                     distinct_tokens[distinct_count] = token.id;
                     distinct_count += 1;
                 }

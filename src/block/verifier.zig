@@ -290,19 +290,17 @@ pub const BlockVerifyResult = struct {
     /// Verification time in nanoseconds
     verification_time_ns: u64,
 
-    /// Create empty result for block
-    pub fn init(blk: *const Block) BlockVerifyResult {
-        return .{
-            .block_id = blk.id(),
-            .height = blk.height(),
-            .valid = true,
-            .first_error = null,
-            .tx_results = undefined,
-            .tx_count = 0,
-            .merkle_valid = false,
-            .total_cost = 0,
-            .verification_time_ns = 0,
-        };
+    /// Initialize result in-place for block (avoids multi-MB stack allocation)
+    pub fn initInPlace(self: *BlockVerifyResult, blk: *const Block) void {
+        self.block_id = blk.id();
+        self.height = blk.height();
+        self.valid = true;
+        self.first_error = null;
+        // tx_results left undefined, filled in as transactions are verified
+        self.tx_count = 0;
+        self.merkle_valid = false;
+        self.total_cost = 0;
+        self.verification_time_ns = 0;
     }
 
     /// Add transaction result
@@ -388,6 +386,12 @@ pub const BlockVerifier = struct {
     /// Pre-allocated buffer for transaction bytes-to-sign (message for signing)
     message_buffer: [Transaction.MAX_BYTES_TO_SIGN]u8,
     message_len: usize,
+
+    /// Pre-allocated buffers for merkle computation (avoid stack overflow)
+    merkle_tx_ids: [merkle.MAX_LEVEL_NODES][32]u8,
+    merkle_witness_ids: [merkle.MAX_LEVEL_NODES][merkle.WITNESS_ID_SIZE]u8,
+    merkle_level_a: [merkle.MAX_LEVEL_NODES][32]u8,
+    merkle_level_b: [merkle.MAX_LEVEL_NODES][32]u8,
 
     /// Pre-allocated type pool (reused across inputs)
     type_pool: types_mod.TypePool,
@@ -535,7 +539,7 @@ pub const BlockVerifier = struct {
     /// Verify a complete block with out-parameter (avoids 5MB stack allocation)
     pub fn verifyBlockInPlace(self: *BlockVerifier, blk: *const Block, result: *BlockVerifyResult) void {
         const start_time = std.time.nanoTimestamp();
-        result.* = BlockVerifyResult.init(blk);
+        result.initInPlace(blk);
 
         // Check for empty block
         if (blk.transactions.len == 0) {
@@ -552,7 +556,15 @@ pub const BlockVerifier = struct {
         }
 
         // Verify Merkle root (v2+ blocks include witness hashes)
-        const merkle_valid = merkle.verifyTxMerkleRootVersioned(blk, blk.header.version);
+        // Use pre-allocated buffers to avoid stack overflow
+        const merkle_valid = merkle.verifyTxMerkleRootWithBuffers(
+            blk,
+            blk.header.version,
+            &self.merkle_tx_ids,
+            &self.merkle_witness_ids,
+            &self.merkle_level_a,
+            &self.merkle_level_b,
+        );
         result.setMerkleResult(merkle_valid);
 
         // Verify each transaction
@@ -820,7 +832,8 @@ test "verifier: BlockVerifyResult stats" {
     header.height = 100;
 
     const blk = Block.init(header, &[_]Transaction{});
-    var result = BlockVerifyResult.init(&blk);
+    var result: BlockVerifyResult = undefined;
+    result.initInPlace(&blk);
 
     var tx_result = TxVerifyResult.init(0);
     tx_result.addInputResult(InputVerifyResult.success(0, 500));

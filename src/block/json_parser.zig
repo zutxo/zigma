@@ -210,11 +210,10 @@ fn parseBlockValue(value: std.json.Value, storage: *BlockStorage) ParseError!Blo
         }
     }
 
-    // Parse AD proofs (optional)
+    // Parse AD proofs (optional) - use storage's ad_proofs buffer directly to avoid stack overflow
     if (getString(value, "adProofs")) |ad_hex| {
-        var ad_buf: [256 * 1024]u8 = undefined;
-        if (parseHexDynamic(ad_hex, &ad_buf)) |ad_bytes| {
-            storage.setAdProofs(ad_bytes) catch {};
+        if (parseHexDynamic(ad_hex, &storage.ad_proofs)) |ad_bytes| {
+            storage.ad_proofs_len = ad_bytes.len;
         } else |_| {}
     }
 

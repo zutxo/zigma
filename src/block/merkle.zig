@@ -294,6 +294,151 @@ pub fn verifyTxMerkleRootVersioned(blk: *const Block, block_version: u8) bool {
     return std.mem.eql(u8, &computed, &blk.header.transactions_root);
 }
 
+/// Verify block's transactions_root using pre-allocated buffers (avoids stack overflow).
+/// Use this from BlockVerifier where buffers are heap-allocated.
+pub fn verifyTxMerkleRootWithBuffers(
+    blk: *const Block,
+    block_version: u8,
+    tx_ids: *[MAX_LEVEL_NODES][32]u8,
+    witness_ids: *[MAX_LEVEL_NODES][WITNESS_ID_SIZE]u8,
+    level_a: *[MAX_LEVEL_NODES][32]u8,
+    level_b: *[MAX_LEVEL_NODES][32]u8,
+) bool {
+    const tx_count = @min(blk.transactions.len, MAX_LEVEL_NODES);
+
+    // Collect transaction IDs
+    for (blk.transactions[0..tx_count], 0..) |tx, i| {
+        tx_ids[i] = tx.id;
+    }
+
+    if (block_version <= INITIAL_VERSION) {
+        // v1: only transaction IDs
+        const computed = computeTxMerkleRootWithBuffers(tx_ids[0..tx_count], level_a, level_b);
+        return std.mem.eql(u8, &computed, &blk.header.transactions_root);
+    }
+
+    // v2+: include witness IDs
+    _ = computeWitnessIds(blk.transactions[0..tx_count], witness_ids);
+    const computed = computeTxMerkleRootV2WithBuffers(tx_ids[0..tx_count], witness_ids[0..tx_count], level_a, level_b);
+    return std.mem.eql(u8, &computed, &blk.header.transactions_root);
+}
+
+/// Compute transaction merkle root using pre-allocated buffers.
+fn computeTxMerkleRootWithBuffers(
+    tx_ids: []const [32]u8,
+    level_a: *[MAX_LEVEL_NODES][32]u8,
+    level_b: *[MAX_LEVEL_NODES][32]u8,
+) [32]u8 {
+    // Empty tree case
+    if (tx_ids.len == 0) {
+        return [_]u8{0} ** 32;
+    }
+
+    // Initialize first level: hash each leaf with LEAF_PREFIX
+    var count: usize = tx_ids.len;
+    var current: *[MAX_LEVEL_NODES][32]u8 = level_a;
+    var next: *[MAX_LEVEL_NODES][32]u8 = level_b;
+
+    for (tx_ids, 0..) |tx_id, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&tx_id);
+        current[i] = hasher.finalize();
+    }
+
+    // Build tree bottom-up
+    while (count > 1) {
+        const pairs = count / 2;
+        const has_odd = count % 2 == 1;
+
+        // Hash pairs
+        for (0..pairs) |i| {
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[i * 2]);
+            hasher.update(&current[i * 2 + 1]);
+            next[i] = hasher.finalize();
+        }
+
+        // Handle odd node
+        if (has_odd) {
+            next[pairs] = current[count - 1];
+            count = pairs + 1;
+        } else {
+            count = pairs;
+        }
+
+        // Swap buffers
+        const tmp = current;
+        current = next;
+        next = tmp;
+    }
+
+    return current[0];
+}
+
+/// Compute v2 merkle root using pre-allocated buffers.
+fn computeTxMerkleRootV2WithBuffers(
+    tx_ids: []const [32]u8,
+    witness_ids: []const [WITNESS_ID_SIZE]u8,
+    level_a: *[MAX_LEVEL_NODES][32]u8,
+    level_b: *[MAX_LEVEL_NODES][32]u8,
+) [32]u8 {
+    // Empty tree case
+    if (tx_ids.len == 0) {
+        return [_]u8{0} ** 32;
+    }
+
+    // Build combined leaf array: txIds ++ witnessIds (as 32-byte hashes)
+    var count: usize = tx_ids.len * 2;
+    var current: *[MAX_LEVEL_NODES][32]u8 = level_a;
+    var next: *[MAX_LEVEL_NODES][32]u8 = level_b;
+
+    // Hash tx IDs as leaves
+    for (tx_ids, 0..) |tx_id, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&tx_id);
+        current[i] = hasher.finalize();
+    }
+
+    // Hash witness IDs as leaves (pad 31-byte witness to 32 with trailing zero)
+    for (witness_ids, 0..) |witness_id, i| {
+        var hasher = hash.Blake2b256Hasher.init();
+        hasher.update(&[_]u8{LEAF_PREFIX});
+        hasher.update(&witness_id);
+        hasher.update(&[_]u8{0}); // Pad to 32 bytes
+        current[tx_ids.len + i] = hasher.finalize();
+    }
+
+    // Build tree bottom-up
+    while (count > 1) {
+        const pairs = count / 2;
+        const has_odd = count % 2 == 1;
+
+        for (0..pairs) |i| {
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[i * 2]);
+            hasher.update(&current[i * 2 + 1]);
+            next[i] = hasher.finalize();
+        }
+
+        if (has_odd) {
+            next[pairs] = current[count - 1];
+            count = pairs + 1;
+        } else {
+            count = pairs;
+        }
+
+        const tmp = current;
+        current = next;
+        next = tmp;
+    }
+
+    return current[0];
+}
+
 // ============================================================================
 // Merkle Proof Verification (for individual transactions)
 // ============================================================================
