@@ -347,6 +347,8 @@ fn computeTxMerkleRootWithBuffers(
     }
 
     // Build tree bottom-up
+    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+
     while (count > 1) {
         const pairs = count / 2;
         const has_odd = count % 2 == 1;
@@ -360,9 +362,13 @@ fn computeTxMerkleRootWithBuffers(
             next[i] = hasher.finalize();
         }
 
-        // Handle odd node
+        // Handle odd node - pair with empty node
         if (has_odd) {
-            next[pairs] = current[count - 1];
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[count - 1]);
+            hasher.update(&empty_node_hash);
+            next[pairs] = hasher.finalize();
             count = pairs + 1;
         } else {
             count = pairs;
@@ -402,16 +408,17 @@ fn computeTxMerkleRootV2WithBuffers(
         current[i] = hasher.finalize();
     }
 
-    // Hash witness IDs as leaves (pad 31-byte witness to 32 with trailing zero)
+    // Hash witness IDs as leaves (31 bytes, no padding)
     for (witness_ids, 0..) |witness_id, i| {
         var hasher = hash.Blake2b256Hasher.init();
         hasher.update(&[_]u8{LEAF_PREFIX});
         hasher.update(&witness_id);
-        hasher.update(&[_]u8{0}); // Pad to 32 bytes
         current[tx_ids.len + i] = hasher.finalize();
     }
 
     // Build tree bottom-up
+    const empty_node_hash: [32]u8 = [_]u8{0} ** 32;
+
     while (count > 1) {
         const pairs = count / 2;
         const has_odd = count % 2 == 1;
@@ -424,8 +431,13 @@ fn computeTxMerkleRootV2WithBuffers(
             next[i] = hasher.finalize();
         }
 
+        // Handle odd node - pair with empty node
         if (has_odd) {
-            next[pairs] = current[count - 1];
+            var hasher = hash.Blake2b256Hasher.init();
+            hasher.update(&[_]u8{INTERNAL_NODE_PREFIX});
+            hasher.update(&current[count - 1]);
+            hasher.update(&empty_node_hash);
+            next[pairs] = hasher.finalize();
             count = pairs + 1;
         } else {
             count = pairs;
