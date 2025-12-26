@@ -2954,8 +2954,20 @@ pub const Evaluator = struct {
             },
             .hash32 => |h| .{ .type_idx = type_idx, .data = .{ .hash32 = h } },
             .avl_tree => |a| .{ .type_idx = type_idx, .data = .{ .avl_tree = a } },
-            // Tuple - store with tuple data structure (types_start=0 means types come from pair type descriptor)
-            .tuple => |t| .{ .type_idx = type_idx, .data = .{ .tuple = .{ .start_idx = t.start, .len = t.len, .types_start = 0 } } },
+            // Tuple - store with tuple data structure
+            // If type_idx is UNIT (fallback from valueToTypeIndex), create proper pair type
+            .tuple => |t| blk: {
+                var actual_type = type_idx;
+                if (actual_type == TypePool.UNIT and t.len == 2) {
+                    // For pairs, try to create a proper pair type from element types
+                    const elem1 = self.values[t.start];
+                    const elem2 = self.values[t.start + 1];
+                    const type1 = valueToTypeIndex(elem1);
+                    const type2 = valueToTypeIndex(elem2);
+                    actual_type = self.pools.type_pool.getPair(type1, type2) catch TypePool.UNIT;
+                }
+                break :blk .{ .type_idx = actual_type, .data = .{ .tuple = .{ .start_idx = t.start, .len = t.len, .types_start = 0 } } };
+            },
             // Types that shouldn't be stored in pool (use stack Value directly)
             .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
             // Function references store body_idx, num_args, and arg_var_id
@@ -4834,31 +4846,50 @@ pub const Evaluator = struct {
         const lambda_idx = self.findSubtreeEnd(zero_idx);
         const lambda_node = self.tree.nodes[lambda_idx];
 
-        // Fold lambda takes 2 args; resolve inline or via val_use
+        // Fold lambda takes 1 arg (a tuple of (acc, elem)); resolve inline or via val_use
+        // Reference: Scala Fold.eval() uses foldOp as ((OV, IV)) => OV (tuple arg, not curried)
         var body_idx: u16 = undefined;
+        var arg_var_id: u8 = undefined;
         if (lambda_node.tag == .func_value) {
-            if (lambda_node.data != 2) return error.InvalidData;
+            // data layout: num_args (bits 0-7), arg_var_id (bits 8-15)
+            const num_args: u8 = @truncate(lambda_node.data);
+            if (num_args != 1) return error.InvalidData;
+            arg_var_id = @truncate(lambda_node.data >> 8);
             body_idx = lambda_idx + 1;
         } else if (lambda_node.tag == .val_use) {
             const var_id: u8 = @truncate(lambda_node.data);
             const func_val = self.var_bindings[var_id] orelse return error.UndefinedVariable;
             if (func_val != .func_ref) return error.TypeMismatch;
             body_idx = func_val.func_ref.body_idx;
+            arg_var_id = func_val.func_ref.arg_var_id;
         } else {
             return error.InvalidData;
         }
 
-        // For fold, we need two var_ids: accumulator and element
-        // Convention: acc_id = 1, elem_id = 2 (or scan body to find them)
-        const acc_var_id: u16 = 1;
-        const elem_var_id: u16 = 2;
-
-        // Accumulate
+        // Accumulate - for each iteration, create a pair (acc, elem) and bind to arg_var_id
         var acc = zero;
         for (0..len) |i| {
             const elem = try self.getCollectionElement(coll, i);
-            self.var_bindings[acc_var_id] = acc;
-            self.var_bindings[elem_var_id] = elem;
+
+            // Create pair (acc, elem) as a tuple value
+            // Store elements in values array for external storage mode
+            const pair_start = self.values_sp;
+            if (pair_start + 2 > self.values.len) return error.OutOfMemory;
+            self.values[pair_start] = acc;
+            self.values[pair_start + 1] = elem;
+            self.values_sp = pair_start + 2;
+
+            const pair_val = Value{
+                .tuple = .{
+                    .start = @truncate(pair_start),
+                    .len = 2,
+                    .types = .{ 0, 0, 0, 0 }, // External storage
+                    .values = .{ 0, 0, 0, 0 }, // External storage
+                },
+            };
+
+            // Bind the pair to the lambda's arg_var_id
+            self.var_bindings[arg_var_id] = pair_val;
 
             acc = try self.evaluateSubtree(body_idx);
         }
@@ -5740,9 +5771,6 @@ pub const Evaluator = struct {
         // Result length is minimum of both
         const result_len = @min(len1, len2);
 
-        // Get the node to determine result type
-        const node = self.tree.nodes[node_idx];
-
         // Allocate storage for tuple pairs in ValuePool
         if (result_len > 65535) return error.CollectionTooLarge;
         const result_start = self.pools.values.allocN(@intCast(result_len)) catch return error.OutOfMemory;
@@ -5758,6 +5786,9 @@ pub const Evaluator = struct {
             .coll => |c| c.elem_type,
             else => unreachable,
         };
+
+        // Create proper pair type for tuple elements (instead of using node.result_type which may be ANY)
+        const pair_type = self.pools.type_pool.getPair(elem_type1, elem_type2) catch return error.OutOfMemory;
 
         // Build tuple pairs
         for (0..result_len) |i| {
@@ -5800,16 +5831,16 @@ pub const Evaluator = struct {
             // Store tuple reference at result position
             const result_idx = result_start + @as(u16, @intCast(i));
             self.pools.values.set(result_idx, .{
-                .type_idx = node.result_type,
+                .type_idx = pair_type,
                 .data = .{ .tuple = .{ .start_idx = tuple_start, .len = 2, .types_start = 0 } },
             });
         }
 
         // Push result collection of tuples
-        // The result_type is Coll[(A,B)], so use it directly - elements are stored as tuples
+        // Use the computed pair_type as the element type
         try self.pushValue(.{
             .coll = .{
-                .elem_type = node.result_type, // Contains pair type info
+                .elem_type = pair_type,
                 .start = result_start,
                 .len = @intCast(result_len),
             },
@@ -7410,7 +7441,12 @@ pub const Evaluator = struct {
     const RUNTIME_COLL_FLAG: u16 = 0x8000;
 
     fn getCollectionElementFromRef(self: *Evaluator, coll: Value.CollRef, idx: u16) EvalError!Value {
-        if (idx >= coll.len) return error.IndexOutOfBounds;
+        if (idx >= coll.len) {
+            self.diag.failed_index = @intCast(idx);
+            self.diag.collection_len = coll.len;
+            self.diag.coll_type = .coll_generic;
+            return error.IndexOutOfBounds;
+        }
 
         // Check if this is a runtime-built collection (high bit set)
         if (coll.start & RUNTIME_COLL_FLAG != 0) {
@@ -7419,6 +7455,9 @@ pub const Evaluator = struct {
             if (val_idx < self.values.len) {
                 return self.values[val_idx];
             }
+            self.diag.failed_index = @intCast(idx);
+            self.diag.collection_len = coll.len;
+            self.diag.coll_type = .coll_generic;
             return error.IndexOutOfBounds;
         }
 
@@ -7434,6 +7473,9 @@ pub const Evaluator = struct {
             return self.values[val_idx];
         }
 
+        self.diag.failed_index = @intCast(idx);
+        self.diag.collection_len = coll.len;
+        self.diag.coll_type = .coll_generic;
         return error.IndexOutOfBounds;
     }
 
