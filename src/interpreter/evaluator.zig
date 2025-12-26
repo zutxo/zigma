@@ -11673,7 +11673,7 @@ test "evaluator: apply function with arithmetic" {
     // Tree: [apply] [func_value(1)] [bin_op(plus)] [val_use(1)] [constant(1)] [constant(5)]
     var tree = ExprTree.init();
     tree.nodes[0] = .{ .tag = .apply };
-    tree.nodes[1] = .{ .tag = .func_value, .data = 1 }; // 1 argument
+    tree.nodes[1] = .{ .tag = .func_value, .data = 1 | (1 << 8) }; // 1 arg, arg_var_id=1
     tree.nodes[2] = .{ .tag = .bin_op, .data = @intFromEnum(BinOpKind.plus) }; // x + 1
     tree.nodes[3] = .{ .tag = .val_use, .data = 1 }; // x (var_id = 1)
     tree.nodes[4] = .{ .tag = .constant, .data = 0 }; // 1
@@ -11705,7 +11705,7 @@ test "evaluator: apply with variable shadowing" {
     tree.nodes[1] = .{ .tag = .val_def, .data = 1 }; // x (var_id = 1)
     tree.nodes[2] = .{ .tag = .constant, .data = 0 }; // x = 100
     tree.nodes[3] = .{ .tag = .apply }; // Result expression
-    tree.nodes[4] = .{ .tag = .func_value, .data = 1 }; // Lambda with 1 arg
+    tree.nodes[4] = .{ .tag = .func_value, .data = 1 | (1 << 8) }; // 1 arg, arg_var_id=1
     tree.nodes[5] = .{ .tag = .bin_op, .data = @intFromEnum(BinOpKind.plus) }; // x + 1
     tree.nodes[6] = .{ .tag = .val_use, .data = 1 }; // x (var_id = 1)
     tree.nodes[7] = .{ .tag = .constant, .data = 1 }; // 1

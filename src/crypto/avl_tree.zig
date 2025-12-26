@@ -312,28 +312,24 @@ pub const AvlNode = union(enum) {
 
     /// Compute the Blake2b256 label for this node
     pub fn computeLabel(self: AvlNode, key_length: usize) [hash_size]u8 {
+        _ = key_length; // Not used in hash computation
+
         var hasher = hash.Blake2b256Hasher.init();
 
         switch (self) {
             .leaf => |leaf| {
-                // Leaf serialization: prefix(1) + key + value_len + value + next_key
-                hasher.update(&[_]u8{1}); // Leaf prefix
+                // Leaf hash: prefix(0) + key + value + next_key
+                // NOTE: prefix 0 for leaf, no value length prefix
+                hasher.update(&[_]u8{0}); // Leaf prefix
                 hasher.update(leaf.key);
-                // Variable-length value: 2-byte length prefix
-                const len_bytes: [2]u8 = .{
-                    @truncate(leaf.value.len >> 8),
-                    @truncate(leaf.value.len),
-                };
-                hasher.update(&len_bytes);
                 hasher.update(leaf.value);
                 hasher.update(leaf.next_leaf_key);
             },
             .internal => |internal| {
-                // Internal serialization: prefix(0) + balance + key_len + left + right
-                hasher.update(&[_]u8{0}); // Internal prefix
+                // Internal hash: prefix(1) + balance + left + right
+                // NOTE: prefix 1 for internal, no key_length
+                hasher.update(&[_]u8{1}); // Internal prefix
                 hasher.update(&[_]u8{@bitCast(internal.balance)});
-                // Key length as single byte (protocol limit)
-                hasher.update(&[_]u8{@truncate(key_length)});
                 hasher.update(&internal.left_label);
                 hasher.update(&internal.right_label);
             },
