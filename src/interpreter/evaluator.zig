@@ -5824,10 +5824,24 @@ pub const Evaluator = struct {
 
         const obj = try self.popValue();
 
-        // Get collection length (only coll_byte supported for now)
+        // Get collection length - handles all collection types
         const len: usize = switch (obj) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
+            },
             else => return error.TypeMismatch,
         };
 
