@@ -9642,8 +9642,9 @@ pub const Evaluator = struct {
 
         if (lambda_node.tag == .func_value) {
             // Inline lambda: body follows func_value node
+            // data layout: num_args (bits 0-7), arg_var_id (bits 8-15)
             const body_idx = lambda_idx + 1;
-            const arg_var_id: u8 = @truncate(self.findLambdaArgId(body_idx) orelse 1);
+            const arg_var_id: u8 = @truncate(lambda_node.data >> 8);
             return .{ .body_idx = body_idx, .arg_var_id = arg_var_id };
         } else if (lambda_node.tag == .val_use) {
             // Lambda from variable reference
@@ -9651,7 +9652,7 @@ pub const Evaluator = struct {
             const func_val = self.var_bindings[var_id] orelse return error.UndefinedVariable;
             if (func_val != .func_ref) return error.TypeMismatch;
             const body_idx = func_val.func_ref.body_idx;
-            const arg_var_id: u8 = @truncate(self.findLambdaArgId(body_idx) orelse 1);
+            const arg_var_id = func_val.func_ref.arg_var_id;
             return .{ .body_idx = body_idx, .arg_var_id = arg_var_id };
         } else {
             return error.InvalidData;
