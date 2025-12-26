@@ -250,24 +250,37 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
                                 std.mem.eql(u8, tn, "SColl[SByte]") or
                                 std.mem.eql(u8, tn, "Coll[SByte]");
 
-                            const type_byte: u8 = if (std.mem.eql(u8, tn, "SGroupElement"))
-                                0x07 // GROUP_ELEMENT type code
-                            else if (std.mem.eql(u8, tn, "SInt"))
-                                0x04 // INT type code
-                            else if (std.mem.eql(u8, tn, "SLong"))
-                                0x05 // LONG type code
-                            else if (std.mem.eql(u8, tn, "SBoolean"))
-                                0x01 // BOOLEAN type code
-                            else if (is_coll_byte)
-                                0x0E // COLL_BYTE type code
-                            else
-                                continue; // Unknown type, skip
+                            // SSigmaProp values are already fully serialized (start with type 0x08)
+                            const is_pre_serialized = std.mem.eql(u8, tn, "SSigmaProp");
 
-                            if (is_coll_byte) {
+                            // SColl[SLong] and SColl[SInt] need special collection encoding
+                            const is_coll_long = std.mem.eql(u8, tn, "SColl[SLong]");
+                            const is_coll_int = std.mem.eql(u8, tn, "SColl[SInt]");
+
+                            if (is_pre_serialized) {
+                                // Value already includes type byte, use as-is
+                                result.registers[i] = value_bytes;
+                            } else if (is_coll_byte) {
                                 // For Coll[Byte], format is: type_byte + VLQ_length + bytes
                                 const encoded = encodeCollByteRegister(allocator, value_bytes) catch continue;
                                 result.registers[i] = encoded;
+                            } else if (is_coll_long or is_coll_int) {
+                                // For Coll[Long/Int], value is already serialized (type + length + elements)
+                                // The JSON value should be pre-serialized hex
+                                result.registers[i] = value_bytes;
                             } else {
+                                // Determine type byte for primitives
+                                const type_byte: u8 = if (std.mem.eql(u8, tn, "SGroupElement"))
+                                    0x07 // GROUP_ELEMENT type code
+                                else if (std.mem.eql(u8, tn, "SInt"))
+                                    0x04 // INT type code
+                                else if (std.mem.eql(u8, tn, "SLong"))
+                                    0x05 // LONG type code
+                                else if (std.mem.eql(u8, tn, "SBoolean"))
+                                    0x01 // BOOLEAN type code
+                                else
+                                    continue; // Unknown type, skip
+
                                 // For primitives, format is: type_byte + value
                                 const full_bytes = allocator.alloc(u8, 1 + value_bytes.len) catch continue;
                                 full_bytes[0] = type_byte;
@@ -491,6 +504,34 @@ fn runScenario(
         data_input_boxes[i].registers = parsed_data_inputs[i].registers;
     }
 
+    // Parse context extension (for getVar operations)
+    var context_vars: [256]?[]const u8 = .{null} ** 256;
+    if (tx.object.get("context_extension")) |ctx_ext| {
+        var iter = ctx_ext.object.iterator();
+        while (iter.next()) |entry| {
+            const var_id = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            const var_obj = entry.value_ptr.*.object;
+            const var_type = if (var_obj.get("type_name")) |tn| tn.string else null;
+            const var_val = var_obj.get("value") orelse continue;
+
+            // Parse value similar to registers
+            if (var_val == .string) {
+                const value_bytes = hexToBytes(arena_alloc, var_val.string) catch continue;
+                if (var_type) |tn| {
+                    if (std.mem.eql(u8, tn, "SColl[SByte]") or std.mem.eql(u8, tn, "Coll[Byte]")) {
+                        context_vars[var_id] = encodeCollByteRegister(arena_alloc, value_bytes) catch continue;
+                    } else if (std.mem.eql(u8, tn, "SSigmaProp")) {
+                        context_vars[var_id] = value_bytes;
+                    } else {
+                        context_vars[var_id] = value_bytes;
+                    }
+                } else {
+                    context_vars[var_id] = value_bytes;
+                }
+            }
+        }
+    }
+
     // Create evaluation context with full transaction data
     const input_slice = input_boxes[0..input_count];
     var ctx = Context.forHeight(height, input_slice);
@@ -501,6 +542,7 @@ fn runScenario(
     if (data_input_count > 0) {
         ctx.data_inputs = data_input_boxes[0..data_input_count];
     }
+    ctx.context_vars = context_vars;
 
     // Evaluate
     var eval = Evaluator.init(&tree.expr_tree, &ctx);
