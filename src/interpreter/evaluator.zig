@@ -4294,10 +4294,24 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Get collection length - only coll_byte supported currently
+        // Get collection length - handles all collection types
         const len: usize = switch (coll) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
+            },
             else => return error.TypeMismatch,
         };
 
@@ -4357,10 +4371,24 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Get collection length - only coll_byte supported currently
+        // Get collection length - support all collection types
         const len: usize = switch (coll) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
+            },
             else => return error.TypeMismatch,
         };
 
@@ -4421,10 +4449,24 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Get collection length
+        // Get collection length - support all collection types
         const len: usize = switch (coll) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
+            },
             else => return error.TypeMismatch,
         };
 
@@ -4511,7 +4553,7 @@ pub const Evaluator = struct {
 
         const coll = try self.popValue();
 
-        // Get collection length
+        // Get collection length - support all collection types
         const len: usize = switch (coll) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
@@ -4519,6 +4561,15 @@ pub const Evaluator = struct {
                 .inputs => self.ctx.inputs.len,
                 .outputs => self.ctx.outputs.len,
                 .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
             },
             else => return error.TypeMismatch,
         };
@@ -4654,10 +4705,24 @@ pub const Evaluator = struct {
         // INVARIANT: Popped exactly 2 values
         assert(self.value_sp == initial_sp - 2);
 
-        // Get collection length - only coll_byte supported currently
+        // Get collection length - support all collection types
         const len: usize = switch (coll) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
+            .box_coll => |bc| switch (bc.source) {
+                .inputs => self.ctx.inputs.len,
+                .outputs => self.ctx.outputs.len,
+                .data_inputs => self.ctx.data_inputs.len,
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) break :blk 0;
+                break :blk boxes[tc.box_index].tokens.len;
+            },
             else => return error.TypeMismatch,
         };
 
@@ -8996,6 +9061,7 @@ pub const Evaluator = struct {
     }
 
     /// Helper: get element from collection at index
+    /// Supports all collection types: coll_byte, coll, box_coll, token_coll
     fn getCollectionElement(self: *Evaluator, coll: Value, idx: usize) EvalError!Value {
         return switch (coll) {
             .coll_byte => |c| if (idx < c.len) .{ .byte = @bitCast(c[idx]) } else blk: {
@@ -9003,11 +9069,66 @@ pub const Evaluator = struct {
                 self.diag.collection_len = c.len;
                 break :blk error.IndexOutOfBounds;
             },
-            .coll => |c| if (@as(usize, @intCast(idx)) >= c.len) blk: {
+            .coll => |c| if (idx >= c.len) blk: {
                 self.diag.failed_index = @intCast(idx);
                 self.diag.collection_len = c.len;
                 break :blk error.IndexOutOfBounds;
             } else self.getCollectionElementFromRef(c, @intCast(idx)),
+            .box_coll => |bc| blk: {
+                const boxes = switch (bc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (idx >= boxes.len) {
+                    self.diag.failed_index = @intCast(idx);
+                    self.diag.collection_len = boxes.len;
+                    break :blk error.IndexOutOfBounds;
+                }
+                break :blk .{ .box = .{ .source = bc.source, .index = @intCast(idx) } };
+            },
+            .token_coll => |tc| blk: {
+                const boxes = switch (tc.source) {
+                    .inputs => self.ctx.inputs,
+                    .outputs => self.ctx.outputs,
+                    .data_inputs => self.ctx.data_inputs,
+                };
+                if (tc.box_index >= boxes.len) {
+                    self.diag.failed_index = @intCast(tc.box_index);
+                    self.diag.collection_len = boxes.len;
+                    self.diag.coll_type = .token_coll;
+                    break :blk error.IndexOutOfBounds;
+                }
+                const box = boxes[tc.box_index];
+                if (idx >= box.tokens.len) {
+                    self.diag.failed_index = @intCast(idx);
+                    self.diag.collection_len = box.tokens.len;
+                    self.diag.coll_type = .token_coll;
+                    break :blk error.IndexOutOfBounds;
+                }
+                const token = box.tokens[idx];
+
+                // Copy token id to arena
+                const token_id = self.arena.allocSlice(u8, 32) catch return error.OutOfMemory;
+                @memcpy(token_id, &token.id);
+
+                // Store tuple elements in values array
+                const start: u16 = @truncate(self.values_sp);
+                if (start + 2 > self.values.len) return error.OutOfMemory;
+
+                self.values[start] = .{ .coll_byte = token_id };
+                self.values[start + 1] = .{ .long = token.amount };
+                self.values_sp = start + 2;
+
+                break :blk .{
+                    .tuple = .{
+                        .start = start,
+                        .len = 2,
+                        .types = .{ 0, 0, 0, 0 },
+                        .values = .{ 0, 0, 0, 0 },
+                    },
+                };
+            },
             else => error.TypeMismatch,
         };
     }

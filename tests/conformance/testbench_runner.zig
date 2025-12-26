@@ -172,17 +172,40 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
         const reg_names = [_][]const u8{ "R4", "R5", "R6", "R7", "R8", "R9" };
         for (reg_names, 0..) |reg_name, i| {
             if (regs_val.object.get(reg_name)) |reg_val| {
-                // Register value could be raw hex or typed object
-                // For now, try to get a "value" field as hex, or skip
-                if (reg_val.object.get("value")) |val| {
-                    switch (val) {
-                        .string => |s| {
-                            // Try to parse as hex
-                            const reg_bytes = hexToBytes(allocator, s) catch null;
-                            result.registers[i] = reg_bytes;
-                        },
-                        else => {},
-                    }
+                // Get type_name and value for typed register encoding
+                const type_name = if (reg_val.object.get("type_name")) |tn| tn.string else null;
+                const val = reg_val.object.get("value") orelse continue;
+
+                switch (val) {
+                    .string => |s| {
+                        const value_bytes = hexToBytes(allocator, s) catch continue;
+
+                        // Prepend type byte based on type_name
+                        if (type_name) |tn| {
+                            const type_byte: u8 = if (std.mem.eql(u8, tn, "SGroupElement"))
+                                0x07 // GROUP_ELEMENT type code
+                            else if (std.mem.eql(u8, tn, "SInt"))
+                                0x04 // INT type code
+                            else if (std.mem.eql(u8, tn, "SLong"))
+                                0x05 // LONG type code
+                            else if (std.mem.eql(u8, tn, "SBoolean"))
+                                0x01 // BOOLEAN type code
+                            else if (std.mem.eql(u8, tn, "Coll[Byte]") or std.mem.eql(u8, tn, "SByteArray"))
+                                0x0E // COLL_BYTE type code
+                            else
+                                continue; // Unknown type, skip
+
+                            // Allocate type_byte + value_bytes
+                            const full_bytes = allocator.alloc(u8, 1 + value_bytes.len) catch continue;
+                            full_bytes[0] = type_byte;
+                            @memcpy(full_bytes[1..], value_bytes);
+                            result.registers[i] = full_bytes;
+                        } else {
+                            // No type specified - use raw bytes
+                            result.registers[i] = value_bytes;
+                        }
+                    },
+                    else => {},
                 }
             }
         }
