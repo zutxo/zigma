@@ -650,19 +650,19 @@ pub const BatchAVLVerifier = struct {
                 // Skip 32-byte hash
                 pos += hash_size;
             } else if (marker == ProofMarker.leaf) {
-                // Skip leaf: key + value + next_key
+                // Skip leaf: key + next_key + value (proof format order)
                 pos += self.key_length; // key
+                pos += self.key_length; // next_leaf_key (comes BEFORE value)
                 if (self.value_length_opt) |vl| {
                     pos += vl; // fixed-length value
                 } else {
-                    if (pos + 2 > self.proof.len) return error.ProofExhausted;
-                    const vlen: usize = std.mem.readInt(u16, self.proof[pos..][0..2], .big);
+                    if (pos + 4 > self.proof.len) return error.ProofExhausted;
+                    const vlen: usize = std.mem.readInt(u32, self.proof[pos..][0..4], .big);
                     // Check bounds before advancing position
-                    const total_advance = 2 +| vlen; // saturating add
+                    const total_advance = 4 +| vlen; // saturating add (4 bytes for u32 length)
                     if (pos +| total_advance > self.proof.len) return error.ProofExhausted;
                     pos += total_advance;
                 }
-                pos += self.key_length; // next_leaf_key
             } else {
                 // Balance byte (-1, 0, 1 encoded as 0xFF, 0x00, 0x01)
                 // Internal node: balance only, children come from stack
@@ -762,22 +762,22 @@ pub const BatchAVLVerifier = struct {
         const key = self.proof[start..][0..self.key_length];
         self.tree_pos += self.key_length;
 
-        // Value
+        // Next leaf key (comes BEFORE value in proof format)
+        if (self.tree_pos + self.key_length > self.proof.len) return error.ProofExhausted;
+        const next_key = self.proof[self.tree_pos..][0..self.key_length];
+        self.tree_pos += self.key_length;
+
+        // Value length (u32, 4 bytes, not u16)
         const value_len = if (self.value_length_opt) |vl| vl else blk: {
-            if (self.tree_pos + 2 > self.proof.len) return error.ProofExhausted;
-            const len = std.mem.readInt(u16, self.proof[self.tree_pos..][0..2], .big);
-            self.tree_pos += 2;
+            if (self.tree_pos + 4 > self.proof.len) return error.ProofExhausted;
+            const len = std.mem.readInt(u32, self.proof[self.tree_pos..][0..4], .big);
+            self.tree_pos += 4;
             break :blk @as(usize, len);
         };
 
         if (self.tree_pos + value_len > self.proof.len) return error.ProofExhausted;
         const value = self.proof[self.tree_pos..][0..value_len];
         self.tree_pos += value_len;
-
-        // Next leaf key
-        if (self.tree_pos + self.key_length > self.proof.len) return error.ProofExhausted;
-        const next_key = self.proof[self.tree_pos..][0..self.key_length];
-        self.tree_pos += self.key_length;
 
         return .{ .key = key, .value = value, .next_leaf_key = next_key };
     }
@@ -2260,6 +2260,7 @@ test "avl_tree: BatchAVLVerifier single leaf lookup" {
     const next_key = [_]u8{0xFF};
 
     // Build proof bytes
+    // Wire format: marker, key, next_key, value_len(4 bytes), value, end_marker
     var proof_buf: [128]u8 = undefined;
     var pos: usize = 0;
 
@@ -2271,16 +2272,18 @@ test "avl_tree: BatchAVLVerifier single leaf lookup" {
     proof_buf[pos] = key[0];
     pos += 1;
 
-    // Value length (2 bytes big-endian) + value
-    proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 4; // length = 4
-    pos += 2;
-    @memcpy(proof_buf[pos..][0..4], &value);
-    pos += 4;
-
-    // Next key
+    // Next key (comes BEFORE value in wire format)
     proof_buf[pos] = next_key[0];
     pos += 1;
+
+    // Value length (4 bytes big-endian) + value
+    proof_buf[pos] = 0;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 4; // length = 4
+    pos += 4;
+    @memcpy(proof_buf[pos..][0..4], &value);
+    pos += 4;
 
     // End of tree marker
     proof_buf[pos] = ProofMarker.end_of_tree;
@@ -2339,7 +2342,7 @@ test "avl_tree: BatchAVLVerifier lookup key not found" {
     const value = [_]u8{ 0xDE, 0xAD };
     const next_key = [_]u8{0xFF};
 
-    // Build proof
+    // Build proof (wire format: marker, key, next_key, value_len(4), value, end)
     var proof_buf: [128]u8 = undefined;
     var pos: usize = 0;
 
@@ -2347,13 +2350,15 @@ test "avl_tree: BatchAVLVerifier lookup key not found" {
     pos += 1;
     proof_buf[pos] = key[0];
     pos += 1;
+    proof_buf[pos] = next_key[0]; // next_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value);
     pos += 2;
-    proof_buf[pos] = next_key[0];
-    pos += 1;
     proof_buf[pos] = ProofMarker.end_of_tree;
     pos += 1;
 

@@ -2029,10 +2029,7 @@ pub const Evaluator = struct {
         try self.addCost(15); // OptionIsDefined cost from opcodes
 
         const opt_val = try self.popValue();
-        if (opt_val != .option) {
-            std.debug.print("DEBUG optionIsDefined: expected option, got {s}\n", .{@tagName(opt_val)});
-            return error.TypeMismatch;
-        }
+        if (opt_val != .option) return error.TypeMismatch;
 
         // INVARIANT: Option type is well-formed
         assert(opt_val.option.inner_type != 0);
@@ -2243,10 +2240,7 @@ pub const Evaluator = struct {
         try self.addCost(20); // ProveDlog construction cost
 
         const input = try self.popValue();
-        if (input != .group_element) {
-            std.debug.print("DEBUG proveDlog: expected group_element, got {s}\n", .{@tagName(input)});
-            return error.TypeMismatch;
-        }
+        if (input != .group_element) return error.TypeMismatch;
 
         // INVARIANT: GroupElement is 33-byte compressed public key
         assert(input.group_element.len == 33);
@@ -2302,10 +2296,7 @@ pub const Evaluator = struct {
         try self.addCost(15); // SigmaPropBytes cost
 
         const input = try self.popValue();
-        if (input != .sigma_prop) {
-            std.debug.print("DEBUG sigmaPropBytes: expected sigma_prop, got {s}\n", .{@tagName(input)});
-            return error.TypeMismatch;
-        }
+        if (input != .sigma_prop) return error.TypeMismatch;
 
         // Return the raw sigma bytes as Coll[Byte]
         const sigma_data = input.sigma_prop.data;
@@ -2698,10 +2689,7 @@ pub const Evaluator = struct {
         try self.addCost(FixedCost.select_field);
 
         const tuple_val = try self.popValue();
-        if (tuple_val != .tuple) {
-            std.debug.print("DEBUG selectField: expected tuple, got {s}\n", .{@tagName(tuple_val)});
-            return error.TypeMismatch;
-        }
+        if (tuple_val != .tuple) return error.TypeMismatch;
 
         // INVARIANT: Value is a tuple
         assert(tuple_val == .tuple);
@@ -2963,8 +2951,10 @@ pub const Evaluator = struct {
             },
             .hash32 => |h| .{ .type_idx = type_idx, .data = .{ .hash32 = h } },
             .avl_tree => |a| .{ .type_idx = type_idx, .data = .{ .avl_tree = a } },
+            // Tuple - store with tuple data structure (types_start=0 means types come from pair type descriptor)
+            .tuple => |t| .{ .type_idx = type_idx, .data = .{ .tuple = .{ .start_idx = t.start, .len = t.len, .types_start = 0 } } },
             // Types that shouldn't be stored in pool (use stack Value directly)
-            .tuple, .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
+            .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll, .soft_fork_placeholder => .{ .type_idx = type_idx, .data = .{ .primitive = 0 } },
             // Function references store body_idx and num_args
             .func_ref => |f| .{ .type_idx = type_idx, .data = .{ .primitive = (@as(i64, f.body_idx) << 8) | @as(i64, f.num_args) } },
         };
@@ -3044,11 +3034,17 @@ pub const Evaluator = struct {
             const start = self.values_sp;
             if (start + elem_count > self.values.len) return error.OutOfMemory;
 
+            // Debug: show expected element type
+            const expected_stype = self.pools.type_pool.get(elem_type);
+            std.debug.print("DEBUG concreteCollection: elem_count={d}, expected elem_type={s}\n", .{ elem_count, @tagName(expected_stype) });
+
             // Pop elements in reverse order (last on stack = first in collection)
             var i: u16 = elem_count;
             while (i > 0) {
                 i -= 1;
                 const val = try self.popValue();
+                // Debug: show actual element type
+                std.debug.print("DEBUG concreteCollection: elem[{d}] actual type={s}\n", .{ i, @tagName(val) });
                 self.values[start + i] = val;
             }
             self.values_sp = start + elem_count;
@@ -4154,10 +4150,7 @@ pub const Evaluator = struct {
         try self.addCost(10); // FixedCost for box property access
 
         const box_val = try self.popValue();
-        if (box_val != .box) {
-            std.debug.print("DEBUG computeBoxId: expected box, got {s}\n", .{@tagName(box_val)});
-            return error.TypeMismatch;
-        }
+        if (box_val != .box) return error.TypeMismatch;
 
         const source = convertBoxSource(box_val.box.source);
         const box = self.getBoxFromSource(source, box_val.box.index) orelse {
@@ -4499,10 +4492,7 @@ pub const Evaluator = struct {
                 if (tc.box_index >= boxes.len) break :blk 0;
                 break :blk boxes[tc.box_index].tokens.len;
             },
-            else => {
-                std.debug.print("DEBUG forAll: unexpected coll type: {s}\n", .{@tagName(coll)});
-                return error.TypeMismatch;
-            },
+            else => return error.TypeMismatch,
         };
 
         // Chunk-based cost for forall: PerItemCost(3, 1, 10)
@@ -4531,10 +4521,7 @@ pub const Evaluator = struct {
 
             // Evaluate lambda body
             const body_result = try self.evaluateSubtree(body_idx);
-            if (body_result != .boolean) {
-                std.debug.print("DEBUG forAll body: expected boolean, got {s}\n", .{@tagName(body_result)});
-                return error.TypeMismatch;
-            }
+            if (body_result != .boolean) return error.TypeMismatch;
 
             if (!body_result.boolean) {
                 // Found false: forall fails
@@ -5030,8 +5017,9 @@ pub const Evaluator = struct {
         }
     }
 
-    /// Compute LogicalAnd: Coll[Boolean] → Boolean (true iff all elements are true)
-    /// Returns true for empty collection (vacuous truth)
+    /// Compute LogicalAnd: Coll[Boolean] → Boolean OR Coll[SigmaProp] → SigmaProp
+    /// For Coll[Boolean]: returns true iff all elements are true (vacuous truth for empty)
+    /// For Coll[SigmaProp]: returns SigmaAnd of all elements (combines propositions)
     fn computeLogicalAnd(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
@@ -5042,10 +5030,7 @@ pub const Evaluator = struct {
         const len: usize = switch (coll_val) {
             .coll_byte => |c| c.len,
             .coll => |c| c.len,
-            else => {
-                std.debug.print("DEBUG logicalAnd: expected coll, got {s}\n", .{@tagName(coll_val)});
-                return error.TypeMismatch;
-            },
+            else => return error.TypeMismatch,
         };
 
         // Cost: base 10 + per-element
@@ -5057,26 +5042,64 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Check all elements
-        for (0..len) |i| {
-            const elem = try self.getCollectionElement(coll_val, i);
-            if (elem != .boolean) {
-                std.debug.print("DEBUG logicalAnd elem: expected boolean, got {s} at index {d}\n", .{ @tagName(elem), i });
-                return error.TypeMismatch;
-            }
-            if (!elem.boolean) {
-                // Found false: entire AND is false
-                try self.pushValue(.{ .boolean = false });
-                return;
-            }
-        }
+        // Determine element type from collection's declared type
+        // For Coll[Boolean]: iterate elements and AND them as booleans
+        // For Coll[SigmaProp]: create SigmaAnd of all elements
+        const declared_elem_type: TypeIndex = switch (coll_val) {
+            .coll_byte => TypePool.BYTE,
+            .coll => |c| c.elem_type,
+            else => return error.TypeMismatch, // Shouldn't reach here
+        };
 
-        // All true
-        try self.pushValue(.{ .boolean = true });
+        const elem_stype = self.pools.type_pool.get(declared_elem_type);
+
+        switch (elem_stype) {
+            .boolean => {
+                // Coll[Boolean] → Boolean
+                for (0..len) |i| {
+                    const elem = try self.getCollectionElement(coll_val, i);
+                    switch (elem) {
+                        .boolean => |b| {
+                            if (!b) {
+                                try self.pushValue(.{ .boolean = false });
+                                return;
+                            }
+                        },
+                        else => return error.TypeMismatch,
+                    }
+                }
+                try self.pushValue(.{ .boolean = true });
+            },
+            .sigma_prop => {
+                // Coll[SigmaProp] → SigmaProp (SigmaAnd)
+                var children: [256]*const sigma_tree.SigmaBoolean = undefined;
+
+                for (0..len) |i| {
+                    const elem = try self.getCollectionElement(coll_val, i);
+                    children[i] = try self.extractSigmaBoolean(elem);
+                }
+
+                // Allocate children slice in arena
+                const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, len) catch return error.OutOfMemory;
+                @memcpy(child_slice, children[0..len]);
+
+                // Allocate the SigmaBoolean node itself
+                const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+                node_ptr[0] = .{ .cand = .{ .children = child_slice } };
+
+                // Serialize the SigmaBoolean to bytes for SigmaProp
+                const sigma_bytes = try self.serializeSigmaBoolean(&node_ptr[0]);
+
+                // Push result as SigmaProp
+                try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+            },
+            else => return error.TypeMismatch,
+        }
     }
 
-    /// Compute LogicalOr: Coll[Boolean] → Boolean (true iff any element is true)
-    /// Returns false for empty collection
+    /// Compute LogicalOr: Coll[Boolean] → Boolean OR Coll[SigmaProp] → SigmaProp
+    /// For Coll[Boolean]: returns true iff any element is true (false for empty)
+    /// For Coll[SigmaProp]: returns SigmaOr of all elements (combines propositions)
     fn computeLogicalOr(self: *Evaluator) EvalError!void {
         // PRECONDITIONS
         assert(self.value_sp >= 1);
@@ -5099,19 +5122,57 @@ pub const Evaluator = struct {
             return;
         }
 
-        // Check all elements
-        for (0..len) |i| {
-            const elem = try self.getCollectionElement(coll_val, i);
-            if (elem != .boolean) return error.TypeMismatch;
-            if (elem.boolean) {
-                // Found true: entire OR is true
-                try self.pushValue(.{ .boolean = true });
-                return;
-            }
-        }
+        // Determine element type from collection's declared type
+        const declared_elem_type: TypeIndex = switch (coll_val) {
+            .coll_byte => TypePool.BYTE,
+            .coll => |c| c.elem_type,
+            else => return error.TypeMismatch, // Shouldn't reach here
+        };
 
-        // All false
-        try self.pushValue(.{ .boolean = false });
+        const elem_stype = self.pools.type_pool.get(declared_elem_type);
+
+        switch (elem_stype) {
+            .boolean => {
+                // Coll[Boolean] → Boolean
+                for (0..len) |i| {
+                    const elem = try self.getCollectionElement(coll_val, i);
+                    switch (elem) {
+                        .boolean => |b| {
+                            if (b) {
+                                try self.pushValue(.{ .boolean = true });
+                                return;
+                            }
+                        },
+                        else => return error.TypeMismatch,
+                    }
+                }
+                try self.pushValue(.{ .boolean = false });
+            },
+            .sigma_prop => {
+                // Coll[SigmaProp] → SigmaProp (SigmaOr)
+                var children: [256]*const sigma_tree.SigmaBoolean = undefined;
+
+                for (0..len) |i| {
+                    const elem = try self.getCollectionElement(coll_val, i);
+                    children[i] = try self.extractSigmaBoolean(elem);
+                }
+
+                // Allocate children slice in arena
+                const child_slice = self.arena.allocSlice(*const sigma_tree.SigmaBoolean, len) catch return error.OutOfMemory;
+                @memcpy(child_slice, children[0..len]);
+
+                // Allocate the SigmaBoolean node itself
+                const node_ptr = self.arena.alloc(sigma_tree.SigmaBoolean, 1) catch return error.OutOfMemory;
+                node_ptr[0] = .{ .cor = .{ .children = child_slice } };
+
+                // Serialize the SigmaBoolean to bytes for SigmaProp
+                const sigma_bytes = try self.serializeSigmaBoolean(&node_ptr[0]);
+
+                // Push result as SigmaProp
+                try self.pushValue(.{ .sigma_prop = .{ .data = sigma_bytes } });
+            },
+            else => return error.TypeMismatch,
+        }
     }
 
     // ========================================================================
@@ -5151,10 +5212,7 @@ pub const Evaluator = struct {
             // Pop in reverse: arg first, then func_ref
             arg_value = try self.popValue();
             const func_ref_value = try self.popValue();
-            if (func_ref_value != .func_ref) {
-                std.debug.print("DEBUG apply: expected func_ref, got {s}\n", .{@tagName(func_ref_value)});
-                return error.TypeMismatch;
-            }
+            if (func_ref_value != .func_ref) return error.TypeMismatch;
             const func_ref = func_ref_value.func_ref;
             num_args = func_ref.num_args;
             body_idx = func_ref.body_idx;
@@ -5164,10 +5222,7 @@ pub const Evaluator = struct {
         if (num_args == 0) return error.InvalidData;
 
         // For v5.x, only single-arg functions are supported
-        if (num_args != 1) {
-            std.debug.print("DEBUG apply: unsupported num_args={d}\n", .{num_args});
-            return error.TypeMismatch;
-        }
+        if (num_args != 1) return error.TypeMismatch;
 
         assert(body_idx < self.tree.node_count); // body must be in bounds
 
