@@ -151,6 +151,63 @@ fn encodeIntegerRegister(allocator: std.mem.Allocator, type_byte: u8, value: i64
     return result;
 }
 
+/// Encode a Coll[Long] or Coll[Int] from JSON array as serialized register
+/// Format: type_byte + VLQ(length) + ZigZag VLQ elements...
+fn encodeCollNumericRegister(allocator: std.mem.Allocator, type_byte: u8, values: []const std.json.Value) ![]u8 {
+    // Build buffer: type + VLQ length + all elements
+    // Max size estimate: 1 (type) + 5 (VLQ length) + 10 * num_elements (max VLQ per element)
+    var buf = try allocator.alloc(u8, 6 + values.len * 10);
+    errdefer allocator.free(buf);
+
+    buf[0] = type_byte;
+    var pos: usize = 1;
+
+    // VLQ encode the array length
+    var arr_len: u32 = @intCast(values.len);
+    while (true) {
+        const byte: u8 = @truncate(arr_len & 0x7F);
+        arr_len >>= 7;
+        if (arr_len == 0) {
+            buf[pos] = byte;
+            pos += 1;
+            break;
+        } else {
+            buf[pos] = byte | 0x80;
+            pos += 1;
+        }
+    }
+
+    // Encode each element as ZigZag VLQ
+    for (values) |val| {
+        const int_val: i64 = val.integer;
+
+        // ZigZag encode
+        const zigzag: u64 = blk: {
+            const shifted: u64 = @bitCast(int_val << 1);
+            const sign_mask: u64 = @bitCast(int_val >> 63);
+            break :blk shifted ^ sign_mask;
+        };
+
+        // VLQ encode
+        var v = zigzag;
+        while (true) {
+            const byte: u8 = @truncate(v & 0x7F);
+            v >>= 7;
+            if (v == 0) {
+                buf[pos] = byte;
+                pos += 1;
+                break;
+            } else {
+                buf[pos] = byte | 0x80;
+                pos += 1;
+            }
+        }
+    }
+
+    // Resize to actual size
+    return allocator.realloc(buf, pos);
+}
+
 /// Storage for parsed box data (static allocation)
 const ParsedBox = struct {
     box: BoxView,
@@ -250,8 +307,10 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
                                 std.mem.eql(u8, tn, "SColl[SByte]") or
                                 std.mem.eql(u8, tn, "Coll[SByte]");
 
-                            // SSigmaProp values are already fully serialized (start with type 0x08)
-                            const is_pre_serialized = std.mem.eql(u8, tn, "SSigmaProp");
+                            // SSigmaProp and nested collections are already fully serialized
+                            const is_pre_serialized = std.mem.eql(u8, tn, "SSigmaProp") or
+                                std.mem.startsWith(u8, tn, "SColl[Coll[") or // Nested collections
+                                std.mem.startsWith(u8, tn, "SColl[SColl["); // Alternative notation
 
                             // SColl[SLong] and SColl[SInt] need special collection encoding
                             const is_coll_long = std.mem.eql(u8, tn, "SColl[SLong]");
@@ -305,6 +364,21 @@ fn parseBox(allocator: std.mem.Allocator, box_json: std.json.Value, default_heig
                                 result.registers[i] = encoded;
                             }
                             // Other types with integer values are skipped
+                        }
+                    },
+                    .array => |arr| {
+                        // Handle array values for SColl[SLong] and SColl[SInt] types
+                        if (type_name) |tn| {
+                            if (std.mem.eql(u8, tn, "SColl[SLong]")) {
+                                // Type code: coll_base(12) + long(5) = 17 = 0x11
+                                const encoded = encodeCollNumericRegister(allocator, 0x11, arr.items) catch continue;
+                                result.registers[i] = encoded;
+                            } else if (std.mem.eql(u8, tn, "SColl[SInt]")) {
+                                // Type code: coll_base(12) + int(4) = 16 = 0x10
+                                const encoded = encodeCollNumericRegister(allocator, 0x10, arr.items) catch continue;
+                                result.registers[i] = encoded;
+                            }
+                            // Other array types are skipped
                         }
                     },
                     else => {},
