@@ -2802,31 +2802,35 @@ test "avl_tree: BatchAVLVerifier update with path recomputation" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Left leaf (key1) - the one we'll update
+    // Left leaf (key1) - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key1[0];
     pos += 1;
+    proof_buf[pos] = key2[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2; // value length
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value1_old);
     pos += 2;
-    proof_buf[pos] = key2[0]; // next_leaf_key = key2
-    pos += 1;
 
-    // Right leaf (key2)
+    // Right leaf (key2) - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key2[0];
     pos += 1;
+    proof_buf[pos] = end_key[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value2);
     pos += 2;
-    proof_buf[pos] = end_key[0];
-    pos += 1;
 
     // Internal node with balance=0
     proof_buf[pos] = 0x00;
@@ -2926,18 +2930,20 @@ test "avl_tree: BatchAVLVerifier update rejects invalid new digest" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Single leaf
+    // Single leaf - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key[0];
     pos += 1;
+    proof_buf[pos] = next_key[0]; // next_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value_old);
     pos += 2;
-    proof_buf[pos] = next_key[0];
-    pos += 1;
 
     // End of tree
     proof_buf[pos] = ProofMarker.end_of_tree;
@@ -2985,18 +2991,20 @@ test "avl_tree: BatchAVLVerifier update rejects non-existent key" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Single leaf
+    // Single leaf - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key[0];
     pos += 1;
+    proof_buf[pos] = next_key[0]; // next_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value);
     pos += 2;
-    proof_buf[pos] = next_key[0];
-    pos += 1;
 
     // End of tree
     proof_buf[pos] = ProofMarker.end_of_tree;
@@ -3327,18 +3335,20 @@ test "avl_tree: BatchAVLVerifier insert creates new structure" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Single leaf (insertion point)
+    // Single leaf (insertion point) - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = existing_key[0];
     pos += 1;
+    proof_buf[pos] = end_key[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2; // value length
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &existing_value);
     pos += 2;
-    proof_buf[pos] = end_key[0]; // next_leaf_key
-    pos += 1;
 
     // End of tree
     proof_buf[pos] = ProofMarker.end_of_tree;
@@ -3484,31 +3494,35 @@ test "avl_tree: BatchAVLVerifier remove from two-leaf tree" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Left leaf (key1)
+    // Left leaf (key1) - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key1[0];
     pos += 1;
+    proof_buf[pos] = key2[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value1);
     pos += 2;
-    proof_buf[pos] = key2[0]; // next_leaf_key = key2
-    pos += 1;
 
-    // Right leaf (key2) - the one we're removing
+    // Right leaf (key2) - the one we're removing - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key2[0];
     pos += 1;
+    proof_buf[pos] = end_key[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value2);
     pos += 2;
-    proof_buf[pos] = end_key[0];
-    pos += 1;
 
     // Internal node with balance=0
     proof_buf[pos] = 0x00;
@@ -3599,31 +3613,35 @@ test "avl_tree: BatchAVLVerifier remove rejects non-existent key" {
     var proof_buf: [256]u8 = undefined;
     var pos: usize = 0;
 
-    // Left leaf
+    // Left leaf - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key1[0];
     pos += 1;
+    proof_buf[pos] = key2[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value1);
     pos += 2;
-    proof_buf[pos] = key2[0];
-    pos += 1;
 
-    // Right leaf
+    // Right leaf - wire format: marker, key, next_key, value_len(4), value
     proof_buf[pos] = ProofMarker.leaf;
     pos += 1;
     proof_buf[pos] = key2[0];
     pos += 1;
+    proof_buf[pos] = end_key[0]; // next_leaf_key BEFORE value
+    pos += 1;
     proof_buf[pos] = 0;
-    proof_buf[pos + 1] = 2;
-    pos += 2;
+    proof_buf[pos + 1] = 0;
+    proof_buf[pos + 2] = 0;
+    proof_buf[pos + 3] = 2; // value length (4 bytes)
+    pos += 4;
     @memcpy(proof_buf[pos..][0..2], &value2);
     pos += 2;
-    proof_buf[pos] = end_key[0];
-    pos += 1;
 
     // Internal node
     proof_buf[pos] = 0x00;
