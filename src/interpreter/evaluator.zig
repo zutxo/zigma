@@ -2672,11 +2672,38 @@ pub const Evaluator = struct {
         // INVARIANT: Index is within bounds
         assert(field_idx < tuple.len);
 
-        // Get the element from the values array
-        const elem_idx = tuple.start + field_idx;
-        if (elem_idx >= self.values_sp) return error.InvalidData;
+        // Determine storage mode and get element
+        const elem: Value = blk: {
+            // Inline storage: types[0] != 0 indicates types are stored inline
+            if (tuple.start == 0 and tuple.types[0] != 0) {
+                const type_idx = tuple.types[field_idx];
+                const val = tuple.values[field_idx];
+                break :blk switch (type_idx) {
+                    TypePool.BOOLEAN => .{ .boolean = val != 0 },
+                    TypePool.BYTE => .{ .byte = @truncate(val) },
+                    TypePool.SHORT => .{ .short = @truncate(val) },
+                    TypePool.INT => .{ .int = @truncate(val) },
+                    TypePool.LONG => .{ .long = val },
+                    else => .{ .long = val }, // Default for unknown primitive types
+                };
+            }
 
-        const elem = self.values[elem_idx];
+            // External storage: types[0] == 0 indicates elements are stored elsewhere
+            const elem_idx = tuple.start + field_idx;
+
+            // Try ValuePool first (for deserialized constants)
+            if (self.pools.values.get(elem_idx)) |pooled| {
+                break :blk try pooledValueToValue(pooled, &self.pools.type_pool);
+            }
+
+            // Fall back to evaluator's values array (for runtime-built tuples)
+            if (elem_idx < self.values_sp) {
+                break :blk self.values[elem_idx];
+            }
+
+            return error.InvalidData;
+        };
+
         try self.pushValue(elem);
 
         // POSTCONDITION: Result is on stack

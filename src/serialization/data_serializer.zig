@@ -627,6 +627,95 @@ fn storeValueInPool(
     return idx;
 }
 
+/// Convert Value to PooledValue for tuple/collection element storage.
+/// Unlike storeValueInPool, this doesn't allocate in the pool - just converts.
+fn valueToPooled(
+    value: Value,
+    type_idx: TypeIndex,
+    vpool: *ValuePool,
+    arena: anytype,
+) DeserializeError!value_pool.PooledValue {
+    _ = arena; // Reserved for future use
+    _ = vpool; // Reserved for future use
+
+    return switch (value) {
+        .unit => .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = 0 },
+        },
+        .boolean => |b| .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = if (b) 1 else 0 },
+        },
+        .byte => |b| .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = @as(i64, b) },
+        },
+        .short => |s| .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = @as(i64, s) },
+        },
+        .int => |i| .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = @as(i64, i) },
+        },
+        .long => |l| .{
+            .type_idx = type_idx,
+            .data = .{ .primitive = l },
+        },
+        .big_int => |bi| blk: {
+            var data: value_pool.PooledValue.BigIntData = .{
+                .bytes = [_]u8{0} ** 32,
+                .len = bi.len,
+            };
+            @memcpy(data.bytes[0..bi.len], bi.bytes[0..bi.len]);
+            break :blk .{
+                .type_idx = type_idx,
+                .data = .{ .big_int = data },
+            };
+        },
+        .group_element => |ge| .{
+            .type_idx = type_idx,
+            .data = .{ .group_element = ge },
+        },
+        .coll_byte => |bytes| .{
+            .type_idx = type_idx,
+            .data = .{ .byte_slice = .{ .ptr = bytes.ptr, .len = @intCast(bytes.len) } },
+        },
+        .coll => |c| .{
+            .type_idx = type_idx,
+            .data = .{ .collection = .{ .elem_type = c.elem_type, .start_idx = c.start, .len = c.len } },
+        },
+        .option => |o| .{
+            .type_idx = type_idx,
+            .data = .{ .option = .{ .inner_type = o.inner_type, .value_idx = o.value_idx } },
+        },
+        .box => |b| .{
+            .type_idx = type_idx,
+            .data = .{ .box = .{ .source = @enumFromInt(@intFromEnum(b.source)), .index = b.index } },
+        },
+        .hash32 => |h| .{
+            .type_idx = type_idx,
+            .data = .{ .hash32 = h },
+        },
+        .avl_tree => |tree| .{
+            .type_idx = type_idx,
+            .data = .{ .avl_tree = tree },
+        },
+        .sigma_prop => |sp| .{
+            .type_idx = type_idx,
+            .data = .{ .sigma_prop = .{ .ptr = sp.data.ptr, .len = @intCast(sp.data.len) } },
+        },
+        // Types not yet supported
+        .tuple, .header, .pre_header, .unsigned_big_int, .box_coll, .token_coll => {
+            return error.NotSupported;
+        },
+        .soft_fork_placeholder, .func_ref => {
+            return error.NotSupported;
+        },
+    };
+}
+
 fn deserializeColl(
     elem_idx: TypeIndex,
     pool: *const TypePool,
@@ -740,16 +829,43 @@ fn deserializeTuple2(
     const v1 = try deserialize(t1, pool, reader, arena, values);
     const v2 = try deserialize(t2, pool, reader, arena, values);
 
-    // For simple types, store inline (full ValuePool support in Phase 2)
-    const val1 = try valueToI64(v1) orelse return error.NotSupported;
-    const val2 = try valueToI64(v2) orelse return error.NotSupported;
+    // Try inline storage for primitives first
+    const val1_opt = try valueToI64(v1);
+    const val2_opt = try valueToI64(v2);
+
+    if (val1_opt != null and val2_opt != null) {
+        // Both primitives - use inline storage
+        return .{
+            .tuple = .{
+                .start = 0, // 0 indicates inline storage
+                .len = 2,
+                .types = .{ t1, t2, 0, 0 },
+                .values = .{ val1_opt.?, val2_opt.?, 0, 0 },
+            },
+        };
+    }
+
+    // Non-primitive element(s) - store in ValuePool
+    const vpool = values orelse return error.NotSupported;
+
+    // Allocate slots for both elements
+    const start_idx = vpool.allocN(2) catch return error.OutOfMemory;
+
+    // Store first element
+    const pooled1 = try valueToPooled(v1, t1, vpool, arena);
+    vpool.set(start_idx, pooled1);
+
+    // Store second element
+    const pooled2 = try valueToPooled(v2, t2, vpool, arena);
+    vpool.set(start_idx + 1, pooled2);
 
     return .{
         .tuple = .{
-            .start = 0, // 0 indicates inline storage
+            .start = start_idx,
             .len = 2,
-            .types = .{ t1, t2, 0, 0 },
-            .values = .{ val1, val2, 0, 0 },
+            // types[0]=0 indicates external storage (distinguishes from inline which has types[0]!=0)
+            .types = .{ 0, 0, 0, 0 },
+            .values = .{ 0, 0, 0, 0 },
         },
     };
 }
@@ -767,15 +883,36 @@ fn deserializeTuple3(
     const v2 = try deserialize(t2, pool, reader, arena, values);
     const v3 = try deserialize(t3, pool, reader, arena, values);
 
-    const val1 = try valueToI64(v1) orelse return error.NotSupported;
-    const val2 = try valueToI64(v2) orelse return error.NotSupported;
-    const val3 = try valueToI64(v3) orelse return error.NotSupported;
+    // Try inline storage for all-primitive tuples
+    const val1_opt = try valueToI64(v1);
+    const val2_opt = try valueToI64(v2);
+    const val3_opt = try valueToI64(v3);
+
+    if (val1_opt != null and val2_opt != null and val3_opt != null) {
+        return .{ .tuple = .{
+            .start = 0,
+            .len = 3,
+            .types = .{ t1, t2, t3, 0 },
+            .values = .{ val1_opt.?, val2_opt.?, val3_opt.?, 0 },
+        } };
+    }
+
+    // Non-primitive element(s) - store in ValuePool
+    const vpool = values orelse return error.NotSupported;
+    const start_idx = vpool.allocN(3) catch return error.OutOfMemory;
+
+    const elem_vals = [_]Value{ v1, v2, v3 };
+    const elem_types = [_]TypeIndex{ t1, t2, t3 };
+    for (0..3) |i| {
+        const pooled = try valueToPooled(elem_vals[i], elem_types[i], vpool, arena);
+        vpool.set(start_idx + @as(u16, @intCast(i)), pooled);
+    }
 
     return .{ .tuple = .{
-        .start = 0,
+        .start = start_idx,
         .len = 3,
-        .types = .{ t1, t2, t3, 0 },
-        .values = .{ val1, val2, val3, 0 },
+        .types = .{ 0, 0, 0, 0 },
+        .values = .{ 0, 0, 0, 0 },
     } };
 }
 
@@ -794,16 +931,37 @@ fn deserializeTuple4(
     const v3 = try deserialize(t3, pool, reader, arena, values);
     const v4 = try deserialize(t4, pool, reader, arena, values);
 
-    const val1 = try valueToI64(v1) orelse return error.NotSupported;
-    const val2 = try valueToI64(v2) orelse return error.NotSupported;
-    const val3 = try valueToI64(v3) orelse return error.NotSupported;
-    const val4 = try valueToI64(v4) orelse return error.NotSupported;
+    // Try inline storage for all-primitive tuples
+    const val1_opt = try valueToI64(v1);
+    const val2_opt = try valueToI64(v2);
+    const val3_opt = try valueToI64(v3);
+    const val4_opt = try valueToI64(v4);
+
+    if (val1_opt != null and val2_opt != null and val3_opt != null and val4_opt != null) {
+        return .{ .tuple = .{
+            .start = 0,
+            .len = 4,
+            .types = .{ t1, t2, t3, t4 },
+            .values = .{ val1_opt.?, val2_opt.?, val3_opt.?, val4_opt.? },
+        } };
+    }
+
+    // Non-primitive element(s) - store in ValuePool
+    const vpool = values orelse return error.NotSupported;
+    const start_idx = vpool.allocN(4) catch return error.OutOfMemory;
+
+    const elem_vals = [_]Value{ v1, v2, v3, v4 };
+    const elem_types = [_]TypeIndex{ t1, t2, t3, t4 };
+    for (0..4) |i| {
+        const pooled = try valueToPooled(elem_vals[i], elem_types[i], vpool, arena);
+        vpool.set(start_idx + @as(u16, @intCast(i)), pooled);
+    }
 
     return .{ .tuple = .{
-        .start = 0,
+        .start = start_idx,
         .len = 4,
-        .types = .{ t1, t2, t3, t4 },
-        .values = .{ val1, val2, val3, val4 },
+        .types = .{ 0, 0, 0, 0 },
+        .values = .{ 0, 0, 0, 0 },
     } };
 }
 
@@ -814,24 +972,50 @@ fn deserializeTupleN(
     arena: anytype,
     values: ?*ValuePool,
 ) DeserializeError!Value {
-    // Only support up to 4 elements for now (full ValuePool support in Phase 2)
+    // Only support up to 4 elements for inline storage
     if (indices.len > 4) return error.NotSupported;
+    if (indices.len < 2) return error.InvalidData;
 
     var elem_types: [4]TypeIndex = .{ 0, 0, 0, 0 };
     var elem_values: [4]i64 = .{ 0, 0, 0, 0 };
+    var deserialized_values: [4]Value = undefined;
+    var all_primitive = true;
 
     for (indices, 0..) |t, i| {
         const v = try deserialize(t, pool, reader, arena, values);
-        const val = try valueToI64(v) orelse return error.NotSupported;
-        elem_types[i] = t;
-        elem_values[i] = val;
+        deserialized_values[i] = v;
+        const val_opt = try valueToI64(v);
+        if (val_opt) |val| {
+            elem_types[i] = t;
+            elem_values[i] = val;
+        } else {
+            all_primitive = false;
+        }
+    }
+
+    if (all_primitive) {
+        return .{ .tuple = .{
+            .start = 0,
+            .len = @intCast(indices.len),
+            .types = elem_types,
+            .values = elem_values,
+        } };
+    }
+
+    // Non-primitive element(s) - store in ValuePool
+    const vpool = values orelse return error.NotSupported;
+    const start_idx = vpool.allocN(@intCast(indices.len)) catch return error.OutOfMemory;
+
+    for (indices, 0..) |t, i| {
+        const pooled = try valueToPooled(deserialized_values[i], t, vpool, arena);
+        vpool.set(start_idx + @as(u16, @intCast(i)), pooled);
     }
 
     return .{ .tuple = .{
-        .start = 0,
+        .start = start_idx,
         .len = @intCast(indices.len),
-        .types = elem_types,
-        .values = elem_values,
+        .types = .{ 0, 0, 0, 0 },
+        .values = .{ 0, 0, 0, 0 },
     } };
 }
 

@@ -13,6 +13,7 @@ const opcodes = @import("../core/opcodes.zig");
 const data_serializer = @import("data_serializer.zig");
 const type_serializer = @import("type_serializer.zig");
 const memory = @import("../interpreter/memory.zig");
+const value_pool_mod = @import("../interpreter/value_pool.zig");
 
 const TypePool = types.TypePool;
 const TypeIndex = types.TypeIndex;
@@ -368,6 +369,9 @@ pub const ExprTree = struct {
     /// Type pool
     type_pool: TypePool = TypePool.init(),
 
+    /// Value pool for storing tuple/collection elements during deserialization
+    value_pool: value_pool_mod.ValuePool = value_pool_mod.ValuePool.init(),
+
     /// ValDef type store: maps varId -> TypeIndex
     /// Used during deserialization so ValUse can look up types
     val_def_types: [max_val_defs]TypeIndex = [_]TypeIndex{TypePool.UNIT} ** max_val_defs,
@@ -381,6 +385,7 @@ pub const ExprTree = struct {
         self.value_count = 0;
         self.constant_count = 0;
         self.type_pool.reset();
+        self.value_pool.reset();
         self.val_def_types = [_]TypeIndex{TypePool.UNIT} ** max_val_defs;
     }
 
@@ -763,8 +768,8 @@ fn deserializeConstant(
         };
     };
 
-    // Parse the value (pass null for value_pool - not needed during deserialization)
-    const value = data_serializer.deserialize(type_idx, &tree.type_pool, reader, arena, null) catch |e| {
+    // Parse the value using the tree's value_pool for tuple/collection elements
+    const value = data_serializer.deserialize(type_idx, &tree.type_pool, reader, arena, &tree.value_pool) catch |e| {
         return switch (e) {
             error.UnexpectedEndOfInput => error.UnexpectedEndOfInput,
             error.Overflow => error.Overflow,
