@@ -4867,12 +4867,16 @@ pub const Evaluator = struct {
         }
 
         // Accumulate - for each iteration, create a pair (acc, elem) and bind to arg_var_id
+        // Save values_sp so we can reset after each iteration (pairs are temporary)
+        const saved_values_sp = self.values_sp;
         var acc = zero;
         for (0..len) |i| {
             const elem = try self.getCollectionElement(coll, i);
 
             // Create pair (acc, elem) as a tuple value
             // Store elements in values array for external storage mode
+            // Reset to saved position each iteration to reuse the same slots
+            self.values_sp = saved_values_sp;
             const pair_start = self.values_sp;
             if (pair_start + 2 > self.values.len) return error.OutOfMemory;
             self.values[pair_start] = acc;
@@ -4893,6 +4897,8 @@ pub const Evaluator = struct {
 
             acc = try self.evaluateSubtree(body_idx);
         }
+        // Reset values_sp after fold completes - pairs no longer needed
+        self.values_sp = saved_values_sp;
 
         try self.pushValue(acc);
         // POSTCONDITION: Net change is -1 (popped 2, pushed 1)
